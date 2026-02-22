@@ -674,7 +674,10 @@ func validateToolArgs(tool Tool, args json.RawMessage) error {
 		return nil
 	}
 
-	// Parse arguments
+	// Parse arguments (treat nil/empty as empty object)
+	if len(args) == 0 {
+		args = []byte("{}")
+	}
 	var parsed map[string]any
 	if err := json.Unmarshal(args, &parsed); err != nil {
 		return fmt.Errorf("validation failed for tool %q: invalid JSON: %w", tool.Name(), err)

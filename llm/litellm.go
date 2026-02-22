@@ -2,6 +2,7 @@ package llm
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"io"
 
@@ -271,7 +272,7 @@ func (l *LiteLLMAdapter) GenerateStream(ctx context.Context, messages []Message,
 				partial.Content = append(partial.Content, agentcore.ToolCallBlock(ToolCall{
 					ID:   tc.ID,
 					Name: tc.Function.Name,
-					Args: []byte(tc.Function.Arguments),
+					Args: safeArgs(tc.Function.Arguments),
 				}))
 				idx := len(partial.Content) - 1
 				eventChan <- StreamEvent{
@@ -404,7 +405,7 @@ func convertResponse(response *litellm.Response) Message {
 		content = append(content, agentcore.ToolCallBlock(agentcore.ToolCall{
 			ID:   call.ID,
 			Name: call.Function.Name,
-			Args: []byte(call.Function.Arguments),
+			Args: safeArgs(call.Function.Arguments),
 		}))
 	}
 
@@ -493,4 +494,12 @@ func applyToolConfig(request *litellm.Request, tools []ToolSpec) {
 		})
 	}
 	request.Tools = ltTools
+}
+
+// safeArgs returns args as json.RawMessage, defaulting to "{}" if empty.
+func safeArgs(args string) json.RawMessage {
+	if args == "" {
+		return json.RawMessage("{}")
+	}
+	return json.RawMessage(args)
 }
