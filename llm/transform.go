@@ -18,13 +18,13 @@ const maxToolCallIDLength = 64
 //  1. Normalize tool call IDs (truncate >64 chars, sanitize to [a-zA-Z0-9_-]),
 //     handle thinking blocks based on target provider.
 //  2. Apply ID mapping to tool results, insert synthetic results for orphaned tool calls.
-func TransformMessages(messages []Message, targetProvider string) []Message {
+func TransformMessages(messages []agentcore.Message, targetProvider string) []agentcore.Message {
 	if len(messages) == 0 {
 		return nil
 	}
 
 	idMap := make(map[string]string) // oldID → newID
-	result := make([]Message, 0, len(messages))
+	result := make([]agentcore.Message, 0, len(messages))
 
 	// Pass 1: normalize IDs and thinking blocks, skip incomplete messages
 	for _, msg := range messages {
@@ -43,7 +43,7 @@ func TransformMessages(messages []Message, targetProvider string) []Message {
 }
 
 // transformContent normalizes a single message's content blocks.
-func transformContent(msg Message, targetProvider string, idMap map[string]string) Message {
+func transformContent(msg agentcore.Message, targetProvider string, idMap map[string]string) agentcore.Message {
 	newContent := make([]agentcore.ContentBlock, 0, len(msg.Content))
 
 	for _, block := range msg.Content {
@@ -103,8 +103,8 @@ func normalizeToolCallID(id string) string {
 }
 
 // applyIDMapping updates tool result IDs and inserts synthetic results for orphans.
-func applyIDMapping(messages []Message, idMap map[string]string) []Message {
-	result := make([]Message, 0, len(messages))
+func applyIDMapping(messages []agentcore.Message, idMap map[string]string) []agentcore.Message {
+	result := make([]agentcore.Message, 0, len(messages))
 
 	for i, msg := range messages {
 		// Remap tool result IDs
@@ -144,7 +144,7 @@ func applyIDMapping(messages []Message, idMap map[string]string) []Message {
 }
 
 // collectToolResultIDs gathers tool_call_id values from consecutive tool messages starting at index.
-func collectToolResultIDs(messages []Message, start int) map[string]bool {
+func collectToolResultIDs(messages []agentcore.Message, start int) map[string]bool {
 	ids := make(map[string]bool)
 	for i := start; i < len(messages); i++ {
 		if messages[i].Role != agentcore.RoleTool {

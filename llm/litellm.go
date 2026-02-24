@@ -10,7 +10,7 @@ import (
 	"github.com/voocel/litellm"
 )
 
-// LiteLLMAdapter adapts litellm to the llm.ChatModel interface.
+// LiteLLMAdapter adapts litellm to the agentcore.ChatModel interface.
 type LiteLLMAdapter struct {
 	*BaseModel
 	client *litellm.Client
@@ -84,7 +84,7 @@ func (l *LiteLLMAdapter) ProviderName() string {
 }
 
 // Generate produces a synchronous response.
-func (l *LiteLLMAdapter) Generate(ctx context.Context, messages []Message, tools []ToolSpec, opts ...CallOption) (*LLMResponse, error) {
+func (l *LiteLLMAdapter) Generate(ctx context.Context, messages []agentcore.Message, tools []agentcore.ToolSpec, opts ...agentcore.CallOption) (*agentcore.LLMResponse, error) {
 	cfg := l.GetConfig()
 	llmMessages := convertMessages(messages)
 
@@ -107,11 +107,11 @@ func (l *LiteLLMAdapter) Generate(ctx context.Context, messages []Message, tools
 	if msg.Usage != nil {
 		msg.Usage.Cost = CalculateCost(l.Info().Pricing, msg.Usage)
 	}
-	return &LLMResponse{Message: msg}, nil
+	return &agentcore.LLMResponse{Message: msg}, nil
 }
 
 // GenerateStream produces a streaming response with fine-grained events.
-func (l *LiteLLMAdapter) GenerateStream(ctx context.Context, messages []Message, tools []ToolSpec, opts ...CallOption) (<-chan StreamEvent, error) {
+func (l *LiteLLMAdapter) GenerateStream(ctx context.Context, messages []agentcore.Message, tools []agentcore.ToolSpec, opts ...agentcore.CallOption) (<-chan agentcore.StreamEvent, error) {
 	cfg := l.GetConfig()
 	llmMessages := convertMessages(messages)
 
@@ -130,7 +130,7 @@ func (l *LiteLLMAdapter) GenerateStream(ctx context.Context, messages []Message,
 		return nil, fmt.Errorf("llm: stream failed: %w", err)
 	}
 
-	eventChan := make(chan StreamEvent, 100)
+	eventChan := make(chan agentcore.StreamEvent, 100)
 
 	go func() {
 		defer close(eventChan)
@@ -152,7 +152,7 @@ func (l *LiteLLMAdapter) GenerateStream(ctx context.Context, messages []Message,
 				if err == io.EOF {
 					break
 				}
-				eventChan <- StreamEvent{Type: StreamEventError, Err: err}
+				eventChan <- agentcore.StreamEvent{Type: agentcore.StreamEventError, Err: err}
 				return
 			}
 			if chunk == nil {
@@ -173,16 +173,16 @@ func (l *LiteLLMAdapter) GenerateStream(ctx context.Context, messages []Message,
 					thinkStarted = true
 					partial.Content = append(partial.Content, agentcore.ThinkingBlock(""))
 					idx := len(partial.Content) - 1
-					eventChan <- StreamEvent{
-						Type:         StreamEventThinkingStart,
+					eventChan <- agentcore.StreamEvent{
+						Type:         agentcore.StreamEventThinkingStart,
 						ContentIndex: idx,
 						Message:      partial,
 					}
 				}
 				idx := lastBlockIndex(partial.Content, agentcore.ContentThinking)
 				partial.Content[idx].Thinking += chunk.Reasoning.Content
-				eventChan <- StreamEvent{
-					Type:         StreamEventThinkingDelta,
+				eventChan <- agentcore.StreamEvent{
+					Type:         agentcore.StreamEventThinkingDelta,
 					ContentIndex: idx,
 					Delta:        chunk.Reasoning.Content,
 					Message:      partial,
@@ -195,16 +195,16 @@ func (l *LiteLLMAdapter) GenerateStream(ctx context.Context, messages []Message,
 					textStarted = true
 					partial.Content = append(partial.Content, agentcore.TextBlock(""))
 					idx := len(partial.Content) - 1
-					eventChan <- StreamEvent{
-						Type:         StreamEventTextStart,
+					eventChan <- agentcore.StreamEvent{
+						Type:         agentcore.StreamEventTextStart,
 						ContentIndex: idx,
 						Message:      partial,
 					}
 				}
 				idx := lastBlockIndex(partial.Content, agentcore.ContentText)
 				partial.Content[idx].Text += chunk.Content
-				eventChan <- StreamEvent{
-					Type:         StreamEventTextDelta,
+				eventChan <- agentcore.StreamEvent{
+					Type:         agentcore.StreamEventTextDelta,
 					ContentIndex: idx,
 					Delta:        chunk.Content,
 					Message:      partial,
@@ -219,15 +219,15 @@ func (l *LiteLLMAdapter) GenerateStream(ctx context.Context, messages []Message,
 
 				if !wasStarted && !toolStarted[deltaIdx] {
 					toolStarted[deltaIdx] = true
-					eventChan <- StreamEvent{
-						Type:    StreamEventToolCallStart,
+					eventChan <- agentcore.StreamEvent{
+						Type:    agentcore.StreamEventToolCallStart,
 						Message: partial,
 					}
 				}
 
 				if chunk.ToolCallDelta.ArgumentsDelta != "" {
-					eventChan <- StreamEvent{
-						Type:    StreamEventToolCallDelta,
+					eventChan <- agentcore.StreamEvent{
+						Type:    agentcore.StreamEventToolCallDelta,
 						Delta:   chunk.ToolCallDelta.ArgumentsDelta,
 						Message: partial,
 					}
@@ -248,8 +248,8 @@ func (l *LiteLLMAdapter) GenerateStream(ctx context.Context, messages []Message,
 		if thinkStarted {
 			idx := lastBlockIndex(partial.Content, agentcore.ContentThinking)
 			if idx >= 0 {
-				eventChan <- StreamEvent{
-					Type:         StreamEventThinkingEnd,
+				eventChan <- agentcore.StreamEvent{
+					Type:         agentcore.StreamEventThinkingEnd,
 					ContentIndex: idx,
 					Message:      partial,
 				}
@@ -258,8 +258,8 @@ func (l *LiteLLMAdapter) GenerateStream(ctx context.Context, messages []Message,
 		if textStarted {
 			idx := lastBlockIndex(partial.Content, agentcore.ContentText)
 			if idx >= 0 {
-				eventChan <- StreamEvent{
-					Type:         StreamEventTextEnd,
+				eventChan <- agentcore.StreamEvent{
+					Type:         agentcore.StreamEventTextEnd,
 					ContentIndex: idx,
 					Message:      partial,
 				}
@@ -269,14 +269,14 @@ func (l *LiteLLMAdapter) GenerateStream(ctx context.Context, messages []Message,
 		// Build final tool calls from accumulated deltas
 		if calls := toolAcc.Build(); len(calls) > 0 {
 			for _, tc := range calls {
-				partial.Content = append(partial.Content, agentcore.ToolCallBlock(ToolCall{
+				partial.Content = append(partial.Content, agentcore.ToolCallBlock(agentcore.ToolCall{
 					ID:   tc.ID,
 					Name: tc.Function.Name,
 					Args: safeArgs(tc.Function.Arguments),
 				}))
 				idx := len(partial.Content) - 1
-				eventChan <- StreamEvent{
-					Type:         StreamEventToolCallEnd,
+				eventChan <- agentcore.StreamEvent{
+					Type:         agentcore.StreamEventToolCallEnd,
 					ContentIndex: idx,
 					Message:      partial,
 				}
@@ -296,7 +296,7 @@ func (l *LiteLLMAdapter) GenerateStream(ctx context.Context, messages []Message,
 		}
 
 		partial.StopReason = mapStopReason(finishReason)
-		eventChan <- StreamEvent{Type: StreamEventDone, Message: partial, StopReason: partial.StopReason}
+		eventChan <- agentcore.StreamEvent{Type: agentcore.StreamEventDone, Message: partial, StopReason: partial.StopReason}
 	}()
 
 	return eventChan, nil
@@ -314,11 +314,10 @@ func lastBlockIndex(blocks []agentcore.ContentBlock, ct agentcore.ContentType) i
 
 // convertMessages converts agentcore.Message to litellm.Message.
 // Handles multipart content (text + images) via litellm.Contents field.
-func convertMessages(messages []Message) []litellm.Message {
+func convertMessages(messages []agentcore.Message) []litellm.Message {
 	llmMessages := make([]litellm.Message, len(messages))
 	for i, msg := range messages {
-		llmMsg := convertSingleMessage(msg)
-		llmMessages[i] = llmMsg
+		llmMessages[i] = convertSingleMessage(msg)
 	}
 	return llmMessages
 }
@@ -334,7 +333,7 @@ func hasImageContent(blocks []agentcore.ContentBlock) bool {
 }
 
 // convertSingleMessage converts one agentcore.Message to litellm.Message.
-func convertSingleMessage(msg Message) litellm.Message {
+func convertSingleMessage(msg agentcore.Message) litellm.Message {
 	llmMsg := litellm.Message{
 		Role: string(msg.Role),
 	}
@@ -348,7 +347,6 @@ func convertSingleMessage(msg Message) litellm.Message {
 				parts = append(parts, litellm.TextContent(b.Text))
 			case agentcore.ContentImage:
 				if b.Image != nil {
-					// Base64 data URI format: data:<mime>;base64,<data>
 					url := "data:" + b.Image.MimeType + ";base64," + b.Image.Data
 					parts = append(parts, litellm.ImageContent(url))
 				}
@@ -387,7 +385,7 @@ func convertSingleMessage(msg Message) litellm.Message {
 }
 
 // convertResponse converts litellm.Response to agentcore.Message with content blocks.
-func convertResponse(response *litellm.Response) Message {
+func convertResponse(response *litellm.Response) agentcore.Message {
 	var content []agentcore.ContentBlock
 
 	// Thinking/reasoning content
@@ -421,7 +419,7 @@ func convertResponse(response *litellm.Response) Message {
 		}
 	}
 
-	return Message{
+	return agentcore.Message{
 		Role:       agentcore.RoleAssistant,
 		Content:    content,
 		StopReason: mapStopReason(response.FinishReason),
@@ -429,7 +427,7 @@ func convertResponse(response *litellm.Response) Message {
 	}
 }
 
-// mapStopReason maps litellm canonical FinishReason to MAS StopReason.
+// mapStopReason maps litellm canonical FinishReason to agentcore StopReason.
 func mapStopReason(reason string) agentcore.StopReason {
 	switch reason {
 	case litellm.FinishReasonStop, "":
@@ -447,7 +445,7 @@ func mapStopReason(reason string) agentcore.StopReason {
 
 // applyCallConfig resolves CallOptions once and applies API key, thinking, and
 // session config to the litellm request.
-func applyCallConfig(req *litellm.Request, opts []CallOption) {
+func applyCallConfig(req *litellm.Request, opts []agentcore.CallOption) {
 	callCfg := agentcore.ResolveCallConfig(opts)
 
 	// Per-request API key override
@@ -475,7 +473,7 @@ func applyCallConfig(req *litellm.Request, opts []CallOption) {
 	}
 }
 
-func applyToolConfig(request *litellm.Request, tools []ToolSpec) {
+func applyToolConfig(request *litellm.Request, tools []agentcore.ToolSpec) {
 	if len(tools) == 0 {
 		return
 	}
