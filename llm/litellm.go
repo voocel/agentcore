@@ -286,8 +286,13 @@ func convertSingleMessage(msg agentcore.Message) litellm.Message {
 				parts = append(parts, litellm.TextContent(b.Text))
 			case agentcore.ContentImage:
 				if b.Image != nil {
-					url := "data:" + b.Image.MimeType + ";base64," + b.Image.Data
-					parts = append(parts, litellm.ImageContent(url))
+					var imgURL string
+					if b.Image.URL != "" {
+						imgURL = b.Image.URL
+					} else {
+						imgURL = "data:" + b.Image.MimeType + ";base64," + b.Image.Data
+					}
+					parts = append(parts, litellm.ImageContent(imgURL))
 				}
 			}
 		}

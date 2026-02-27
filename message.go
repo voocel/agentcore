@@ -44,10 +44,14 @@ type ContentBlock struct {
 	Image    *ImageData  `json:"image,omitempty"`
 }
 
-// ImageData holds base64-encoded image content.
+// ImageData holds image content as base64 data or a URL.
+// When URL is set, providers pass it directly (no download/encoding needed).
+// When Data is set, it is sent as a base64 data URL with MimeType.
+// MimeType is required for base64 mode, optional for URL mode (provider infers it).
 type ImageData struct {
-	Data     string `json:"data"`
-	MimeType string `json:"mime_type"`
+	Data     string `json:"data,omitempty"`
+	URL      string `json:"url,omitempty"`
+	MimeType string `json:"mime_type,omitempty"`
 }
 
 // Block constructors
@@ -66,6 +70,10 @@ func ToolCallBlock(tc ToolCall) ContentBlock {
 
 func ImageBlock(data, mimeType string) ContentBlock {
 	return ContentBlock{Type: ContentImage, Image: &ImageData{Data: data, MimeType: mimeType}}
+}
+
+func ImageURLBlock(url string) ContentBlock {
+	return ContentBlock{Type: ContentImage, Image: &ImageData{URL: url}}
 }
 
 // ---------------------------------------------------------------------------
