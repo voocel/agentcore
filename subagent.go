@@ -70,6 +70,7 @@ type subagentUsage struct {
 	CacheWrite int     `json:"cache_write"`
 	Cost       float64 `json:"cost"`
 	Turns      int     `json:"turns"`
+	Tools      int     `json:"tools"`
 }
 
 // SubAgentTool implements the Tool interface.
@@ -408,6 +409,23 @@ func (t *SubAgentTool) runAgent(ctx context.Context, agentName, task string, mod
 
 	for ev := range events {
 		switch ev.Type {
+		case EventToolExecStart:
+			su.Tools++
+			data, _ := json.Marshal(map[string]any{
+				"agent": agentName,
+				"tool":  ev.Tool,
+				"args":  ev.Args,
+			})
+			ReportToolProgress(ctx, data)
+		case EventToolExecEnd:
+			if ev.IsError {
+				data, _ := json.Marshal(map[string]any{
+					"agent": agentName,
+					"tool":  ev.Tool,
+					"error": true,
+				})
+				ReportToolProgress(ctx, data)
+			}
 		case EventMessageEnd:
 			if ev.Message == nil {
 				continue
@@ -415,6 +433,11 @@ func (t *SubAgentTool) runAgent(ctx context.Context, agentName, task string, mod
 			if ev.Message.GetRole() == RoleAssistant {
 				lastAssistantContent = ev.Message.TextContent()
 				su.Turns++
+				data, _ := json.Marshal(map[string]any{
+					"agent": agentName,
+					"turn":  su.Turns,
+				})
+				ReportToolProgress(ctx, data)
 				// Accumulate usage from assistant messages
 				if msg, ok := ev.Message.(Message); ok && msg.Usage != nil {
 					su.Input += msg.Usage.Input
