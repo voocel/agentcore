@@ -39,6 +39,7 @@ type subagentParams struct {
 	Chain       []subagentChain `json:"chain,omitempty"`
 	Background  bool            `json:"background,omitempty"`
 	Description string          `json:"description,omitempty"`
+	Model       string          `json:"model,omitempty"`
 }
 
 type subagentTask struct {
@@ -75,10 +76,11 @@ type subagentUsage struct {
 // The main agent calls this tool to delegate tasks to specialized sub-agents
 // with isolated contexts.
 type SubAgentTool struct {
-	agents   map[string]SubAgentConfig
-	notifyFn func(AgentMessage) // called when a background task completes
-	mu       sync.Mutex
-	bgSeq    int
+	agents      map[string]SubAgentConfig
+	notifyFn    func(AgentMessage)                 // called when a background task completes
+	createModel func(name string) (ChatModel, error) // resolves model name to ChatModel at runtime
+	mu          sync.Mutex
+	bgSeq       int
 }
 
 // NewSubAgentTool creates a subagent tool from a set of agent configs.
@@ -95,6 +97,12 @@ func NewSubAgentTool(agents ...SubAgentConfig) *SubAgentTool {
 // as a follow-up message.
 func (t *SubAgentTool) SetNotifyFn(fn func(AgentMessage)) {
 	t.notifyFn = fn
+}
+
+// SetCreateModel sets the factory for resolving model names (e.g. "haiku", "gpt-4o-mini")
+// to ChatModel instances at runtime. Enables LLM to override the default model per call.
+func (t *SubAgentTool) SetCreateModel(fn func(name string) (ChatModel, error)) {
+	t.createModel = fn
 }
 
 func (t *SubAgentTool) Name() string  { return "subagent" }
@@ -130,6 +138,7 @@ func (t *SubAgentTool) Schema() map[string]any {
 		schema.Property("chain", schema.Array("Array of {agent, task} for sequential execution. Use {previous} in task to reference prior output.", taskItem)),
 		schema.Property("background", schema.Bool("Set true to run in background. Returns immediately; a notification is sent when the task completes.")),
 		schema.Property("description", schema.String("Short description of the background task (shown in notifications).")),
+		schema.Property("model", schema.String("Optional model override for this call (e.g. model ID or alias). If not set, uses the agent's default model.")),
 	)
 }
 
@@ -137,6 +146,16 @@ func (t *SubAgentTool) Execute(ctx context.Context, args json.RawMessage) (json.
 	var params subagentParams
 	if err := json.Unmarshal(args, &params); err != nil {
 		return nil, fmt.Errorf("invalid subagent params: %w", err)
+	}
+
+	// Resolve model override once (applies to all subtasks in this call).
+	var modelOverride ChatModel
+	if params.Model != "" && t.createModel != nil {
+		m, err := t.createModel(params.Model)
+		if err != nil {
+			return json.Marshal(map[string]any{"error": fmt.Sprintf("invalid model %q: %v", params.Model, err)})
+		}
+		modelOverride = m
 	}
 
 	hasChain := len(params.Chain) > 0
@@ -148,7 +167,7 @@ func (t *SubAgentTool) Execute(ctx context.Context, args json.RawMessage) (json.
 		if !hasSingle {
 			return json.Marshal("background mode requires agent + task")
 		}
-		return t.executeBackground(params.Agent, params.Task, params.Description)
+		return t.executeBackground(params.Agent, params.Task, params.Description, modelOverride)
 	}
 
 	modeCount := boolToInt(hasChain) + boolToInt(hasParallel) + boolToInt(hasSingle)
@@ -158,17 +177,17 @@ func (t *SubAgentTool) Execute(ctx context.Context, args json.RawMessage) (json.
 
 	switch {
 	case hasChain:
-		return t.executeChain(ctx, params.Chain)
+		return t.executeChain(ctx, params.Chain, modelOverride)
 	case hasParallel:
-		return t.executeParallel(ctx, params.Tasks)
+		return t.executeParallel(ctx, params.Tasks, modelOverride)
 	default:
-		return t.executeSingle(ctx, params.Agent, params.Task)
+		return t.executeSingle(ctx, params.Agent, params.Task, modelOverride)
 	}
 }
 
 // executeBackground launches a sub-agent in a detached goroutine and returns immediately.
 // When the sub-agent finishes, a notification is sent via notifyFn (typically Agent.FollowUp).
-func (t *SubAgentTool) executeBackground(agentName, task, description string) (json.RawMessage, error) {
+func (t *SubAgentTool) executeBackground(agentName, task, description string, modelOverride ChatModel) (json.RawMessage, error) {
 	if _, ok := t.agents[agentName]; !ok {
 		available := make([]string, 0, len(t.agents))
 		for name := range t.agents {
@@ -187,7 +206,7 @@ func (t *SubAgentTool) executeBackground(agentName, task, description string) (j
 	go func() {
 		// Detached context — background task is independent of the parent request.
 		bgCtx := context.Background()
-		output, usage, err := t.runAgent(bgCtx, agentName, task)
+		output, usage, err := t.runAgent(bgCtx, agentName, task, modelOverride)
 
 		var result map[string]any
 		if err != nil {
@@ -242,8 +261,8 @@ func (t *SubAgentTool) notify(result map[string]any) {
 }
 
 // executeSingle runs one sub-agent with an isolated context.
-func (t *SubAgentTool) executeSingle(ctx context.Context, agentName, task string) (json.RawMessage, error) {
-	output, usage, err := t.runAgent(ctx, agentName, task)
+func (t *SubAgentTool) executeSingle(ctx context.Context, agentName, task string, modelOverride ChatModel) (json.RawMessage, error) {
+	output, usage, err := t.runAgent(ctx, agentName, task, modelOverride)
 	if err != nil {
 		return json.Marshal(map[string]any{
 			"error": fmt.Sprintf("Agent %q failed: %v", agentName, err),
@@ -257,7 +276,7 @@ func (t *SubAgentTool) executeSingle(ctx context.Context, agentName, task string
 }
 
 // executeChain runs sub-agents sequentially, passing each output to the next via {previous}.
-func (t *SubAgentTool) executeChain(ctx context.Context, chain []subagentChain) (json.RawMessage, error) {
+func (t *SubAgentTool) executeChain(ctx context.Context, chain []subagentChain, modelOverride ChatModel) (json.RawMessage, error) {
 	var previous string
 	results := make([]subagentResult, 0, len(chain))
 
@@ -267,7 +286,7 @@ func (t *SubAgentTool) executeChain(ctx context.Context, chain []subagentChain) 
 		}
 
 		task := strings.ReplaceAll(step.Task, "{previous}", previous)
-		output, usage, err := t.runAgent(ctx, step.Agent, task)
+		output, usage, err := t.runAgent(ctx, step.Agent, task, modelOverride)
 
 		result := subagentResult{
 			Agent: step.Agent,
@@ -298,7 +317,7 @@ func (t *SubAgentTool) executeChain(ctx context.Context, chain []subagentChain) 
 }
 
 // executeParallel runs multiple sub-agents concurrently with bounded concurrency.
-func (t *SubAgentTool) executeParallel(ctx context.Context, tasks []subagentTask) (json.RawMessage, error) {
+func (t *SubAgentTool) executeParallel(ctx context.Context, tasks []subagentTask, modelOverride ChatModel) (json.RawMessage, error) {
 	if len(tasks) > maxParallelTasks {
 		return json.Marshal(fmt.Sprintf("Too many parallel tasks (%d). Max is %d.", len(tasks), maxParallelTasks))
 	}
@@ -314,7 +333,7 @@ func (t *SubAgentTool) executeParallel(ctx context.Context, tasks []subagentTask
 			sem <- struct{}{}
 			defer func() { <-sem }()
 
-			output, usage, err := t.runAgent(ctx, st.Agent, st.Task)
+			output, usage, err := t.runAgent(ctx, st.Agent, st.Task, modelOverride)
 			result := subagentResult{
 				Agent: st.Agent,
 				Task:  st.Task,
@@ -347,7 +366,7 @@ func (t *SubAgentTool) executeParallel(ctx context.Context, tasks []subagentTask
 
 // runAgent executes an isolated agent loop for the given agent config and task.
 // Includes panic recovery to prevent a subagent crash from taking down the parent.
-func (t *SubAgentTool) runAgent(ctx context.Context, agentName, task string) (output string, usage *subagentUsage, err error) {
+func (t *SubAgentTool) runAgent(ctx context.Context, agentName, task string, modelOverride ChatModel) (output string, usage *subagentUsage, err error) {
 	cfg, ok := t.agents[agentName]
 	if !ok {
 		available := make([]string, 0, len(t.agents))
@@ -373,6 +392,9 @@ func (t *SubAgentTool) runAgent(ctx context.Context, agentName, task string) (ou
 		Model:    cfg.Model,
 		StreamFn: cfg.StreamFn,
 		MaxTurns: cfg.MaxTurns,
+	}
+	if modelOverride != nil {
+		loopCfg.Model = modelOverride
 	}
 	if loopCfg.MaxTurns <= 0 {
 		loopCfg.MaxTurns = defaultMaxTurns
