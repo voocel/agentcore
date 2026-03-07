@@ -25,26 +25,26 @@ type AgentState struct {
 // It consumes loop events to update internal state, just like any external listener.
 type Agent struct {
 	// Configuration (set via options)
-	model            ChatModel
-	systemPrompt     string
-	tools            []Tool
-	maxTurns         int
-	maxRetries       int
-	maxToolErrors    int
-	thinkingLevel    ThinkingLevel
-	streamFn         StreamFn
-	transformContext func(ctx context.Context, msgs []AgentMessage) ([]AgentMessage, error)
-	convertToLLM     func([]AgentMessage) []Message
-	steeringMode      QueueMode
-	followUpMode      QueueMode
-	contextWindow     int
-	contextEstimateFn ContextEstimateFn
-	permissionFn      PermissionFunc
-	getApiKey         func(provider string) (string, error)
-	thinkingBudgets   map[ThinkingLevel]int
-	sessionID         string
-	middlewares       []ToolMiddleware
-	maxRetryDelay    time.Duration
+	model              ChatModel
+	systemPrompt       string
+	tools              []Tool
+	maxTurns           int
+	maxRetries         int
+	maxToolErrors      int
+	thinkingLevel      ThinkingLevel
+	streamFn           StreamFn
+	transformContext   func(ctx context.Context, msgs []AgentMessage) ([]AgentMessage, error)
+	convertToLLM       func([]AgentMessage) []Message
+	steeringMode       QueueMode
+	followUpMode       QueueMode
+	contextWindow      int
+	contextEstimateFn  ContextEstimateFn
+	permissionFn       PermissionFunc
+	getApiKey          func(provider string) (string, error)
+	thinkingBudgets    map[ThinkingLevel]int
+	sessionID          string
+	middlewares        []ToolMiddleware
+	maxRetryDelay      time.Duration
 	maxToolConcurrency int
 
 	// State
@@ -56,14 +56,15 @@ type Agent struct {
 	totalUsage       Usage               // cumulative token usage
 
 	// Queues
-	steeringQ []AgentMessage
-	followUpQ []AgentMessage
+	steeringQ                   []AgentMessage
+	followUpQ                   []AgentMessage
+	skipNextInitialSteeringPoll bool
 
 	// Lifecycle
 	listeners       []func(Event)
 	cancel          context.CancelFunc
 	done            chan struct{} // closed when loop finishes
-	wantAbortMarker atomic.Bool  // set by Abort(), read by runLoop
+	wantAbortMarker atomic.Bool   // set by Abort(), read by runLoop
 	mu              sync.Mutex
 }
 
@@ -144,10 +145,12 @@ func (a *Agent) Continue() error {
 	lastMsg := a.messages[len(a.messages)-1]
 	if lastMsg.GetRole() == RoleAssistant {
 		if queued := dequeue(&a.steeringQ, a.steeringMode); len(queued) > 0 {
+			a.skipNextInitialSteeringPoll = true
 			a.mu.Unlock()
 			return a.PromptMessages(queued...)
 		}
 		if queued := dequeue(&a.followUpQ, a.followUpMode); len(queued) > 0 {
+			a.skipNextInitialSteeringPoll = true
 			a.mu.Unlock()
 			return a.PromptMessages(queued...)
 		}
@@ -315,6 +318,13 @@ func (a *Agent) SetModel(m ChatModel) {
 	a.model = m
 }
 
+// SetContextWindow updates the context window size (in tokens).
+func (a *Agent) SetContextWindow(n int) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	a.contextWindow = n
+}
+
 // SetSystemPrompt changes the system prompt. Takes effect on the next turn.
 func (a *Agent) SetSystemPrompt(s string) {
 	a.mu.Lock()
@@ -395,6 +405,9 @@ func (a *Agent) Reset() {
 
 // buildConfig constructs a LoopConfig from the agent's settings. Must be called with lock held.
 func (a *Agent) buildConfig() LoopConfig {
+	skipInitialSteering := a.skipNextInitialSteeringPoll
+	a.skipNextInitialSteeringPoll = false
+
 	return LoopConfig{
 		Model:            a.model,
 		StreamFn:         a.streamFn,
@@ -411,6 +424,10 @@ func (a *Agent) buildConfig() LoopConfig {
 		GetSteeringMessages: func() []AgentMessage {
 			a.mu.Lock()
 			defer a.mu.Unlock()
+			if skipInitialSteering {
+				skipInitialSteering = false
+				return nil
+			}
 			return dequeue(&a.steeringQ, a.steeringMode)
 		},
 		GetFollowUpMessages: func() []AgentMessage {
@@ -419,7 +436,7 @@ func (a *Agent) buildConfig() LoopConfig {
 			return dequeue(&a.followUpQ, a.followUpMode)
 		},
 		MaxRetryDelay:         a.maxRetryDelay,
-		Middlewares:            a.middlewares,
+		Middlewares:           a.middlewares,
 		MaxToolConcurrency:    a.maxToolConcurrency,
 		ShouldEmitAbortMarker: a.wantAbortMarker.Load,
 	}

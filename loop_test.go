@@ -206,6 +206,39 @@ func TestAgentLoop_Abort(t *testing.T) {
 	requireEvent(t, events, EventAgentEnd)
 }
 
+func TestAgentLoop_AbortEmitsAbortMarker(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	events := collectEvents(AgentLoop(ctx,
+		[]AgentMessage{UserMsg("cancelled")},
+		AgentContext{},
+		LoopConfig{
+			StreamFn: func(ctx context.Context, req *LLMRequest) (*LLMResponse, error) {
+				return nil, ctx.Err()
+			},
+			ShouldEmitAbortMarker: func() bool { return true },
+		},
+	))
+
+	var abortMsg Message
+	found := false
+	for _, ev := range events {
+		msg, ok := ev.Message.(Message)
+		if ev.Type == EventMessageEnd && ok && msg.StopReason == StopReasonAborted {
+			abortMsg = msg
+			found = true
+			break
+		}
+	}
+	if !found {
+		t.Fatal("expected abort marker message")
+	}
+	if abortMsg.Metadata["abort_phase"] != "inference" {
+		t.Fatalf("expected abort phase inference, got %v", abortMsg.Metadata["abort_phase"])
+	}
+}
+
 func TestAgentLoop_SteeringInterrupt(t *testing.T) {
 	var calls []string
 	steeringDelivered := false
