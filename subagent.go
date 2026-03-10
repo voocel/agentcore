@@ -417,6 +417,14 @@ func (t *SubAgentTool) runAgent(ctx context.Context, agentName, task string, mod
 				"args":  ev.Args,
 			})
 			ReportToolProgress(ctx, data)
+		case EventMessageUpdate:
+			if ev.Delta != "" {
+				data, _ := json.Marshal(map[string]any{
+					"agent": agentName,
+					"delta": ev.Delta,
+				})
+				ReportToolProgress(ctx, data)
+			}
 		case EventToolExecEnd:
 			if ev.IsError {
 				data, _ := json.Marshal(map[string]any{

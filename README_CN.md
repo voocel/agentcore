@@ -2,7 +2,7 @@
 
 **AgentCore** 是一个极简、可组合的 Go Agent 核心库，用于构建任意 AI Agent 应用。
 
-[示例](./examples/) | [English](./README.md)
+[English](README.md) | [中文](README_CN.md)
 
 ## 安装
 
@@ -13,6 +13,11 @@ go get github.com/voocel/agentcore
 ## 设计哲学
 
 克制的内核，开放的扩展，往往比面面俱到的一体化更可靠。越少的内置，越多的可能。
+
+## 稳定性
+
+- 优先稳定 `Agent`、`AgentLoop`、`Event`、`Tool`、`Message` 这些核心接口
+- 行为变化先补测试，再更新说明；`examples/` 与内部实现细节不视为稳定 API
 
 ## 架构
 
@@ -45,6 +50,7 @@ import (
 
     "github.com/voocel/agentcore"
     "github.com/voocel/agentcore/llm"
+    "github.com/voocel/agentcore/policy"
     "github.com/voocel/agentcore/tools"
 )
 
@@ -63,6 +69,7 @@ func main() {
             tools.NewEdit("."),
             tools.NewBash("."),
         ),
+        agentcore.WithPermission(policy.WorkspaceProfile(".")),
     )
 
     agent.Subscribe(func(ev agentcore.Event) {
@@ -77,6 +84,8 @@ func main() {
     agent.WaitForIdle()
 }
 ```
+
+更安全的默认配置可使用 `policy.ReadOnlyProfile(root)` 或 `policy.WorkspaceProfile(root)`。
 
 ### 多 Agent（SubAgent 工具）
 

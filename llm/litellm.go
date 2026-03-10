@@ -76,6 +76,11 @@ func NewGeminiModel(model, apiKey string, baseURL ...string) (*LiteLLMAdapter, e
 	return newProviderAdapter("gemini", model, apiKey, baseURL...)
 }
 
+// NewOpenRouterModel creates an OpenRouter adapter.
+func NewOpenRouterModel(model, apiKey string, baseURL ...string) (*LiteLLMAdapter, error) {
+	return newProviderAdapter("openrouter", model, apiKey, baseURL...)
+}
+
 // ProviderName returns the provider name (e.g. "openai", "anthropic").
 // Implements agentcore.ProviderNamer for per-provider API key resolution.
 func (l *LiteLLMAdapter) ProviderName() string {
@@ -152,15 +157,15 @@ func (l *LiteLLMAdapter) GenerateStream(ctx context.Context, messages []agentcor
 					Message:      partial,
 				}
 			},
-			OnReasoning: func(chunk *litellm.ReasoningChunk) {
-				if chunk.Content == "" {
+			OnReasoning: func(content string) {
+				if content == "" {
 					return
 				}
-				partial.Content[thinkIdx].Thinking += chunk.Content
+				partial.Content[thinkIdx].Thinking += content
 				eventChan <- agentcore.StreamEvent{
 					Type:         agentcore.StreamEventThinkingDelta,
 					ContentIndex: thinkIdx,
-					Delta:        chunk.Content,
+					Delta:        content,
 					Message:      partial,
 				}
 			},
@@ -334,8 +339,8 @@ func convertResponse(response *litellm.Response) agentcore.Message {
 	var content []agentcore.ContentBlock
 
 	// Thinking/reasoning content
-	if response.Reasoning != nil && response.Reasoning.Content != "" {
-		content = append(content, agentcore.ThinkingBlock(response.Reasoning.Content))
+	if response.ReasoningContent != "" {
+		content = append(content, agentcore.ThinkingBlock(response.ReasoningContent))
 	}
 
 	// Text content

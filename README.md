@@ -2,7 +2,7 @@
 
 **AgentCore** is a minimal, composable Go library for building AI agent applications.
 
-[Examples](./examples/) | [简体中文](./README_CN.md)
+[English](README.md) | [中文](README_CN.md)
 
 ## Install
 
@@ -13,6 +13,11 @@ go get github.com/voocel/agentcore
 ## Design Philosophy
 
 A restrained core with open extensibility tends to be more reliable than a complex all-in-one solution. Fewer built-ins, more possibilities.
+
+## Stability
+
+- Keep `Agent`, `AgentLoop`, `Event`, `Tool`, and `Message` stable first
+- Behavioral changes should come with tests first; `examples/` and internal implementation details are not stable API
 
 ## Architecture
 
@@ -45,6 +50,7 @@ import (
 
     "github.com/voocel/agentcore"
     "github.com/voocel/agentcore/llm"
+    "github.com/voocel/agentcore/policy"
     "github.com/voocel/agentcore/tools"
 )
 
@@ -63,6 +69,7 @@ func main() {
             tools.NewEdit("."),
             tools.NewBash("."),
         ),
+        agentcore.WithPermission(policy.WorkspaceProfile(".")),
     )
 
     agent.Subscribe(func(ev agentcore.Event) {
@@ -77,6 +84,8 @@ func main() {
     agent.WaitForIdle()
 }
 ```
+
+For a safer default, use `policy.ReadOnlyProfile(root)` or `policy.WorkspaceProfile(root)`.
 
 ### Multi-Agent (SubAgent Tool)
 
