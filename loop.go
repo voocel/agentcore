@@ -197,6 +197,21 @@ func runLoop(ctx context.Context, currentCtx *AgentContext, newMessages *[]Agent
 					currentCtx.Messages = append(currentCtx.Messages, resultMsg)
 					*newMessages = append(*newMessages, resultMsg)
 				}
+				// Inject sibling text after ALL tool results so tool_result
+				// blocks stay grouped. The Anthropic provider merges consecutive
+				// user-role messages, producing the expected format:
+				//   user: [{tool_result: ...}, ..., {text: "Tool loaded."}]
+				for _, tr := range turnToolResults {
+					if tr.SiblingText != "" {
+						textMsg := Message{
+							Role:      RoleUser,
+							Content:   []ContentBlock{TextBlock(tr.SiblingText)},
+							Timestamp: time.Now(),
+						}
+						currentCtx.Messages = append(currentCtx.Messages, textMsg)
+						*newMessages = append(*newMessages, textMsg)
+					}
+				}
 
 				steeringAfterTools = steering
 			}
@@ -683,11 +698,25 @@ func executeSingleToolCall(ctx context.Context, tools []Tool, call ToolCall, con
 					IsError:    true,
 				}
 			} else {
-				summary := contentBlocksTextSummary(blocks)
-				result = ToolResult{
-					ToolCallID:    call.ID,
-					Content:       summary,
-					ContentBlocks: blocks,
+				// Separate tool_reference blocks from text blocks.
+				// tool_reference goes into tool_result content; text becomes
+				// a sibling text block alongside the tool_result (matching
+				// the Anthropic tool search API format).
+				refBlocks, siblingText := splitToolRefBlocks(blocks)
+				if len(refBlocks) > 0 {
+					result = ToolResult{
+						ToolCallID:    call.ID,
+						Content:       contentBlocksTextSummary(blocks),
+						ContentBlocks: refBlocks,
+						SiblingText:   siblingText,
+					}
+				} else {
+					summary := contentBlocksTextSummary(blocks)
+					result = ToolResult{
+						ToolCallID:    call.ID,
+						Content:       summary,
+						ContentBlocks: blocks,
+					}
 				}
 			}
 		} else {
@@ -801,7 +830,8 @@ func toolLabel(tool Tool) string {
 }
 
 // buildToolSpecs converts Tool interfaces to ToolSpec for the LLM.
-// When a DeferFilter is present among the tools, deferred tools are excluded.
+// When a DeferFilter is present among the tools, unactivated deferred tools
+// are excluded and activated deferred tools are sent with DeferLoading: true.
 func buildToolSpecs(tools []Tool) []ToolSpec {
 	if len(tools) == 0 {
 		return nil
@@ -823,7 +853,10 @@ func buildToolSpecs(tools []Tool) []ToolSpec {
 			Parameters:  t.Schema(),
 		}
 		if filter != nil && filter.IsDeferred(t.Name()) {
-			spec.DeferLoading = true
+			continue // unactivated deferred → don't send schema
+		}
+		if filter != nil && filter.WasDeferred(t.Name()) {
+			spec.DeferLoading = true // activated deferred → send with defer_loading
 		}
 		specs = append(specs, spec)
 	}
@@ -946,6 +979,26 @@ func copyMessages(msgs []AgentMessage) []AgentMessage {
 	out := make([]AgentMessage, len(msgs))
 	copy(out, msgs)
 	return out
+}
+
+// splitToolRefBlocks separates tool_reference blocks from text blocks.
+// Returns the tool_reference blocks and concatenated text from text blocks.
+// Used to format tool search results: tool_reference goes into tool_result
+// content, text becomes a sibling block outside the tool_result.
+func splitToolRefBlocks(blocks []ContentBlock) (refs []ContentBlock, text string) {
+	var texts []string
+	for _, b := range blocks {
+		switch b.Type {
+		case ContentToolRef:
+			refs = append(refs, b)
+		case ContentText:
+			if b.Text != "" {
+				texts = append(texts, b.Text)
+			}
+		}
+	}
+	text = strings.Join(texts, "\n")
+	return
 }
 
 // contentBlocksTextSummary extracts text from ContentBlocks as a JSON string

@@ -61,11 +61,13 @@ func NewToolSearchTool(deferred ...agentcore.Tool) *ToolSearchTool {
 func (t *ToolSearchTool) Name() string { return "tool_search" }
 
 func (t *ToolSearchTool) Description() string {
-	return "Search for and activate deferred tools. " +
-		"Query modes: \"select:Name1,Name2\" for exact selection, " +
-		"\"/regex_pattern/\" for regex matching (e.g. \"/web_.*/\", \"/(?i)cron/\"), " +
-		"or plain keywords for scored search. " +
-		"Returns tool_reference blocks that activate matched tools."
+	return "Fetches full schema definitions for deferred tools so they can be called. " +
+		"Deferred tools appear by name in <available-deferred-tools> messages. " +
+		"Until fetched, only the name is known — there is no parameter schema, " +
+		"so the tool cannot be invoked. This tool takes a query, matches it against " +
+		"the deferred tool list, and returns the matched tools' complete JSONSchema " +
+		"definitions. Query modes: \"select:Name1,Name2\" for exact selection, " +
+		"\"/regex_pattern/\" for regex matching, or plain keywords for scored search."
 }
 
 func (t *ToolSearchTool) Schema() map[string]any {
@@ -74,14 +76,15 @@ func (t *ToolSearchTool) Schema() map[string]any {
 		"properties": map[string]any{
 			"query": map[string]any{
 				"type":        "string",
-				"description": "Search query. Modes: \"select:Name1,Name2\" for exact match, \"/pattern/\" for regex, or keywords for scored search.",
+				"description": "Query to find deferred tools. Use \"select:<tool_name>\" for direct selection, or keywords to search.",
 			},
 			"max_results": map[string]any{
-				"type":        "integer",
-				"description": "Maximum number of results to return (default: 5).",
+				"type":        "number",
+				"description": "Maximum number of results to return (default: 5)",
+				"default":     5,
 			},
 		},
-		"required":             []string{"query"},
+		"required":             []string{"query", "max_results"},
 		"additionalProperties": false,
 	}
 }
@@ -115,12 +118,10 @@ func (t *ToolSearchTool) ExecuteContent(_ context.Context, args json.RawMessage)
 	}
 
 	blocks := make([]agentcore.ContentBlock, 0, len(matches)+1)
-	blocks = append(blocks, agentcore.TextBlock(
-		fmt.Sprintf("Found %d tool(s). They are now available for use.", len(matches)),
-	))
 	for _, name := range matches {
 		blocks = append(blocks, agentcore.ToolRefBlock(name))
 	}
+	blocks = append(blocks, agentcore.TextBlock("Tool loaded."))
 	return blocks, nil
 }
 
@@ -142,7 +143,7 @@ func (t *ToolSearchTool) Execute(ctx context.Context, args json.RawMessage) (jso
 }
 
 // IsDeferred implements agentcore.DeferFilter.
-// Returns true for deferred tools not yet activated.
+// Returns true for deferred tools not yet activated (should be excluded from API).
 func (t *ToolSearchTool) IsDeferred(name string) bool {
 	t.mu.RLock()
 	defer t.mu.RUnlock()
@@ -150,6 +151,15 @@ func (t *ToolSearchTool) IsDeferred(name string) bool {
 		return false
 	}
 	return !t.activated[name]
+}
+
+// WasDeferred implements agentcore.DeferFilter.
+// Returns true if the tool was originally in the deferred set (regardless of
+// activation state). Activated deferred tools are sent with defer_loading: true.
+func (t *ToolSearchTool) WasDeferred(name string) bool {
+	t.mu.RLock()
+	defer t.mu.RUnlock()
+	return t.deferredNames[name]
 }
 
 // DeferredNames returns the names of all deferred (not yet activated) tools.

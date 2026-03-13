@@ -48,6 +48,7 @@ type ToolResult struct {
 	ContentBlocks []ContentBlock   `json:"-"` // rich content (images); not serialized
 	IsError       bool             `json:"is_error,omitempty"`
 	Details       any              `json:"details,omitempty"` // optional metadata for UI display/logging
+	SiblingText   string           `json:"-"` // text injected alongside (not inside) tool_result
 }
 
 // ---------------------------------------------------------------------------
@@ -84,13 +85,27 @@ type Previewer interface {
 	Preview(ctx context.Context, args json.RawMessage) (json.RawMessage, error)
 }
 
-// DeferFilter controls which tools are visible to the LLM.
-// When a tool in the agent's tool list implements DeferFilter,
-// buildToolSpecs calls IsDeferred for each tool and skips those
-// that return true (their schemas are not sent to the LLM).
-// Tools remain registered for execution — only their specs are hidden.
+// DeferFilter controls deferred tool loading for the LLM.
+// When a tool in the agent's tool list implements DeferFilter:
+//   - IsDeferred returns true → tool schema is excluded from the API request
+//   - WasDeferred returns true → tool schema is sent with defer_loading: true
+//
+// Unactivated deferred tools are excluded entirely. Once activated via
+// tool_reference, they are sent with defer_loading: true so the API server
+// manages their context loading. Tools remain registered for execution
+// regardless — only their API visibility changes.
+//
+// IsDeferred is also used by the system prompt builder to exclude unactivated
+// tools from the tool description section (they appear in
+// <available-deferred-tools> by name only).
 type DeferFilter interface {
+	// IsDeferred reports whether the tool is deferred and not yet activated.
+	// Unactivated deferred tools are excluded from the API request entirely.
 	IsDeferred(toolName string) bool
+	// WasDeferred reports whether the tool was originally in the deferred set
+	// (regardless of activation). Activated deferred tools are sent with
+	// defer_loading: true.
+	WasDeferred(toolName string) bool
 }
 
 // PermissionFunc is called before each tool execution.
