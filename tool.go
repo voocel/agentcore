@@ -48,7 +48,6 @@ type ToolResult struct {
 	ContentBlocks []ContentBlock   `json:"-"` // rich content (images); not serialized
 	IsError       bool             `json:"is_error,omitempty"`
 	Details       any              `json:"details,omitempty"` // optional metadata for UI display/logging
-	SiblingText   string           `json:"-"` // text injected alongside (not inside) tool_result
 }
 
 // ---------------------------------------------------------------------------
@@ -106,6 +105,46 @@ type DeferFilter interface {
 	// (regardless of activation). Activated deferred tools are sent with
 	// defer_loading: true.
 	WasDeferred(toolName string) bool
+}
+
+// DeferActivator is an optional extension of DeferFilter that supports
+// pre-activating deferred tools (e.g. when restoring a session whose
+// history contains tool_reference blocks for previously activated tools).
+type DeferActivator interface {
+	DeferFilter
+	Activate(names ...string)
+}
+
+// ReactivateDeferred scans restored messages for tool_reference blocks and
+// pre-activates them via the DeferActivator found in tools. This must be
+// called after restoring a session to avoid "Tool reference not found" errors.
+func ReactivateDeferred(tools []Tool, msgs []AgentMessage) {
+	var activator DeferActivator
+	for _, t := range tools {
+		if a, ok := t.(DeferActivator); ok {
+			activator = a
+			break
+		}
+	}
+	if activator == nil {
+		return
+	}
+
+	var names []string
+	for _, am := range msgs {
+		msg, ok := am.(Message)
+		if !ok {
+			continue
+		}
+		for _, b := range msg.Content {
+			if b.Type == ContentToolRef && b.ToolName != "" {
+				names = append(names, b.ToolName)
+			}
+		}
+	}
+	if len(names) > 0 {
+		activator.Activate(names...)
+	}
 }
 
 // PermissionFunc is called before each tool execution.

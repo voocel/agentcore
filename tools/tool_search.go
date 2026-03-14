@@ -162,6 +162,19 @@ func (t *ToolSearchTool) WasDeferred(name string) bool {
 	return t.deferredNames[name]
 }
 
+// Activate marks the given tool names as activated so their schemas
+// are sent to the API with defer_loading: true instead of being excluded.
+// Used to restore activation state when resuming a session.
+func (t *ToolSearchTool) Activate(names ...string) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	for _, n := range names {
+		if t.deferredNames[n] {
+			t.activated[n] = true
+		}
+	}
+}
+
 // DeferredNames returns the names of all deferred (not yet activated) tools.
 func (t *ToolSearchTool) DeferredNames() []string {
 	t.mu.RLock()

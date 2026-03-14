@@ -199,21 +199,6 @@ func runLoop(ctx context.Context, currentCtx *AgentContext, newMessages *[]Agent
 					currentCtx.Messages = append(currentCtx.Messages, resultMsg)
 					*newMessages = append(*newMessages, resultMsg)
 				}
-				// Inject sibling text after ALL tool results so tool_result
-				// blocks stay grouped. The Anthropic provider merges consecutive
-				// user-role messages, producing the expected format:
-				//   user: [{tool_result: ...}, ..., {text: "Tool loaded."}]
-				for _, tr := range turnToolResults {
-					if tr.SiblingText != "" {
-						textMsg := Message{
-							Role:      RoleUser,
-							Content:   []ContentBlock{TextBlock(tr.SiblingText)},
-							Timestamp: time.Now(),
-						}
-						currentCtx.Messages = append(currentCtx.Messages, textMsg)
-						*newMessages = append(*newMessages, textMsg)
-					}
-				}
 
 				steeringAfterTools = steering
 			}
@@ -709,17 +694,21 @@ func executeSingleToolCall(ctx context.Context, tools []Tool, call ToolCall, con
 					IsError:    true,
 				}
 			} else {
-				// Separate tool_reference blocks from text blocks.
-				// tool_reference goes into tool_result content; text becomes
-				// a sibling text block alongside the tool_result (matching
-				// the Anthropic tool search API format).
+				// When tool_reference blocks are present, keep them alongside
+				// any text blocks in ContentBlocks. The provider layer splits
+				// tool_reference into tool_result content and text into sibling
+				// blocks within the same user message.
 				refBlocks, siblingText := splitToolRefBlocks(blocks)
 				if len(refBlocks) > 0 {
+					resultBlocks := make([]ContentBlock, 0, len(refBlocks)+1)
+					resultBlocks = append(resultBlocks, refBlocks...)
+					if siblingText != "" {
+						resultBlocks = append(resultBlocks, TextBlock(siblingText))
+					}
 					result = ToolResult{
 						ToolCallID:    call.ID,
 						Content:       contentBlocksTextSummary(blocks),
-						ContentBlocks: refBlocks,
-						SiblingText:   siblingText,
+						ContentBlocks: resultBlocks,
 					}
 				} else {
 					summary := contentBlocksTextSummary(blocks)
