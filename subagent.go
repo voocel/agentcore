@@ -81,6 +81,11 @@ type SubAgentConfig struct {
 	Tools        []Tool
 	StreamFn     StreamFn
 	MaxTurns     int
+
+	// Optional two-stage context pipeline (same as Agent-level).
+	// When set, enables automatic context compaction for long-running sub-agents.
+	TransformContext func(ctx context.Context, msgs []AgentMessage) ([]AgentMessage, error)
+	ConvertToLLM     func(msgs []AgentMessage) []Message
 }
 
 // subagentParams is the JSON schema input for the subagent tool.
@@ -552,9 +557,11 @@ func (t *SubAgentTool) runAgent(ctx context.Context, agentName, task string, mod
 	}
 
 	loopCfg := LoopConfig{
-		Model:    cfg.Model,
-		StreamFn: cfg.StreamFn,
-		MaxTurns: cfg.MaxTurns,
+		Model:            cfg.Model,
+		StreamFn:         cfg.StreamFn,
+		MaxTurns:         cfg.MaxTurns,
+		TransformContext: cfg.TransformContext,
+		ConvertToLLM:     cfg.ConvertToLLM,
 	}
 	if modelOverride != nil {
 		loopCfg.Model = modelOverride
@@ -611,10 +618,15 @@ func (t *SubAgentTool) runAgent(ctx context.Context, agentName, task string, mod
 			}
 		case EventToolExecEnd:
 			if bg == nil && ev.IsError {
+				errMsg := string(ev.Result)
+				if len(errMsg) > 200 {
+					errMsg = errMsg[:200]
+				}
 				data, _ := json.Marshal(map[string]any{
-					"agent": agentName,
-					"tool":  ev.Tool,
-					"error": true,
+					"agent":   agentName,
+					"tool":    ev.Tool,
+					"error":   true,
+					"message": errMsg,
 				})
 				ReportToolProgress(ctx, data)
 			}
