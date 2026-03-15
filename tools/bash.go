@@ -9,7 +9,6 @@ import (
 	"io"
 	"os"
 	"os/exec"
-	"path/filepath"
 	"sync"
 	"time"
 
@@ -56,8 +55,8 @@ func (bs *BackgroundShell) snapshot() BackgroundShell {
 type BashTool struct {
 	WorkDir   string
 	Timeout   time.Duration // default: 2 minutes
-	notifyFn  func(agentcore.AgentMessage)
-	outputDir string // directory for background shell output files
+	notifyFn        func(agentcore.AgentMessage)
+	bgOutputFactory func(shellID string) (io.WriteCloser, string, error) // creates output writer for background shells
 
 	mu       sync.Mutex
 	bgSeq    int
@@ -78,18 +77,11 @@ func (t *BashTool) SetNotifyFn(fn func(agentcore.AgentMessage)) {
 	t.notifyFn = fn
 }
 
-// SetOutputDir sets the directory for background shell output files.
-// If not set, defaults to $TMPDIR/codebot-bg/.
-func (t *BashTool) SetOutputDir(dir string) { t.outputDir = dir }
-
-// outputFilePath returns the path for a background shell's output file.
-func (t *BashTool) outputFilePath(shellID string) string {
-	dir := t.outputDir
-	if dir == "" {
-		dir = filepath.Join(os.TempDir(), "codebot-bg")
-	}
-	_ = os.MkdirAll(dir, 0o700)
-	return filepath.Join(dir, shellID+".output")
+// SetBgOutputFactory sets the factory that creates output writers for background shells.
+// The factory receives the shell ID and returns a writer, file path, and error.
+// If not set, background output is discarded.
+func (t *BashTool) SetBgOutputFactory(fn func(shellID string) (io.WriteCloser, string, error)) {
+	t.bgOutputFactory = fn
 }
 
 // BackgroundShells returns a snapshot of all background shells.
@@ -221,12 +213,16 @@ func (t *BashTool) executeBackground(a bashArgs) (json.RawMessage, error) {
 		desc = bashTruncate(a.Command, 60)
 	}
 
-	outPath := t.outputFilePath(shellID)
-	outFile, ferr := os.Create(outPath)
-	if ferr != nil {
-		cancel()
-		pr.Close()
-		return nil, fmt.Errorf("create output file: %w", ferr)
+	var outFile io.WriteCloser
+	var outPath string
+	if t.bgOutputFactory != nil {
+		var ferr error
+		outFile, outPath, ferr = t.bgOutputFactory(shellID)
+		if ferr != nil {
+			cancel()
+			pr.Close()
+			return nil, fmt.Errorf("create output: %w", ferr)
+		}
 	}
 
 	bs := &BackgroundShell{
@@ -246,12 +242,17 @@ func (t *BashTool) executeBackground(a bashArgs) (json.RawMessage, error) {
 	// Background goroutine: stream output to file, wait for exit, notify.
 	go func() {
 		defer cancel()
-		defer outFile.Close()
+
+		var w io.Writer = io.Discard
+		if outFile != nil {
+			defer outFile.Close()
+			w = outFile
+		}
 
 		done := make(chan struct{})
 		go func() {
 			defer close(done)
-			io.Copy(outFile, pr)
+			io.Copy(w, pr)
 		}()
 
 		waitErr := cmd.Wait()
@@ -275,6 +276,10 @@ func (t *BashTool) executeBackground(a bashArgs) (json.RawMessage, error) {
 		}
 
 		bs.mu.Lock()
+		if bs.Status != "running" {
+			bs.mu.Unlock()
+			return
+		}
 		bs.Status = status
 		bs.ExitCode = exitCode
 		bs.EndedAt = time.Now()

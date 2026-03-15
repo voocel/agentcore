@@ -4,8 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"os"
-	"path/filepath"
+	"io"
 	"strings"
 	"sync"
 	"time"
@@ -136,10 +135,9 @@ type subagentUsage struct {
 // with isolated contexts.
 type SubAgentTool struct {
 	agents       map[string]SubAgentConfig
-	notifyFn     func(AgentMessage)                   // called when a background task completes
-	createModel  func(name string) (ChatModel, error) // resolves model name to ChatModel at runtime
-	tasksDir     string                                // tmp dir for task output files (shared with BashTool)
-	subagentsDir string                                // persistent dir for agent output files
+	notifyFn        func(AgentMessage)                   // called when a background task completes
+	createModel     func(name string) (ChatModel, error) // resolves model name to ChatModel at runtime
+	bgOutputFactory func(taskID, agentName string) (io.WriteCloser, string, error) // creates output writer for background tasks
 	mu           sync.Mutex
 	bgSeq        int
 	bgTasks      map[string]*BackgroundTask // background task registry
@@ -217,12 +215,11 @@ func (t *SubAgentTool) SetCreateModel(fn func(name string) (ChatModel, error)) {
 	t.createModel = fn
 }
 
-// SetDirs configures the output directories for background tasks.
-// tasksDir: tmp dir for task output files (symlinks for agents, shared with BashTool)
-// subagentsDir: persistent dir for agent output files (~/.codebot/projects/<project>/<session>/subagents/)
-func (t *SubAgentTool) SetDirs(tasksDir, subagentsDir string) {
-	t.tasksDir = tasksDir
-	t.subagentsDir = subagentsDir
+// SetBgOutputFactory sets the factory that creates output writers for background tasks.
+// The factory receives the task ID and agent name, returns a writer, file path, and error.
+// If not set, background output is not persisted.
+func (t *SubAgentTool) SetBgOutputFactory(fn func(taskID, agentName string) (io.WriteCloser, string, error)) {
+	t.bgOutputFactory = fn
 }
 
 func (t *SubAgentTool) Name() string  { return "subagent" }
@@ -339,35 +336,29 @@ func (t *SubAgentTool) executeBackground(agentName, task, description string, mo
 	t.mu.Unlock()
 
 	go func() {
-		// Create jsonl file for session persistence and symlink in tasks dir.
-		var outFile *os.File
-		var outPath string
-		if t.subagentsDir != "" {
-			_ = os.MkdirAll(t.subagentsDir, 0o700)
-			outPath = filepath.Join(t.subagentsDir, "agent-"+taskID+".jsonl")
-			if f, ferr := os.Create(outPath); ferr == nil {
-				outFile = f
+		defer cancel()
+
+		var outFile io.WriteCloser
+		if t.bgOutputFactory != nil {
+			w, path, ferr := t.bgOutputFactory(taskID, agentName)
+			if ferr == nil {
+				outFile = w
 				bt.mu.Lock()
-				bt.OutputFile = outPath
+				bt.OutputFile = path
 				bt.mu.Unlock()
-				// Write meta file.
-				meta, _ := json.Marshal(map[string]string{"agentType": agentName})
-				_ = os.WriteFile(filepath.Join(t.subagentsDir, "agent-"+taskID+".meta.json"), meta, 0o600)
-				// Create symlink in shared tasks dir.
-				if t.tasksDir != "" {
-					_ = os.MkdirAll(t.tasksDir, 0o700)
-					_ = os.Symlink(outPath, filepath.Join(t.tasksDir, "agent-"+taskID+".output"))
-				}
 			}
 		}
 
-		output, usage, err := t.runAgentWithProgress(bgCtx, agentName, task, modelOverride, bt, outFile)
+		_, usage, err := t.runAgent(bgCtx, agentName, task, modelOverride, &bgRunOpts{bt: bt, outFile: outFile})
 		if outFile != nil {
 			outFile.Close()
 		}
-		_ = output // final text already streamed to jsonl
 
 		bt.mu.Lock()
+		if bt.Status != "running" {
+			bt.mu.Unlock()
+			return
+		}
 		bt.EndedAt = time.Now()
 		if err != nil {
 			bt.Status = "failed"
@@ -427,7 +418,7 @@ func (t *SubAgentTool) notify(result map[string]any) {
 
 // executeSingle runs one sub-agent with an isolated context.
 func (t *SubAgentTool) executeSingle(ctx context.Context, agentName, task string, modelOverride ChatModel) (json.RawMessage, error) {
-	output, usage, err := t.runAgent(ctx, agentName, task, modelOverride)
+	output, usage, err := t.runAgent(ctx, agentName, task, modelOverride, nil)
 	if err != nil {
 		return json.Marshal(map[string]any{
 			"error": fmt.Sprintf("Agent %q failed: %v", agentName, err),
@@ -451,7 +442,7 @@ func (t *SubAgentTool) executeChain(ctx context.Context, chain []subagentChain, 
 		}
 
 		task := strings.ReplaceAll(step.Task, "{previous}", previous)
-		output, usage, err := t.runAgent(ctx, step.Agent, task, modelOverride)
+		output, usage, err := t.runAgent(ctx, step.Agent, task, modelOverride, nil)
 
 		result := subagentResult{
 			Agent: step.Agent,
@@ -498,7 +489,7 @@ func (t *SubAgentTool) executeParallel(ctx context.Context, tasks []subagentTask
 			sem <- struct{}{}
 			defer func() { <-sem }()
 
-			output, usage, err := t.runAgent(ctx, st.Agent, st.Task, modelOverride)
+			output, usage, err := t.runAgent(ctx, st.Agent, st.Task, modelOverride, nil)
 			result := subagentResult{
 				Agent: st.Agent,
 				Task:  st.Task,
@@ -529,107 +520,16 @@ func (t *SubAgentTool) executeParallel(ctx context.Context, tasks []subagentTask
 	})
 }
 
-// runAgentWithProgress is like runAgent but also updates a BackgroundTask with real-time progress.
-// If outFile is non-nil, each message is streamed as a jsonl line for session persistence.
-func (t *SubAgentTool) runAgentWithProgress(ctx context.Context, agentName, task string, modelOverride ChatModel, bt *BackgroundTask, outFile *os.File) (output string, usage *subagentUsage, err error) {
-	cfg, ok := t.agents[agentName]
-	if !ok {
-		available := make([]string, 0, len(t.agents))
-		for name := range t.agents {
-			available = append(available, name)
-		}
-		return "", nil, fmt.Errorf("unknown agent %q, available: %s", agentName, strings.Join(available, ", "))
-	}
-
-	defer func() {
-		if r := recover(); r != nil {
-			err = fmt.Errorf("subagent %q panicked: %v", agentName, r)
-		}
-	}()
-
-	agentCtx := AgentContext{
-		SystemPrompt: cfg.SystemPrompt,
-		Tools:        cfg.Tools,
-	}
-
-	loopCfg := LoopConfig{
-		Model:    cfg.Model,
-		StreamFn: cfg.StreamFn,
-		MaxTurns: cfg.MaxTurns,
-	}
-	if modelOverride != nil {
-		loopCfg.Model = modelOverride
-	}
-	if loopCfg.MaxTurns <= 0 {
-		loopCfg.MaxTurns = defaultMaxTurns
-	}
-
-	events := AgentLoop(ctx, []AgentMessage{UserMsg(task)}, agentCtx, loopCfg)
-
-	var lastAssistantContent string
-	var lastErr error
-	su := &subagentUsage{}
-
-	for ev := range events {
-		switch ev.Type {
-		case EventToolExecStart:
-			su.Tools++
-			bt.mu.Lock()
-			bt.ToolCount++
-			bt.mu.Unlock()
-			label := ev.Tool
-			if len(ev.Args) > 0 {
-				label += "(" + truncate(string(ev.Args), 60) + ")"
-			}
-			bt.addProgress(label)
-		case EventToolExecEnd:
-			// no-op for progress
-		case EventMessageEnd:
-			if ev.Message == nil {
-				continue
-			}
-			// Stream message to jsonl file for session persistence.
-			if outFile != nil {
-				if msg, ok := ev.Message.(Message); ok {
-					if line, je := json.Marshal(msg); je == nil {
-						line = append(line, '\n')
-						outFile.Write(line)
-					}
-				}
-			}
-			if ev.Message.GetRole() == RoleAssistant {
-				lastAssistantContent = ev.Message.TextContent()
-				su.Turns++
-				if msg, ok := ev.Message.(Message); ok && msg.Usage != nil {
-					su.Input += msg.Usage.Input
-					su.Output += msg.Usage.Output
-					su.CacheRead += msg.Usage.CacheRead
-					su.CacheWrite += msg.Usage.CacheWrite
-					if msg.Usage.Cost != nil {
-						su.Cost += msg.Usage.Cost.Total
-					}
-				}
-				bt.updateTokens(su.Input, su.Output)
-			}
-		case EventError:
-			if ev.Err != nil {
-				lastErr = ev.Err
-			}
-		}
-	}
-
-	if lastErr != nil && lastAssistantContent == "" {
-		return "", su, lastErr
-	}
-	if lastAssistantContent == "" {
-		return "(no output)", su, nil
-	}
-	return lastAssistantContent, su, nil
+// bgRunOpts configures background-specific behavior for runAgent.
+// When nil, runAgent runs in foreground mode (reports progress to parent context).
+type bgRunOpts struct {
+	bt      *BackgroundTask // background task to update with progress
+	outFile io.Writer       // output stream for session persistence (optional)
 }
 
 // runAgent executes an isolated agent loop for the given agent config and task.
 // Includes panic recovery to prevent a subagent crash from taking down the parent.
-func (t *SubAgentTool) runAgent(ctx context.Context, agentName, task string, modelOverride ChatModel) (output string, usage *subagentUsage, err error) {
+func (t *SubAgentTool) runAgent(ctx context.Context, agentName, task string, modelOverride ChatModel, bg *bgRunOpts) (output string, usage *subagentUsage, err error) {
 	cfg, ok := t.agents[agentName]
 	if !ok {
 		available := make([]string, 0, len(t.agents))
@@ -673,31 +573,44 @@ func (t *SubAgentTool) runAgent(ctx context.Context, agentName, task string, mod
 		switch ev.Type {
 		case EventToolExecStart:
 			su.Tools++
-			data, _ := json.Marshal(map[string]any{
-				"agent": agentName,
-				"tool":  ev.Tool,
-				"args":  ev.Args,
-			})
-			ReportToolProgress(ctx, data)
-		case EventMessageUpdate:
-			if ev.Delta != "" {
+			if bg != nil {
+				bg.bt.mu.Lock()
+				bg.bt.ToolCount++
+				bg.bt.mu.Unlock()
+				label := ev.Tool
+				if len(ev.Args) > 0 {
+					label += "(" + truncate(string(ev.Args), 60) + ")"
+				}
+				bg.bt.addProgress(label)
+			} else {
 				data, _ := json.Marshal(map[string]any{
 					"agent": agentName,
-					"delta": ev.Delta,
+					"tool":  ev.Tool,
+					"args":  ev.Args,
 				})
 				ReportToolProgress(ctx, data)
 			}
-			if ev.Message != nil {
-				if thinking := ev.Message.ThinkingContent(); thinking != "" {
+		case EventMessageUpdate:
+			if bg == nil {
+				if ev.Delta != "" {
 					data, _ := json.Marshal(map[string]any{
-						"agent":    agentName,
-						"thinking": thinking,
+						"agent": agentName,
+						"delta": ev.Delta,
 					})
 					ReportToolProgress(ctx, data)
 				}
+				if ev.Message != nil {
+					if thinking := ev.Message.ThinkingContent(); thinking != "" {
+						data, _ := json.Marshal(map[string]any{
+							"agent":    agentName,
+							"thinking": thinking,
+						})
+						ReportToolProgress(ctx, data)
+					}
+				}
 			}
 		case EventToolExecEnd:
-			if ev.IsError {
+			if bg == nil && ev.IsError {
 				data, _ := json.Marshal(map[string]any{
 					"agent": agentName,
 					"tool":  ev.Tool,
@@ -709,15 +622,24 @@ func (t *SubAgentTool) runAgent(ctx context.Context, agentName, task string, mod
 			if ev.Message == nil {
 				continue
 			}
+			if bg != nil && bg.outFile != nil {
+				if msg, ok := ev.Message.(Message); ok {
+					if line, je := json.Marshal(msg); je == nil {
+						line = append(line, '\n')
+						bg.outFile.Write(line)
+					}
+				}
+			}
 			if ev.Message.GetRole() == RoleAssistant {
 				lastAssistantContent = ev.Message.TextContent()
 				su.Turns++
-				data, _ := json.Marshal(map[string]any{
-					"agent": agentName,
-					"turn":  su.Turns,
-				})
-				ReportToolProgress(ctx, data)
-				// Accumulate usage from assistant messages
+				if bg == nil {
+					data, _ := json.Marshal(map[string]any{
+						"agent": agentName,
+						"turn":  su.Turns,
+					})
+					ReportToolProgress(ctx, data)
+				}
 				if msg, ok := ev.Message.(Message); ok && msg.Usage != nil {
 					su.Input += msg.Usage.Input
 					su.Output += msg.Usage.Output
@@ -725,6 +647,9 @@ func (t *SubAgentTool) runAgent(ctx context.Context, agentName, task string, mod
 					su.CacheWrite += msg.Usage.CacheWrite
 					if msg.Usage.Cost != nil {
 						su.Cost += msg.Usage.Cost.Total
+					}
+					if bg != nil {
+						bg.bt.updateTokens(msg.Usage.Input, msg.Usage.Output)
 					}
 				}
 			}

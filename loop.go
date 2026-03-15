@@ -3,6 +3,7 @@ package agentcore
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"math"
 	"strings"
@@ -305,6 +306,47 @@ func recoverOverflow(ctx context.Context, agentCtx *AgentContext, config LoopCon
 
 	agentCtx.Messages = compacted
 	return callLLM(ctx, agentCtx, config, ch)
+}
+
+// contextOverflowPatterns are substrings in error messages that indicate
+// the request exceeded the model's context window.
+var contextOverflowPatterns = []string{
+	"maximum context length",
+	"context length exceeded",
+	"context window",
+	"token limit",
+	"too many tokens",
+	"max_tokens",
+	"maximum number of tokens",
+	"input is too long",
+	"prompt is too long",
+	"request too large",
+	"content too large",
+	"exceeds the model",
+	"reduce the length",
+	"reduce your prompt",
+}
+
+// IsContextOverflow reports whether the error indicates a context window overflow.
+func IsContextOverflow(err error) bool {
+	if err == nil {
+		return false
+	}
+	msg := strings.ToLower(err.Error())
+	for _, pattern := range contextOverflowPatterns {
+		if strings.Contains(msg, pattern) {
+			return true
+		}
+	}
+	for cause := errors.Unwrap(err); cause != nil; cause = errors.Unwrap(cause) {
+		lowerMsg := strings.ToLower(cause.Error())
+		for _, pattern := range contextOverflowPatterns {
+			if strings.Contains(lowerMsg, pattern) {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 // retryDelay calculates the wait duration using exponential backoff.
