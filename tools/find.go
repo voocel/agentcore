@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
+	"path"
 	"path/filepath"
 	"strings"
 
@@ -23,11 +24,11 @@ func NewFind(workDir string) *FindTool { return &FindTool{WorkDir: workDir} }
 func (t *FindTool) Name() string  { return "find" }
 func (t *FindTool) Label() string { return "Find Files" }
 func (t *FindTool) Description() string {
-	return "Search for files by glob pattern. Returns matching file paths (default limit: 1000)."
+	return "Search for files by glob pattern, including path-aware patterns like 'cmd/*.go' and 'src/**/*.ts'. Returns paths relative to the search directory (default limit: 1000)."
 }
 func (t *FindTool) Schema() map[string]any {
 	return schema.Object(
-		schema.Property("pattern", schema.String("Glob pattern to match (e.g. '*.go', 'src/**/*.ts')")).Required(),
+		schema.Property("pattern", schema.String("Glob pattern to match files (for example: '*.go', 'cmd/*.go', 'src/**/*.ts')")).Required(),
 		schema.Property("path", schema.String("Directory to search in (default: working directory)")),
 		schema.Property("limit", schema.Int("Maximum number of results (default: 1000)")),
 	)
@@ -102,8 +103,8 @@ func (t *FindTool) findWithWalk(ctx context.Context, pattern, dir string, limit 
 			}
 			return nil
 		}
-		if matched, _ := filepath.Match(pattern, d.Name()); matched {
-			rel, _ := filepath.Rel(dir, path)
+		rel, _ := filepath.Rel(dir, path)
+		if findPatternMatches(pattern, rel) {
 			matches = append(matches, rel)
 		}
 		if len(matches) >= limit {
@@ -132,6 +133,64 @@ func (t *FindTool) findWithWalk(ctx context.Context, pattern, dir string, limit 
 		return json.Marshal(tr.Content + "\n\n[Output truncated at " + formatSize(defaultMaxBytes) + ".]")
 	}
 	return json.Marshal(output)
+}
+
+func findPatternMatches(pattern, rel string) bool {
+	pattern = filepath.ToSlash(strings.TrimSpace(pattern))
+	rel = filepath.ToSlash(rel)
+	pattern = strings.TrimPrefix(pattern, "./")
+	rel = strings.TrimPrefix(rel, "./")
+	if pattern == "" || rel == "" {
+		return false
+	}
+
+	if !strings.Contains(pattern, "/") {
+		matched, _ := path.Match(pattern, path.Base(rel))
+		return matched
+	}
+
+	return matchGlobSegments(splitGlobSegments(pattern), splitGlobSegments(rel))
+}
+
+func splitGlobSegments(value string) []string {
+	parts := strings.Split(value, "/")
+	out := make([]string, 0, len(parts))
+	for _, part := range parts {
+		if part == "" || part == "." {
+			continue
+		}
+		out = append(out, part)
+	}
+	return out
+}
+
+func matchGlobSegments(patterns, segments []string) bool {
+	if len(patterns) == 0 {
+		return len(segments) == 0
+	}
+
+	if patterns[0] == "**" {
+		for len(patterns) > 1 && patterns[1] == "**" {
+			patterns = patterns[1:]
+		}
+		if matchGlobSegments(patterns[1:], segments) {
+			return true
+		}
+		if len(segments) == 0 {
+			return false
+		}
+		return matchGlobSegments(patterns, segments[1:])
+	}
+
+	if len(segments) == 0 {
+		return false
+	}
+
+	matched, err := path.Match(patterns[0], segments[0])
+	if err != nil || !matched {
+		return false
+	}
+	return matchGlobSegments(patterns[1:], segments[1:])
 }
 
 func (t *FindTool) formatResults(raw, dir string, limit int) (json.RawMessage, error) {

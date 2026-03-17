@@ -22,7 +22,7 @@ func NewEdit(workDir string) *EditTool { return &EditTool{WorkDir: workDir} }
 func (t *EditTool) Name() string  { return "edit" }
 func (t *EditTool) Label() string { return "Edit File" }
 func (t *EditTool) Description() string {
-	return "Edit a file by replacing exact text. The oldText must match exactly (including whitespace). Use this for precise, surgical edits."
+	return "Edit an existing file by replacing one unique text block. Use read first, then copy the exact file content into old_text without any line numbers or prefixes. Preserve indentation for multi-line edits. If the target appears multiple times, include more surrounding context instead of guessing."
 }
 func (t *EditTool) Schema() map[string]any {
 	return schema.Object(
@@ -70,12 +70,31 @@ func (t *EditTool) parseAndMatch(args json.RawMessage) (*editResult, error) {
 	newText := normalizeToLF(a.NewText)
 
 	idx, matchLen := fuzzyFind(content, oldText)
+	count := 0
+	usedIndentAware := false
 	if idx < 0 {
+		if strings.Contains(oldText, "\n") {
+			idx, matchLen, count = indentAwareFind(content, oldText)
+			if count > 1 {
+				return nil, fmt.Errorf("found %d indentation-insensitive occurrences of the text in %s. Provide more context", count, a.Path)
+			}
+			usedIndentAware = idx >= 0
+		}
+	}
+	if idx < 0 {
+		if hints := formatEditCandidates(content, oldText); hints != "" {
+			return nil, fmt.Errorf("could not find the exact text in %s. The old text must match exactly including all whitespace and newlines.\n\nPossible old_text candidates (copy one exactly):\n%s", a.Path, hints)
+		}
 		return nil, fmt.Errorf("could not find the exact text in %s. The old text must match exactly including all whitespace and newlines", a.Path)
 	}
 
-	if count := strings.Count(normalizeForFuzzy(content), normalizeForFuzzy(oldText)); count > 1 {
+	count = strings.Count(normalizeForFuzzy(content), normalizeForFuzzy(oldText))
+	if count > 1 {
 		return nil, fmt.Errorf("found %d occurrences of the text in %s. The text must be unique. Provide more context", count, a.Path)
+	}
+
+	if usedIndentAware {
+		newText = reindentReplacement(newText, oldText, content[idx:idx+matchLen])
 	}
 
 	newContent := content[:idx] + newText + content[idx+matchLen:]
@@ -279,6 +298,330 @@ func fuzzyFind(content, oldText string) (idx, matchLen int) {
 		return -1, 0
 	}
 	return startByte, endByte - startByte
+}
+
+func indentAwareFind(content, oldText string) (idx, matchLen, count int) {
+	oldLines := strings.Split(oldText, "\n")
+	contentLines := strings.Split(content, "\n")
+	if len(oldLines) == 0 || len(oldLines) > len(contentLines) {
+		return -1, 0, 0
+	}
+
+	target := normalizeLinesForIndentAware(oldLines)
+	lineStarts := lineStartOffsets(content)
+
+	var matches []struct{ start, end int }
+	for i := 0; i+len(oldLines) <= len(contentLines); i++ {
+		window := contentLines[i : i+len(oldLines)]
+		if normalizeLinesForIndentAware(window) != target {
+			continue
+		}
+		matches = append(matches, struct{ start, end int }{
+			start: lineStarts[i],
+			end:   lineStarts[i+len(oldLines)],
+		})
+	}
+
+	if len(matches) == 0 {
+		return -1, 0, 0
+	}
+	if len(matches) > 1 {
+		return -1, 0, len(matches)
+	}
+	m := matches[0]
+	return m.start, m.end - m.start, 1
+}
+
+func normalizeLinesForIndentAware(lines []string) string {
+	processed := make([]string, len(lines))
+	minIndent := -1
+	for i, line := range lines {
+		line = strings.TrimRightFunc(line, unicode.IsSpace)
+		line = strings.Map(normalizeRuneForFuzzy, line)
+		processed[i] = line
+
+		trimmed := strings.TrimLeft(line, " \t")
+		if trimmed == "" {
+			continue
+		}
+		indent := len(line) - len(trimmed)
+		if minIndent == -1 || indent < minIndent {
+			minIndent = indent
+		}
+	}
+
+	if minIndent > 0 {
+		for i, line := range processed {
+			if strings.TrimSpace(line) == "" {
+				continue
+			}
+			if len(line) >= minIndent {
+				processed[i] = line[minIndent:]
+			}
+		}
+	}
+	return strings.Join(processed, "\n")
+}
+
+func reindentReplacement(newText, oldText, matchedText string) string {
+	oldIndent := commonIndentPrefix(strings.Split(oldText, "\n"))
+	matchIndent := commonIndentPrefix(strings.Split(matchedText, "\n"))
+	if oldIndent == matchIndent {
+		return preserveMatchedTrailingNewline(newText, matchedText)
+	}
+
+	lines := strings.Split(newText, "\n")
+	for i, line := range lines {
+		if strings.TrimSpace(line) == "" {
+			continue
+		}
+		lines[i] = matchIndent + removeIndentPrefix(line, oldIndent)
+	}
+	return preserveMatchedTrailingNewline(strings.Join(lines, "\n"), matchedText)
+}
+
+func commonIndentPrefix(lines []string) string {
+	var common string
+	for _, line := range lines {
+		if strings.TrimSpace(line) == "" {
+			continue
+		}
+		indent := leadingIndent(line)
+		if common == "" {
+			common = indent
+			continue
+		}
+		common = sharedPrefix(common, indent)
+		if common == "" {
+			return ""
+		}
+	}
+	return common
+}
+
+func leadingIndent(line string) string {
+	i := 0
+	for i < len(line) && (line[i] == ' ' || line[i] == '\t') {
+		i++
+	}
+	return line[:i]
+}
+
+func sharedPrefix(a, b string) string {
+	n := min(len(a), len(b))
+	i := 0
+	for i < n && a[i] == b[i] {
+		i++
+	}
+	return a[:i]
+}
+
+func removeIndentPrefix(line, indent string) string {
+	if indent == "" {
+		return line
+	}
+	if strings.HasPrefix(line, indent) {
+		return line[len(indent):]
+	}
+
+	trim := len(indent)
+	i := 0
+	for i < len(line) && trim > 0 && (line[i] == ' ' || line[i] == '\t') {
+		i++
+		trim--
+	}
+	return line[i:]
+}
+
+func preserveMatchedTrailingNewline(text, matchedText string) string {
+	if strings.HasSuffix(matchedText, "\n") && !strings.HasSuffix(text, "\n") {
+		return text + "\n"
+	}
+	return text
+}
+
+type editCandidate struct {
+	startLine int
+	endLine   int
+	block     string
+	score     int
+}
+
+func formatEditCandidates(content, oldText string) string {
+	candidates := suggestEditCandidates(content, oldText)
+	if len(candidates) == 0 {
+		return ""
+	}
+
+	var sb strings.Builder
+	for i, c := range candidates {
+		fmt.Fprintf(&sb, "%d. lines %d-%d\n```text\n%s\n```\n", i+1, c.startLine, c.endLine, strings.TrimRight(c.block, "\n"))
+	}
+	return strings.TrimRight(sb.String(), "\n")
+}
+
+func suggestEditCandidates(content, oldText string) []editCandidate {
+	targetLines := splitCandidateLines(oldText)
+	contentLines := splitCandidateLines(content)
+	if len(targetLines) == 0 || len(contentLines) == 0 {
+		return nil
+	}
+
+	if len(targetLines) == 1 {
+		return suggestSingleLineCandidates(contentLines, targetLines[0])
+	}
+	return suggestBlockCandidates(contentLines, targetLines)
+}
+
+func splitCandidateLines(text string) []string {
+	lines := strings.Split(normalizeToLF(text), "\n")
+	if len(lines) > 0 && lines[len(lines)-1] == "" {
+		lines = lines[:len(lines)-1]
+	}
+	return lines
+}
+
+func suggestSingleLineCandidates(contentLines []string, target string) []editCandidate {
+	var out []editCandidate
+	for i, line := range contentLines {
+		score := scoreCandidateLine(line, target)
+		if score <= 0 {
+			continue
+		}
+		out = append(out, editCandidate{
+			startLine: i + 1,
+			endLine:   i + 1,
+			block:     line,
+			score:     score,
+		})
+	}
+	return topEditCandidates(out)
+}
+
+func suggestBlockCandidates(contentLines, targetLines []string) []editCandidate {
+	windowSize := len(targetLines)
+	if windowSize > len(contentLines) {
+		return nil
+	}
+
+	var out []editCandidate
+	for i := 0; i+windowSize <= len(contentLines); i++ {
+		window := contentLines[i : i+windowSize]
+		score := scoreCandidateBlock(window, targetLines)
+		if score <= 0 {
+			continue
+		}
+		out = append(out, editCandidate{
+			startLine: i + 1,
+			endLine:   i + windowSize,
+			block:     strings.Join(window, "\n"),
+			score:     score,
+		})
+	}
+	return topEditCandidates(out)
+}
+
+func scoreCandidateBlock(candidateLines, targetLines []string) int {
+	score := 0
+	for i := range targetLines {
+		score += scoreCandidateLine(candidateLines[i], targetLines[i])
+	}
+
+	if trimmedLine(candidateLines[0]) == trimmedLine(targetLines[0]) {
+		score += 2
+	}
+	last := len(targetLines) - 1
+	if trimmedLine(candidateLines[last]) == trimmedLine(targetLines[last]) {
+		score += 2
+	}
+
+	if normalizeLinesForIndentAware(candidateLines) == normalizeLinesForIndentAware(targetLines) {
+		score += 4
+	}
+	return score
+}
+
+func scoreCandidateLine(candidate, target string) int {
+	c := normalizeSearchText(candidate)
+	t := normalizeSearchText(target)
+	if c == "" || t == "" {
+		return 0
+	}
+	if c == t {
+		return 4
+	}
+	if collapseWhitespace(candidate) == collapseWhitespace(target) {
+		return 3
+	}
+	if strings.Contains(c, t) || strings.Contains(t, c) {
+		return 2
+	}
+	if tokenOverlap(c, t) > 0 {
+		return 1
+	}
+	return 0
+}
+
+func normalizeSearchText(text string) string {
+	text = strings.Map(normalizeRuneForFuzzy, text)
+	return strings.TrimSpace(text)
+}
+
+func collapseWhitespace(text string) string {
+	return strings.Join(strings.Fields(normalizeSearchText(text)), " ")
+}
+
+func tokenOverlap(a, b string) int {
+	seen := make(map[string]struct{})
+	for _, part := range strings.Fields(a) {
+		seen[part] = struct{}{}
+	}
+	overlap := 0
+	for _, part := range strings.Fields(b) {
+		if _, ok := seen[part]; ok {
+			overlap++
+		}
+	}
+	return overlap
+}
+
+func trimmedLine(text string) string {
+	return strings.TrimSpace(strings.Map(normalizeRuneForFuzzy, text))
+}
+
+func topEditCandidates(candidates []editCandidate) []editCandidate {
+	if len(candidates) == 0 {
+		return nil
+	}
+
+	for i := 0; i < len(candidates); i++ {
+		best := i
+		for j := i + 1; j < len(candidates); j++ {
+			if candidates[j].score > candidates[best].score ||
+				(candidates[j].score == candidates[best].score && candidates[j].startLine < candidates[best].startLine) {
+				best = j
+			}
+		}
+		candidates[i], candidates[best] = candidates[best], candidates[i]
+	}
+
+	if len(candidates) > 3 {
+		candidates = candidates[:3]
+	}
+	return candidates
+}
+
+func lineStartOffsets(text string) []int {
+	offsets := []int{0}
+	for i := 0; i < len(text); i++ {
+		if text[i] == '\n' {
+			offsets = append(offsets, i+1)
+		}
+	}
+	if offsets[len(offsets)-1] != len(text) {
+		offsets = append(offsets, len(text))
+	}
+	return offsets
 }
 
 // --- Diff generation ---

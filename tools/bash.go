@@ -53,8 +53,8 @@ func (bs *BackgroundShell) snapshot() BackgroundShell {
 // Final result applies tail truncation (2000 lines / 50KB).
 // Supports run_in_background mode for long-running commands.
 type BashTool struct {
-	WorkDir   string
-	Timeout   time.Duration // default: 2 minutes
+	WorkDir         string
+	Timeout         time.Duration // default: 2 minutes
 	notifyFn        func(agentcore.AgentMessage)
 	bgOutputFactory func(shellID string) (io.WriteCloser, string, error) // creates output writer for background shells
 
@@ -135,16 +135,19 @@ func (t *BashTool) Name() string  { return "bash" }
 func (t *BashTool) Label() string { return "Execute Command" }
 func (t *BashTool) Description() string {
 	return fmt.Sprintf(
-		"Execute a bash command. Output is truncated to last %d lines or %s (whichever is hit first). "+
-			"Set run_in_background=true for long-running commands; returns immediately and notifies on completion.",
+		"Execute a shell command in the workspace. Prefer read, edit, write, find, grep, and ls for file operations. "+
+			"Use workdir instead of 'cd && ...' when a command must run in another directory. "+
+			"Output is truncated to the last %d lines or %s (whichever is hit first). "+
+			"Set run_in_background=true for long-running commands; it returns immediately and notifies on completion.",
 		defaultMaxLines, formatSize(defaultMaxBytes),
 	)
 }
 func (t *BashTool) Schema() map[string]any {
 	return schema.Object(
-		schema.Property("command", schema.String("Shell command to execute")).Required(),
+		schema.Property("command", schema.String("Shell command to execute. Quote paths with spaces.")).Required(),
 		schema.Property("timeout", schema.Int("Timeout in seconds (default: 120)")),
-		schema.Property("description", schema.String("Short description of the command (shown in task list)")),
+		schema.Property("workdir", schema.String("Optional working directory for this command. Use this instead of 'cd && ...'.")),
+		schema.Property("description", schema.String("Short 5-10 word description shown in the task list")),
 		schema.Property("run_in_background", schema.Bool("Run command in background. Returns immediately; a notification is sent when the command completes.")),
 	)
 }
@@ -152,8 +155,17 @@ func (t *BashTool) Schema() map[string]any {
 type bashArgs struct {
 	Command         string `json:"command"`
 	Timeout         int    `json:"timeout"`
+	WorkDir         string `json:"workdir"`
 	Description     string `json:"description"`
 	RunInBackground bool   `json:"run_in_background"`
+}
+
+type bashForegroundResult struct {
+	Output     string `json:"output"`
+	ExitCode   int    `json:"exit_code"`
+	TimedOut   bool   `json:"timed_out,omitempty"`
+	Aborted    bool   `json:"aborted,omitempty"`
+	OutputFile string `json:"output_file,omitempty"`
 }
 
 func (t *BashTool) Execute(ctx context.Context, args json.RawMessage) (json.RawMessage, error) {
@@ -169,12 +181,38 @@ func (t *BashTool) Execute(ctx context.Context, args json.RawMessage) (json.RawM
 	return t.executeForeground(ctx, a)
 }
 
+func (t *BashTool) resolveWorkDir(a bashArgs) (string, error) {
+	workDir := t.WorkDir
+	if a.WorkDir != "" {
+		workDir = ResolvePath(t.WorkDir, a.WorkDir)
+	}
+	if workDir == "" {
+		return "", nil
+	}
+	info, err := os.Stat(workDir)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return "", fmt.Errorf("working directory does not exist: %s", workDir)
+		}
+		return "", fmt.Errorf("check working directory %s: %w", workDir, err)
+	}
+	if !info.IsDir() {
+		return "", fmt.Errorf("working directory is not a directory: %s", workDir)
+	}
+	return workDir, nil
+}
+
 // executeBackground starts a shell command in a detached goroutine and returns immediately.
 // Output is written to a file on disk for on-demand reading.
 func (t *BashTool) executeBackground(a bashArgs) (json.RawMessage, error) {
 	timeout := 10 * time.Minute // generous default for background
 	if a.Timeout > 0 {
 		timeout = time.Duration(a.Timeout) * time.Second
+	}
+
+	workDir, err := t.resolveWorkDir(a)
+	if err != nil {
+		return nil, err
 	}
 
 	shellPath, shellArgs, err := resolveShell()
@@ -186,8 +224,8 @@ func (t *BashTool) executeBackground(a bashArgs) (json.RawMessage, error) {
 
 	cmdArgs := append(append([]string{}, shellArgs...), a.Command)
 	cmd := exec.CommandContext(bgCtx, shellPath, cmdArgs...)
-	if t.WorkDir != "" {
-		cmd.Dir = t.WorkDir
+	if workDir != "" {
+		cmd.Dir = workDir
 	}
 	configureProcGroup(cmd)
 
@@ -334,17 +372,9 @@ func (t *BashTool) executeForeground(ctx context.Context, a bashArgs) (json.RawM
 		timeout = time.Duration(a.Timeout) * time.Second
 	}
 
-	if t.WorkDir != "" {
-		info, err := os.Stat(t.WorkDir)
-		if err != nil {
-			if os.IsNotExist(err) {
-				return nil, fmt.Errorf("working directory does not exist: %s", t.WorkDir)
-			}
-			return nil, fmt.Errorf("check working directory %s: %w", t.WorkDir, err)
-		}
-		if !info.IsDir() {
-			return nil, fmt.Errorf("working directory is not a directory: %s", t.WorkDir)
-		}
+	workDir, err := t.resolveWorkDir(a)
+	if err != nil {
+		return nil, err
 	}
 
 	shellPath, shellArgs, err := resolveShell()
@@ -357,8 +387,8 @@ func (t *BashTool) executeForeground(ctx context.Context, a bashArgs) (json.RawM
 
 	cmdArgs := append(append([]string{}, shellArgs...), a.Command)
 	cmd := exec.CommandContext(ctx, shellPath, cmdArgs...)
-	if t.WorkDir != "" {
-		cmd.Dir = t.WorkDir
+	if workDir != "" {
+		cmd.Dir = workDir
 	}
 	configureProcGroup(cmd)
 
@@ -451,20 +481,26 @@ func (t *BashTool) executeForeground(ctx context.Context, a bashArgs) (json.RawM
 		}
 	}
 
+	exitCode := 0
+	timedOut := errors.Is(ctx.Err(), context.DeadlineExceeded)
+	aborted := !timedOut && errors.Is(ctx.Err(), context.Canceled)
 	if err != nil {
-		if errors.Is(ctx.Err(), context.DeadlineExceeded) {
-			return nil, fmt.Errorf("%s\n\nCommand timed out after %d seconds", result, int(timeout.Seconds()))
-		}
-		if errors.Is(ctx.Err(), context.Canceled) {
-			return nil, fmt.Errorf("%s\n\nCommand aborted", result)
-		}
 		if exitErr, ok := err.(*exec.ExitError); ok {
-			return nil, fmt.Errorf("%s\n\nCommand exited with code %d", result, exitErr.ExitCode())
+			exitCode = exitErr.ExitCode()
+		} else if timedOut || aborted {
+			exitCode = -1
+		} else {
+			return nil, fmt.Errorf("command failed: %w", err)
 		}
-		return nil, fmt.Errorf("%s\n\nCommand failed: %v", result, err)
 	}
 
-	return json.Marshal(result)
+	return json.Marshal(bashForegroundResult{
+		Output:     result,
+		ExitCode:   exitCode,
+		TimedOut:   timedOut,
+		Aborted:    aborted,
+		OutputFile: tempPath,
+	})
 }
 
 func resolveShell() (string, []string, error) {
