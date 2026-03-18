@@ -74,8 +74,8 @@ type Agent struct {
 func NewAgent(opts ...AgentOption) *Agent {
 	a := &Agent{
 		maxTurns:         defaultMaxTurns,
-		maxRetries:       3,
-		maxToolErrors:    3,
+		maxRetries:       defaultMaxRetries,
+		maxToolErrors:    defaultMaxToolErrors,
 		steeringMode:     QueueModeAll,
 		followUpMode:     QueueModeAll,
 		pendingToolCalls: make(map[string]struct{}),

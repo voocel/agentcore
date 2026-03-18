@@ -31,7 +31,7 @@ func (t *GlobTool) Description() string {
 func (t *GlobTool) Schema() map[string]any {
 	return schema.Object(
 		schema.Property("pattern", schema.String("Glob pattern to match files (for example: '*.go', '**/*.js', 'src/**/*.ts')")).Required(),
-		schema.Property("path", schema.String("Directory to search in (default: working directory)")),
+		schema.Property("path", schema.String("Directory to search in, relative or absolute (default: working directory)")),
 	)
 }
 

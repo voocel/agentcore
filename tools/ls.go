@@ -23,16 +23,12 @@ func NewLs(workDir string) *LsTool { return &LsTool{WorkDir: workDir} }
 func (t *LsTool) Name() string  { return "ls" }
 func (t *LsTool) Label() string { return "List Directory" }
 func (t *LsTool) Description() string {
-	return fmt.Sprintf(
-		"List directory contents as a tree. Use this for quick directory structure checks before reading files. Depth controls recursive listing (default 1, max 5). Use ignore to hide generated or irrelevant paths. Output truncated to %d entries or %s.",
-		lsDefaultLimit, formatSize(defaultMaxBytes),
-	)
+	return "List directory contents as a tree. Use this for quick directory structure checks before reading files. Depth controls recursive listing (default 1, max 5). Use ignore to hide generated or irrelevant paths. Common generated directories (node_modules, .git, dist, build, etc.) are hidden by default."
 }
 func (t *LsTool) Schema() map[string]any {
 	return schema.Object(
-		schema.Property("path", schema.String("Directory path (default: working directory)")),
+		schema.Property("path", schema.String("Directory path, relative or absolute (default: working directory)")),
 		schema.Property("depth", schema.Int("Recursion depth (default: 1, max: 5)")),
-		schema.Property("limit", schema.Int("Maximum entries to return (default: 500)")),
 		schema.Property("ignore", schema.Array("Optional file or directory patterns to ignore (for example: tmp/, *.log, dist)", schema.String("Ignore pattern"))),
 	)
 }
@@ -40,7 +36,6 @@ func (t *LsTool) Schema() map[string]any {
 type lsArgs struct {
 	Path   string   `json:"path"`
 	Depth  int      `json:"depth"`
-	Limit  int      `json:"limit"`
 	Ignore []string `json:"ignore"`
 }
 
@@ -92,10 +87,7 @@ func (t *LsTool) Execute(ctx context.Context, args json.RawMessage) (json.RawMes
 		depth = 5
 	}
 
-	maxEntries := a.Limit
-	if maxEntries <= 0 {
-		maxEntries = lsDefaultLimit
-	}
+	maxEntries := lsDefaultLimit
 
 	matcher := newIgnoreMatcher(append(append([]string{}, lsDefaultIgnorePatterns...), a.Ignore...))
 	var sb strings.Builder

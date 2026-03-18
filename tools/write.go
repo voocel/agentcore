@@ -25,7 +25,7 @@ func (t *WriteTool) Description() string {
 }
 func (t *WriteTool) Schema() map[string]any {
 	return schema.Object(
-		schema.Property("path", schema.String("Path to the file to write or overwrite")).Required(),
+		schema.Property("path", schema.String("Path to the file to write or overwrite (relative or absolute)")).Required(),
 		schema.Property("content", schema.String("Full file content to write")).Required(),
 	)
 }

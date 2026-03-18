@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"strings"
 	"sync/atomic"
 	"testing"
 )
@@ -109,6 +110,29 @@ func (t *previewProgressTool) Execute(ctx context.Context, args json.RawMessage)
 	return json.RawMessage(`"ok"`), nil
 }
 
+type richContentTool struct {
+	calls *int64
+}
+
+func (t *richContentTool) Name() string        { return "rich_tool" }
+func (t *richContentTool) Description() string { return "tool with rich content output" }
+func (t *richContentTool) Schema() map[string]any {
+	return map[string]any{
+		"type": "object",
+		"properties": map[string]any{
+			"x": map[string]any{"type": "string"},
+		},
+		"required": []string{"x"},
+	}
+}
+func (t *richContentTool) Execute(ctx context.Context, args json.RawMessage) (json.RawMessage, error) {
+	return json.RawMessage(`"plain"`), nil
+}
+func (t *richContentTool) ExecuteContent(ctx context.Context, args json.RawMessage) ([]ContentBlock, error) {
+	atomic.AddInt64(t.calls, 1)
+	return []ContentBlock{TextBlock("rich")}, nil
+}
+
 func assistantMsg(text string, stop StopReason) Message {
 	return Message{
 		Role:       RoleAssistant,
@@ -191,51 +215,49 @@ func TestAgentLoop_MaxTurns(t *testing.T) {
 	requireEvent(t, events, EventError)
 }
 
-func TestAgentLoop_Abort(t *testing.T) {
-	ctx, cancel := context.WithCancel(context.Background())
-	cancel()
+func TestAgentLoop_AbortBehavior(t *testing.T) {
+	for _, tc := range []struct {
+		name             string
+		emitAbortMarker  bool
+		wantAbortMessage bool
+	}{
+		{name: "silent cancel"},
+		{name: "with abort marker", emitAbortMarker: true, wantAbortMessage: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			ctx, cancel := context.WithCancel(context.Background())
+			cancel()
 
-	events := collectEvents(AgentLoop(ctx,
-		[]AgentMessage{UserMsg("cancelled")},
-		AgentContext{},
-		LoopConfig{StreamFn: func(ctx context.Context, req *LLMRequest) (*LLMResponse, error) {
-			return nil, ctx.Err()
-		}},
-	))
+			events := collectEvents(AgentLoop(ctx,
+				[]AgentMessage{UserMsg("cancelled")},
+				AgentContext{},
+				LoopConfig{
+					StreamFn: func(ctx context.Context, req *LLMRequest) (*LLMResponse, error) {
+						return nil, ctx.Err()
+					},
+					ShouldEmitAbortMarker: func() bool { return tc.emitAbortMarker },
+				},
+			))
 
-	requireEvent(t, events, EventAgentEnd)
-}
+			requireEvent(t, events, EventAgentEnd)
 
-func TestAgentLoop_AbortEmitsAbortMarker(t *testing.T) {
-	ctx, cancel := context.WithCancel(context.Background())
-	cancel()
-
-	events := collectEvents(AgentLoop(ctx,
-		[]AgentMessage{UserMsg("cancelled")},
-		AgentContext{},
-		LoopConfig{
-			StreamFn: func(ctx context.Context, req *LLMRequest) (*LLMResponse, error) {
-				return nil, ctx.Err()
-			},
-			ShouldEmitAbortMarker: func() bool { return true },
-		},
-	))
-
-	var abortMsg Message
-	found := false
-	for _, ev := range events {
-		msg, ok := ev.Message.(Message)
-		if ev.Type == EventMessageEnd && ok && msg.StopReason == StopReasonAborted {
-			abortMsg = msg
-			found = true
-			break
-		}
-	}
-	if !found {
-		t.Fatal("expected abort marker message")
-	}
-	if abortMsg.Metadata["abort_phase"] != "inference" {
-		t.Fatalf("expected abort phase inference, got %v", abortMsg.Metadata["abort_phase"])
+			var abortMsg Message
+			found := false
+			for _, ev := range events {
+				msg, ok := ev.Message.(Message)
+				if ev.Type == EventMessageEnd && ok && msg.StopReason == StopReasonAborted {
+					abortMsg = msg
+					found = true
+					break
+				}
+			}
+			if found != tc.wantAbortMessage {
+				t.Fatalf("abort marker found=%v, want %v", found, tc.wantAbortMessage)
+			}
+			if tc.wantAbortMessage && abortMsg.Metadata["abort_phase"] != "inference" {
+				t.Fatalf("expected abort phase inference, got %v", abortMsg.Metadata["abort_phase"])
+			}
+		})
 	}
 }
 
@@ -341,82 +363,158 @@ func TestAgentLoop_ToolMiddleware(t *testing.T) {
 }
 
 func TestAgentLoop_PermissionDenied(t *testing.T) {
+	var permChecks int
 	var calls []string
-	tc := ToolCall{ID: "tc1", Name: "echo", Args: json.RawMessage(`{"value":"denied"}`)}
 
 	events := runTestLoop(t,
 		[]AgentMessage{UserMsg("test")},
 		AgentContext{Tools: []Tool{echoTool(&calls)}},
 		LoopConfig{
-			StreamFn: mockStreamFn(toolCallMsg(tc), assistantMsg("ok", StopReasonStop)),
+			StreamFn: sequentialStreamFn(func(i int, _ *LLMRequest) (*LLMResponse, error) {
+				if i < 3 {
+					return &LLMResponse{Message: toolCallMsg(ToolCall{
+						ID:   fmt.Sprintf("tc%d", i),
+						Name: "echo",
+						Args: json.RawMessage(`{"value":"denied"}`),
+					})}, nil
+				}
+				return &LLMResponse{Message: assistantMsg("done", StopReasonStop)}, nil
+			}),
 			CheckPermission: func(ctx context.Context, call ToolCall) error {
+				permChecks++
 				return fmt.Errorf("denied")
 			},
+			MaxToolErrors: 1,
 		},
 	)
 
 	if len(calls) != 0 {
 		t.Fatalf("tool should not execute, got %v", calls)
 	}
-	ev, ok := findEvent(events, EventToolExecEnd)
-	if !ok || !ev.IsError {
+	if permChecks != 3 {
+		t.Fatalf("permission check should run for every tool call, got %d", permChecks)
+	}
+	end, ok := findEvent(events, EventToolExecEnd)
+	if !ok || !end.IsError {
 		t.Fatal("expected tool_exec_end with isError=true")
 	}
-}
-
-func TestAgentLoop_PreviewNotCalledWhenArgsInvalid(t *testing.T) {
-	var previewCalls int64
-	pt := &previewProgressTool{previewCalls: &previewCalls}
-	tc := ToolCall{ID: "tc-preview-invalid", Name: "preview_tool", Args: json.RawMessage(`{}`)}
-
-	events := runTestLoop(t,
-		[]AgentMessage{UserMsg("test")},
-		AgentContext{Tools: []Tool{pt}},
-		LoopConfig{StreamFn: mockStreamFn(toolCallMsg(tc), assistantMsg("done", StopReasonStop))},
-	)
-
-	if got := atomic.LoadInt64(&previewCalls); got != 0 {
-		t.Fatalf("preview should not be called for invalid args, got %d", got)
-	}
-	if n := countEvent(events, EventToolExecUpdate); n != 0 {
-		t.Fatalf("expected no tool_exec_update for invalid args, got %d", n)
-	}
-
-	ev, ok := findEvent(events, EventToolExecEnd)
-	if !ok || !ev.IsError {
-		t.Fatal("expected tool_exec_end with isError=true")
-	}
-}
-
-func TestAgentLoop_ToolExecUpdateKinds(t *testing.T) {
-	var previewCalls int64
-	pt := &previewProgressTool{previewCalls: &previewCalls}
-	tc := ToolCall{ID: "tc-preview-valid", Name: "preview_tool", Args: json.RawMessage(`{"x":"v"}`)}
-
-	events := runTestLoop(t,
-		[]AgentMessage{UserMsg("test")},
-		AgentContext{Tools: []Tool{pt}},
-		LoopConfig{StreamFn: mockStreamFn(toolCallMsg(tc), assistantMsg("done", StopReasonStop))},
-	)
-
-	if got := atomic.LoadInt64(&previewCalls); got != 1 {
-		t.Fatalf("preview should be called once, got %d", got)
-	}
-
-	var updates []Event
 	for _, ev := range events {
-		if ev.Type == EventToolExecUpdate {
-			updates = append(updates, ev)
+		if ev.Type == EventToolExecEnd && strings.Contains(string(ev.Result), "disabled after") {
+			t.Fatalf("permission denial should not disable the tool, got result %s", string(ev.Result))
 		}
 	}
-	if len(updates) != 2 {
-		t.Fatalf("expected 2 tool_exec_update events (preview + progress), got %d", len(updates))
+}
+
+func TestAgentLoop_PreviewAndProgress(t *testing.T) {
+	for _, tc := range []struct {
+		name              string
+		args              json.RawMessage
+		wantPreviewCalls  int64
+		wantUpdateKinds   []ToolExecUpdateKind
+		wantToolExecError bool
+	}{
+		{
+			name:              "invalid args skip preview",
+			args:              json.RawMessage(`{}`),
+			wantPreviewCalls:  0,
+			wantToolExecError: true,
+		},
+		{
+			name:              "valid args emit preview and progress",
+			args:              json.RawMessage(`{"x":"v"}`),
+			wantPreviewCalls:  1,
+			wantUpdateKinds:   []ToolExecUpdateKind{ToolExecUpdatePreview, ToolExecUpdateProgress},
+			wantToolExecError: false,
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			var previewCalls int64
+			pt := &previewProgressTool{previewCalls: &previewCalls}
+
+			events := runTestLoop(t,
+				[]AgentMessage{UserMsg("test")},
+				AgentContext{Tools: []Tool{pt}},
+				LoopConfig{StreamFn: mockStreamFn(toolCallMsg(ToolCall{
+					ID:   "tc-preview",
+					Name: "preview_tool",
+					Args: tc.args,
+				}), assistantMsg("done", StopReasonStop))},
+			)
+
+			if got := atomic.LoadInt64(&previewCalls); got != tc.wantPreviewCalls {
+				t.Fatalf("preview calls: got %d, want %d", got, tc.wantPreviewCalls)
+			}
+
+			var gotKinds []ToolExecUpdateKind
+			for _, ev := range events {
+				if ev.Type == EventToolExecUpdate {
+					gotKinds = append(gotKinds, ev.UpdateKind)
+				}
+			}
+			if len(gotKinds) != len(tc.wantUpdateKinds) {
+				t.Fatalf("update count: got %d, want %d", len(gotKinds), len(tc.wantUpdateKinds))
+			}
+			for i := range gotKinds {
+				if gotKinds[i] != tc.wantUpdateKinds[i] {
+					t.Fatalf("update[%d]: got %q, want %q", i, gotKinds[i], tc.wantUpdateKinds[i])
+				}
+			}
+
+			end, ok := findEvent(events, EventToolExecEnd)
+			if !ok {
+				t.Fatal("expected tool_exec_end")
+			}
+			if end.IsError != tc.wantToolExecError {
+				t.Fatalf("tool_exec_end isError=%v, want %v", end.IsError, tc.wantToolExecError)
+			}
+		})
 	}
-	if updates[0].UpdateKind != ToolExecUpdatePreview {
-		t.Fatalf("first update should be preview, got %q", updates[0].UpdateKind)
+}
+
+func TestAgentLoop_ContentToolUsesMiddleware(t *testing.T) {
+	var contentCalls int64
+	var log []string
+	rt := &richContentTool{calls: &contentCalls}
+	tc := ToolCall{ID: "tc-rich", Name: "rich_tool", Args: json.RawMessage(`{"x":"v"}`)}
+
+	var secondReq *LLMRequest
+	events := runTestLoop(t,
+		[]AgentMessage{UserMsg("test")},
+		AgentContext{Tools: []Tool{rt}},
+		LoopConfig{
+			StreamFn: sequentialStreamFn(func(i int, req *LLMRequest) (*LLMResponse, error) {
+				if i == 0 {
+					return &LLMResponse{Message: toolCallMsg(tc)}, nil
+				}
+				secondReq = req
+				return &LLMResponse{Message: assistantMsg("done", StopReasonStop)}, nil
+			}),
+			Middlewares: []ToolMiddleware{
+				func(ctx context.Context, call ToolCall, next ToolExecuteFunc) (json.RawMessage, error) {
+					log = append(log, "before")
+					out, err := next(ctx, call.Args)
+					log = append(log, "after")
+					return out, err
+				},
+			},
+		},
+	)
+
+	if got := atomic.LoadInt64(&contentCalls); got != 1 {
+		t.Fatalf("content tool should execute once, got %d", got)
 	}
-	if updates[1].UpdateKind != ToolExecUpdateProgress {
-		t.Fatalf("second update should be progress, got %q", updates[1].UpdateKind)
+	if len(log) != 2 || log[0] != "before" || log[1] != "after" {
+		t.Fatalf("middleware log: %v", log)
+	}
+	if secondReq == nil || len(secondReq.Messages) == 0 {
+		t.Fatal("expected second llm request with tool result in context")
+	}
+	last := secondReq.Messages[len(secondReq.Messages)-1]
+	if last.Role != RoleTool {
+		t.Fatalf("expected last message to be tool result, got %q", last.Role)
+	}
+	if got := last.TextContent(); got != "rich" {
+		t.Fatalf("expected rich tool content in context, got %q", got)
 	}
 
 	end, ok := findEvent(events, EventToolExecEnd)

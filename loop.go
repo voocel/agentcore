@@ -13,8 +13,12 @@ import (
 	"github.com/voocel/litellm"
 )
 
-const defaultMaxTurns = 10
-const defaultMaxRetryDelay = 60 * time.Second
+const (
+	defaultMaxTurns      = 100
+	defaultMaxRetries    = 3
+	defaultMaxToolErrors = 3
+	defaultMaxRetryDelay = 60 * time.Second
+)
 
 // AgentLoop starts an agent loop with new prompt messages.
 // Prompts are added to context and events are emitted for them.
@@ -663,7 +667,7 @@ func executeSingleToolCall(ctx context.Context, tools []Tool, call ToolCall, con
 	if config.CheckPermission != nil {
 		if err := config.CheckPermission(ctx, call); err != nil {
 			errContent, _ := json.Marshal(err.Error())
-			result := ToolResult{ToolCallID: call.ID, ToolName: call.Name, Content: errContent, IsError: true}
+			result := ToolResult{ToolCallID: call.ID, Content: errContent, IsError: true}
 			emit(ch, Event{
 				Type:      EventToolExecEnd,
 				ToolID:    call.ID,
@@ -724,10 +728,10 @@ func executeSingleToolCall(ctx context.Context, tools []Tool, call ToolCall, con
 		})
 
 		// ContentTool: returns rich content blocks (e.g., images).
-		// Bypasses middleware chain because middleware signature
-		// (json.RawMessage, error) does not accommodate []ContentBlock.
+		// When middleware is configured, execute it through a shim so logging,
+		// auditing, and short-circuit behavior still apply.
 		if ct, ok := tool.(ContentTool); ok {
-			blocks, execErr := ct.ExecuteContent(progressCtx, call.Args)
+			blocks, output, execErr := executeContentTool(progressCtx, tool, ct, call, config.Middlewares)
 			if execErr != nil {
 				errContent, _ := json.Marshal(execErr.Error())
 				result = ToolResult{
@@ -749,11 +753,11 @@ func executeSingleToolCall(ctx context.Context, tools []Tool, call ToolCall, con
 					}
 					result = ToolResult{
 						ToolCallID:    call.ID,
-						Content:       contentBlocksTextSummary(blocks),
+						Content:       pickContentSummary(output, blocks),
 						ContentBlocks: resultBlocks,
 					}
 				} else {
-					summary := contentBlocksTextSummary(blocks)
+					summary := pickContentSummary(output, blocks)
 					result = ToolResult{
 						ToolCallID:    call.ID,
 						Content:       summary,
@@ -765,7 +769,7 @@ func executeSingleToolCall(ctx context.Context, tools []Tool, call ToolCall, con
 			var output json.RawMessage
 			var execErr error
 			if len(config.Middlewares) > 0 {
-				exec := buildMiddlewareChain(tool, call, config.Middlewares)
+				exec := buildMiddlewareChain(call, tool.Execute, config.Middlewares)
 				output, execErr = exec(progressCtx, call.Args)
 			} else {
 				output, execErr = tool.Execute(progressCtx, call.Args)
@@ -994,10 +998,9 @@ func checkType(field string, val any, expected string) error {
 	return nil
 }
 
-// buildMiddlewareChain wraps a tool's Execute with the middleware stack.
+// buildMiddlewareChain wraps a tool execution function with the middleware stack.
 // Outermost middleware is called first; innermost calls the actual tool.
-func buildMiddlewareChain(tool Tool, call ToolCall, middlewares []ToolMiddleware) ToolExecuteFunc {
-	exec := ToolExecuteFunc(tool.Execute)
+func buildMiddlewareChain(call ToolCall, exec ToolExecuteFunc, middlewares []ToolMiddleware) ToolExecuteFunc {
 	for i := len(middlewares) - 1; i >= 0; i-- {
 		mw := middlewares[i]
 		next := exec
@@ -1006,6 +1009,33 @@ func buildMiddlewareChain(tool Tool, call ToolCall, middlewares []ToolMiddleware
 		}
 	}
 	return exec
+}
+
+func executeContentTool(ctx context.Context, tool Tool, ct ContentTool, call ToolCall, middlewares []ToolMiddleware) ([]ContentBlock, json.RawMessage, error) {
+	var blocks []ContentBlock
+	baseExec := func(ctx context.Context, args json.RawMessage) (json.RawMessage, error) {
+		out, err := ct.ExecuteContent(ctx, args)
+		if err != nil {
+			return nil, err
+		}
+		blocks = out
+		return contentBlocksTextSummary(out), nil
+	}
+
+	exec := baseExec
+	if len(middlewares) > 0 {
+		exec = buildMiddlewareChain(call, exec, middlewares)
+	}
+
+	output, err := exec(ctx, call.Args)
+	return blocks, output, err
+}
+
+func pickContentSummary(output json.RawMessage, blocks []ContentBlock) json.RawMessage {
+	if len(output) > 0 {
+		return output
+	}
+	return contentBlocksTextSummary(blocks)
 }
 
 func findTool(tools []Tool, name string) Tool {

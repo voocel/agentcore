@@ -32,7 +32,7 @@ func (t *GrepTool) Description() string {
 func (t *GrepTool) Schema() map[string]any {
 	return schema.Object(
 		schema.Property("pattern", schema.String("Search pattern (regex by default, or exact text with literal=true)")).Required(),
-		schema.Property("path", schema.String("File or directory to search (default: working directory)")),
+		schema.Property("path", schema.String("File or directory to search, relative or absolute (default: working directory)")),
 		schema.Property("glob", schema.String("Optional file glob filter (for example: '*.go', 'src/**/*.ts')")),
 		schema.Property("ignoreCase", schema.Bool("Case insensitive search")),
 		schema.Property("literal", schema.Bool("Treat pattern as literal string, not regex")),
