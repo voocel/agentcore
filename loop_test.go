@@ -362,8 +362,8 @@ func TestAgentLoop_ToolMiddleware(t *testing.T) {
 	}
 }
 
-func TestAgentLoop_PermissionDenied(t *testing.T) {
-	var permChecks int
+func TestAgentLoop_ApprovalDenied(t *testing.T) {
+	var approvalChecks int
 	var calls []string
 
 	events := runTestLoop(t,
@@ -380,9 +380,13 @@ func TestAgentLoop_PermissionDenied(t *testing.T) {
 				}
 				return &LLMResponse{Message: assistantMsg("done", StopReasonStop)}, nil
 			}),
-			CheckPermission: func(ctx context.Context, call ToolCall) error {
-				permChecks++
-				return fmt.Errorf("denied")
+			CheckToolApproval: func(ctx context.Context, req ToolApprovalRequest) (*ToolApprovalResult, error) {
+				approvalChecks++
+				return &ToolApprovalResult{
+					Approved: false,
+					Decision: ToolApprovalDeny,
+					Reason:   "denied",
+				}, nil
 			},
 			MaxToolErrors: 1,
 		},
@@ -391,8 +395,8 @@ func TestAgentLoop_PermissionDenied(t *testing.T) {
 	if len(calls) != 0 {
 		t.Fatalf("tool should not execute, got %v", calls)
 	}
-	if permChecks != 3 {
-		t.Fatalf("permission check should run for every tool call, got %d", permChecks)
+	if approvalChecks != 3 {
+		t.Fatalf("approval check should run for every tool call, got %d", approvalChecks)
 	}
 	end, ok := findEvent(events, EventToolExecEnd)
 	if !ok || !end.IsError {
@@ -400,7 +404,7 @@ func TestAgentLoop_PermissionDenied(t *testing.T) {
 	}
 	for _, ev := range events {
 		if ev.Type == EventToolExecEnd && strings.Contains(string(ev.Result), "disabled after") {
-			t.Fatalf("permission denial should not disable the tool, got result %s", string(ev.Result))
+			t.Fatalf("approval denial should not disable the tool, got result %s", string(ev.Result))
 		}
 	}
 }

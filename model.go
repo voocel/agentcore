@@ -18,10 +18,10 @@ type SystemBlock struct {
 
 // AgentContext holds the immutable context for a single agent loop invocation.
 type AgentContext struct {
-	SystemPrompt  string        // single-string system prompt (legacy)
-	SystemBlocks  []SystemBlock // multi-block system prompt with cache control (takes precedence)
-	Messages      []AgentMessage
-	Tools         []Tool
+	SystemPrompt string        // single-string system prompt (legacy)
+	SystemBlocks []SystemBlock // multi-block system prompt with cache control (takes precedence)
+	Messages     []AgentMessage
+	Tools        []Tool
 }
 
 // StreamFn is an injectable LLM call function.
@@ -60,10 +60,10 @@ type LoopConfig struct {
 	TransformContext func(ctx context.Context, msgs []AgentMessage) ([]AgentMessage, error)
 	ConvertToLLM     func(msgs []AgentMessage) []Message
 
-	// CheckPermission is called before each tool execution.
-	// Return nil to allow, or error to deny (error becomes tool error result).
-	// When nil, all tools are allowed.
-	CheckPermission PermissionFunc
+	// CheckToolApproval is called after validation/preview and before execution.
+	// Returning nil means no approval was required.
+	// Returning a non-nil result applies the approval decision immediately.
+	CheckToolApproval ToolApprovalFunc
 
 	// GetApiKey resolves the API key before each LLM call.
 	// The provider parameter identifies which provider is being called (e.g. "openai", "anthropic").

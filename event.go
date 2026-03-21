@@ -13,18 +13,20 @@ import (
 type EventType string
 
 const (
-	EventAgentStart     EventType = "agent_start"
-	EventAgentEnd       EventType = "agent_end"
-	EventTurnStart      EventType = "turn_start"
-	EventTurnEnd        EventType = "turn_end"
-	EventMessageStart   EventType = "message_start"
-	EventMessageUpdate  EventType = "message_update"
-	EventMessageEnd     EventType = "message_end"
-	EventToolExecStart  EventType = "tool_exec_start"
-	EventToolExecUpdate EventType = "tool_exec_update"
-	EventToolExecEnd    EventType = "tool_exec_end"
-	EventRetry          EventType = "retry"
-	EventError          EventType = "error"
+	EventAgentStart           EventType = "agent_start"
+	EventAgentEnd             EventType = "agent_end"
+	EventTurnStart            EventType = "turn_start"
+	EventTurnEnd              EventType = "turn_end"
+	EventMessageStart         EventType = "message_start"
+	EventMessageUpdate        EventType = "message_update"
+	EventMessageEnd           EventType = "message_end"
+	EventToolExecStart        EventType = "tool_exec_start"
+	EventToolExecUpdate       EventType = "tool_exec_update"
+	EventToolExecEnd          EventType = "tool_exec_end"
+	EventToolApprovalRequest  EventType = "tool_approval_request"
+	EventToolApprovalResolved EventType = "tool_approval_resolved"
+	EventRetry                EventType = "retry"
+	EventError                EventType = "error"
 )
 
 // ToolExecUpdateKind distinguishes update payload semantics for tool_exec_update events.
@@ -38,20 +40,23 @@ const (
 // Event is a lifecycle event emitted by the agent loop.
 // This is the single output channel for all lifecycle information.
 type Event struct {
-	Type        EventType
-	Message     AgentMessage    // for message_start/update/end, turn_end
-	Delta       string          // text delta for message_update
-	ToolID      string          // for tool_exec_*
-	Tool        string          // tool name for tool_exec_*
-	ToolLabel   string          // human-readable tool label (from ToolLabeler)
-	Args        json.RawMessage // tool args for tool_exec_start/tool_exec_update
-	Result      json.RawMessage // tool result for tool_exec_end/update
-	UpdateKind  ToolExecUpdateKind
-	IsError     bool           // tool error flag for tool_exec_end
-	ToolResults []ToolResult   // for turn_end: all tool results from this turn
-	Err         error          // for error events
-	NewMessages []AgentMessage // for agent_end: messages added during this loop
-	RetryInfo   *RetryInfo     // for retry events
+	Type             EventType
+	Message          AgentMessage    // for message_start/update/end, turn_end
+	Delta            string          // text delta for message_update
+	ToolID           string          // for tool_exec_*
+	Tool             string          // tool name for tool_exec_*
+	ToolLabel        string          // human-readable tool label (from ToolLabeler)
+	Args             json.RawMessage // tool args for tool_exec_start/tool_exec_update
+	Result           json.RawMessage // tool result for tool_exec_end/update
+	UpdateKind       ToolExecUpdateKind
+	IsError          bool // tool error flag for tool_exec_end
+	ApprovalDecision ToolApprovalDecision
+	ApprovalReason   string
+	Preview          json.RawMessage
+	ToolResults      []ToolResult   // for turn_end: all tool results from this turn
+	Err              error          // for error events
+	NewMessages      []AgentMessage // for agent_end: messages added during this loop
+	RetryInfo        *RetryInfo     // for retry events
 }
 
 // RetryInfo carries retry context for EventRetry events.

@@ -6,7 +6,6 @@ import (
 
 	"github.com/voocel/agentcore"
 	"github.com/voocel/agentcore/llm"
-	"github.com/voocel/agentcore/policy"
 	"github.com/voocel/agentcore/tools"
 )
 
@@ -32,7 +31,6 @@ func main() {
 			tools.NewEdit("."),
 			tools.NewBash("."),
 		),
-		agentcore.WithPermission(policy.WorkspaceProfile(".")),
 		agentcore.WithMaxTurns(20),
 	)
 

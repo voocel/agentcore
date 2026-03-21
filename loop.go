@@ -621,9 +621,10 @@ func executeToolCallsParallel(ctx context.Context, tools []Tool, calls []ToolCal
 	return results, steering
 }
 
-// executeSingleToolCall executes one tool call: emit events, check permission, run tool.
-// result.ToolName is set when the caller should update toolErrors; empty means skip
-// (circuit-breaker hit, permission denial, or context cancellation).
+// executeSingleToolCall executes one tool call: emit events, validate, preview,
+// run approval, then execute the tool. result.ToolName is set when the caller
+// should update toolErrors; empty means skip (circuit-breaker hit, denial, or
+// context cancellation).
 func executeSingleToolCall(ctx context.Context, tools []Tool, call ToolCall, config LoopConfig, failCount int, ch chan<- Event) ToolResult {
 	// Fast exit: context already cancelled — don't start any tool work.
 	if ctx.Err() != nil {
@@ -663,23 +664,6 @@ func executeSingleToolCall(ctx context.Context, tools []Tool, call ToolCall, con
 		Args:      call.Args,
 	})
 
-	// Permission check: deny before execution if callback returns error.
-	if config.CheckPermission != nil {
-		if err := config.CheckPermission(ctx, call); err != nil {
-			errContent, _ := json.Marshal(err.Error())
-			result := ToolResult{ToolCallID: call.ID, Content: errContent, IsError: true}
-			emit(ch, Event{
-				Type:      EventToolExecEnd,
-				ToolID:    call.ID,
-				Tool:      call.Name,
-				ToolLabel: label,
-				Result:    result.Content,
-				IsError:   true,
-			})
-			return result
-		}
-	}
-
 	var result ToolResult
 
 	if tool == nil {
@@ -698,19 +682,104 @@ func executeSingleToolCall(ctx context.Context, tools []Tool, call ToolCall, con
 			IsError:    true,
 		}
 	} else {
+		var preview json.RawMessage
+
 		// Preview: if tool supports it, compute and emit preview before execution.
-		// Preview runs only after args are validated.
+		// Preview runs only after args are validated so approval UIs can use it.
 		if p, ok := tool.(Previewer); ok {
-			if preview, err := p.Preview(ctx, call.Args); err == nil {
+			if data, err := p.Preview(ctx, call.Args); err == nil {
+				preview = data
 				emit(ch, Event{
 					Type:       EventToolExecUpdate,
 					ToolID:     call.ID,
 					Tool:       call.Name,
 					ToolLabel:  label,
 					Args:       call.Args,
-					Result:     preview,
+					Result:     data,
 					UpdateKind: ToolExecUpdatePreview,
 				})
+			}
+		}
+
+		if config.CheckToolApproval != nil {
+			req := ToolApprovalRequest{
+				Call:      call,
+				ToolLabel: label,
+				Summary:   approvalSummary(call),
+				Preview:   preview,
+			}
+			approval, err := config.CheckToolApproval(ctx, req)
+			if err != nil {
+				emit(ch, Event{
+					Type:      EventToolApprovalRequest,
+					ToolID:    call.ID,
+					Tool:      call.Name,
+					ToolLabel: label,
+					Args:      call.Args,
+					Preview:   preview,
+				})
+				emit(ch, Event{
+					Type:             EventToolApprovalResolved,
+					ToolID:           call.ID,
+					Tool:             call.Name,
+					ToolLabel:        label,
+					ApprovalDecision: ToolApprovalDeny,
+					ApprovalReason:   err.Error(),
+				})
+				errContent, _ := json.Marshal(err.Error())
+				result = ToolResult{
+					ToolCallID: call.ID,
+					Content:    errContent,
+					IsError:    true,
+				}
+				emit(ch, Event{
+					Type:      EventToolExecEnd,
+					ToolID:    call.ID,
+					Tool:      call.Name,
+					ToolLabel: label,
+					Result:    result.Content,
+					IsError:   true,
+				})
+				return result
+			}
+			if approval != nil {
+				emit(ch, Event{
+					Type:      EventToolApprovalRequest,
+					ToolID:    call.ID,
+					Tool:      call.Name,
+					ToolLabel: label,
+					Args:      call.Args,
+					Preview:   preview,
+				})
+				emit(ch, Event{
+					Type:             EventToolApprovalResolved,
+					ToolID:           call.ID,
+					Tool:             call.Name,
+					ToolLabel:        label,
+					ApprovalDecision: approval.Decision,
+					ApprovalReason:   approval.Reason,
+				})
+				if !approval.Approved {
+					reason := approval.Reason
+					if reason == "" {
+						reason = "tool execution denied"
+					}
+					errContent, _ := json.Marshal(reason)
+					result = ToolResult{
+						ToolCallID: call.ID,
+						Content:    errContent,
+						IsError:    true,
+					}
+					emit(ch, Event{
+						Type:      EventToolExecEnd,
+						ToolID:    call.ID,
+						Tool:      call.Name,
+						ToolLabel: label,
+						Result:    result.Content,
+						IsError:   true,
+					})
+					return result
+				}
 			}
 		}
 
@@ -873,6 +942,18 @@ func toolLabel(tool Tool) string {
 		return labeler.Label()
 	}
 	return ""
+}
+
+func approvalSummary(call ToolCall) string {
+	var payload map[string]any
+	if len(call.Args) > 0 && json.Unmarshal(call.Args, &payload) == nil {
+		for _, key := range []string{"path", "command", "url", "query"} {
+			if raw, ok := payload[key].(string); ok && strings.TrimSpace(raw) != "" {
+				return fmt.Sprintf("%s: %s", key, strings.TrimSpace(raw))
+			}
+		}
+	}
+	return call.Name
 }
 
 // buildToolSpecs converts Tool interfaces to ToolSpec for the LLM.

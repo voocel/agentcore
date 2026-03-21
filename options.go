@@ -92,10 +92,9 @@ func WithContextEstimate(fn ContextEstimateFn) AgentOption {
 	return func(a *Agent) { a.contextEstimateFn = fn }
 }
 
-// WithPermission sets a function called before each tool execution.
-// Return nil to allow, or an error to deny (error becomes tool error result).
-func WithPermission(fn PermissionFunc) AgentOption {
-	return func(a *Agent) { a.permissionFn = fn }
+// WithToolApproval sets a runtime approval callback called before tool execution.
+func WithToolApproval(fn ToolApprovalFunc) AgentOption {
+	return func(a *Agent) { a.toolApprovalFn = fn }
 }
 
 // WithGetApiKey sets a dynamic API key resolver called before each LLM call.

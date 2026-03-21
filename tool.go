@@ -42,12 +42,12 @@ type ToolCall struct {
 
 // ToolResult represents a tool execution outcome.
 type ToolResult struct {
-	ToolCallID    string           `json:"tool_call_id"`
-	ToolName      string           `json:"-"` // internal: for toolErrors tracking
-	Content       json.RawMessage  `json:"content,omitempty"`
-	ContentBlocks []ContentBlock   `json:"-"` // rich content (images); not serialized
-	IsError       bool             `json:"is_error,omitempty"`
-	Details       any              `json:"details,omitempty"` // optional metadata for UI display/logging
+	ToolCallID    string          `json:"tool_call_id"`
+	ToolName      string          `json:"-"` // internal: for toolErrors tracking
+	Content       json.RawMessage `json:"content,omitempty"`
+	ContentBlocks []ContentBlock  `json:"-"` // rich content (images); not serialized
+	IsError       bool            `json:"is_error,omitempty"`
+	Details       any             `json:"details,omitempty"` // optional metadata for UI display/logging
 }
 
 // ---------------------------------------------------------------------------
@@ -146,12 +146,6 @@ func ReactivateDeferred(tools []Tool, msgs []AgentMessage) {
 		activator.Activate(names...)
 	}
 }
-
-// PermissionFunc is called before each tool execution.
-// Return nil to allow execution, or a non-nil error to deny.
-// The error message is sent back to the LLM as a tool error result.
-// Receives context.Context to support I/O (e.g. TUI confirmation, remote policy).
-type PermissionFunc func(ctx context.Context, call ToolCall) error
 
 // ToolExecuteFunc is the function signature for tool execution.
 // Used as the "next" parameter in middleware chains.
