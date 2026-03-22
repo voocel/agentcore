@@ -94,7 +94,7 @@ func (t *LsTool) Execute(ctx context.Context, args json.RawMessage) (json.RawMes
 	count := 0
 	truncated := false
 
-	if err := renderTree(ctx, dir, dir, 0, depth, maxEntries, matcher, &count, &truncated, &sb); err != nil {
+	if err := renderTree(ctx, dir, dir, 0, depth, maxEntries, matcher, &count, &truncated, "", &sb); err != nil {
 		return nil, fmt.Errorf("ls %s: %w", dir, err)
 	}
 
@@ -161,7 +161,7 @@ func (m ignoreMatcher) Match(rel string, isDir bool) bool {
 	return false
 }
 
-func renderTree(ctx context.Context, root, dir string, current, maxDepth, maxEntries int, matcher ignoreMatcher, count *int, truncated *bool, sb *strings.Builder) error {
+func renderTree(ctx context.Context, root, dir string, current, maxDepth, maxEntries int, matcher ignoreMatcher, count *int, truncated *bool, prefix string, sb *strings.Builder) error {
 	if current >= maxDepth || *truncated {
 		return nil
 	}
@@ -178,48 +178,56 @@ func renderTree(ctx context.Context, root, dir string, current, maxDepth, maxEnt
 		return strings.ToLower(dirEntries[i].Name()) < strings.ToLower(dirEntries[j].Name())
 	})
 
+	// Collect visible entries first to determine last-child connector.
+	type visibleEntry struct {
+		entry os.DirEntry
+		path  string
+	}
+	var visible []visibleEntry
 	for _, e := range dirEntries {
 		name := e.Name()
 		isDir := e.IsDir()
 		if isDir && IsSkipDir(name) {
 			continue
 		}
-
 		childPath := filepath.Join(dir, name)
 		rel, _ := filepath.Rel(root, childPath)
-		rel = filepath.ToSlash(rel)
-		if matcher.Match(rel, isDir) {
+		if matcher.Match(filepath.ToSlash(rel), isDir) {
 			continue
 		}
+		visible = append(visible, visibleEntry{entry: e, path: childPath})
+	}
 
+	for i, ve := range visible {
 		if *count >= maxEntries {
 			*truncated = true
 			return nil
 		}
 
-		info, err := e.Info()
+		info, err := ve.entry.Info()
 		if err != nil {
 			continue
 		}
 
 		*count++
-		indent := strings.Repeat("  ", current+1)
-		if isDir {
-			sb.WriteString(indent)
-			sb.WriteString(name)
-			sb.WriteString("/\n")
-		} else {
-			sb.WriteString(indent)
-			sb.WriteString(name)
-			sb.WriteString("  ")
-			sb.WriteString(formatSize(int(info.Size())))
-			sb.WriteByte('\n')
+		name := ve.entry.Name()
+		isDir := ve.entry.IsDir()
+		isLast := i == len(visible)-1
+
+		connector := "├── "
+		childPrefix := prefix + "│   "
+		if isLast {
+			connector = "└── "
+			childPrefix = prefix + "    "
 		}
 
 		if isDir {
-			if err := renderTree(ctx, root, childPath, current+1, maxDepth, maxEntries, matcher, count, truncated, sb); err != nil {
+			sb.WriteString(prefix + connector + name + "/\n")
+			if err := renderTree(ctx, root, ve.path, current+1, maxDepth, maxEntries, matcher, count, truncated, childPrefix, sb); err != nil {
 				return err
 			}
+		} else {
+			sb.WriteString(prefix + connector + name + "  " + formatSize(int(info.Size())) + "\n")
 		}
 	}
 	return nil

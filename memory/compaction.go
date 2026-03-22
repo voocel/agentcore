@@ -16,6 +16,20 @@ const (
 	defaultKeepRecentTokens = 20000
 )
 
+// CompactionInfo holds details about a completed compaction for observability.
+type CompactionInfo struct {
+	TokensBefore   int
+	TokensAfter    int
+	MessagesBefore int
+	MessagesAfter  int
+	CompactedCount int           // number of messages summarized
+	KeptCount      int           // number of messages retained verbatim
+	IsSplitTurn    bool
+	IsIncremental  bool          // updated an existing summary
+	SummaryLen     int           // summary length in runes
+	Duration       time.Duration // wall time including LLM calls
+}
+
 // CompactionConfig configures automatic context compaction.
 type CompactionConfig struct {
 	// Model is the ChatModel used for generating summaries.
@@ -33,6 +47,10 @@ type CompactionConfig struct {
 	// KeepRecentTokens is the minimum number of recent tokens to always keep.
 	// Default: 20000.
 	KeepRecentTokens int
+
+	// OnCompaction is called after a successful compaction with details.
+	// Optional — nil means no callback.
+	OnCompaction func(CompactionInfo)
 }
 
 // NewCompaction returns a TransformContext function that automatically compacts
@@ -70,6 +88,8 @@ func NewCompaction(cfg CompactionConfig) func(context.Context, []agentcore.Agent
 		if cut.firstKeptIndex <= 0 {
 			return msgs, nil // nothing to compact
 		}
+
+		start := time.Now()
 
 		// Determine what to summarize vs keep.
 		// If split turn: history ends at turn start, turn prefix is [turnStart:firstKept].
@@ -166,6 +186,22 @@ func NewCompaction(cfg CompactionConfig) func(context.Context, []agentcore.Agent
 		result := make([]agentcore.AgentMessage, 0, 1+len(toKeep))
 		result = append(result, cs)
 		result = append(result, toKeep...)
+
+		if cfg.OnCompaction != nil {
+			cfg.OnCompaction(CompactionInfo{
+				TokensBefore:   tokens,
+				TokensAfter:    EstimateTotal(result),
+				MessagesBefore: len(msgs),
+				MessagesAfter:  len(result),
+				CompactedCount: len(allCompacted),
+				KeptCount:      len(toKeep),
+				IsSplitTurn:    needTurnPrefix,
+				IsIncremental:  previousSummary != "",
+				SummaryLen:     len([]rune(summary)),
+				Duration:       time.Since(start),
+			})
+		}
+
 		return result, nil
 	}
 }
