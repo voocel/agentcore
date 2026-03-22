@@ -23,7 +23,7 @@ jobs:
           go-version: stable
 
       - name: Generate release notes
-        run: bash scripts/gen-changelog.sh > release-notes.md
+        run: .github/scripts/gen-changelog.sh > release-notes.md
         env:
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
           ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
@@ -36,6 +36,6 @@ jobs:
           version: "~> v2"
           args: >-
             release --clean
-            ${{ hashFiles('release-notes.md') != '' && '--release-notes=release-notes.md' || '' }}
+            --release-notes=release-notes.md
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
