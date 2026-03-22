@@ -76,6 +76,7 @@ func NewAgent(opts ...AgentOption) *Agent {
 		maxTurns:         defaultMaxTurns,
 		maxRetries:       defaultMaxRetries,
 		maxToolErrors:    defaultMaxToolErrors,
+		thinkingLevel:    ThinkingLow,
 		steeringMode:     QueueModeAll,
 		followUpMode:     QueueModeAll,
 		pendingToolCalls: make(map[string]struct{}),
@@ -356,6 +357,39 @@ func (a *Agent) SetSystemBlocks(blocks []SystemBlock) {
 	defer a.mu.Unlock()
 	a.systemBlocks = blocks
 	a.systemPrompt = ""
+}
+
+// BuildLLMMessages constructs the message list exactly as the agent loop would
+// for an LLM call: system blocks/prompt → converted conversation messages.
+// This enables external callers (e.g., prompt suggestion) to make background
+// LLM calls that share the same message prefix for prompt cache hits.
+func (a *Agent) BuildLLMMessages() []Message {
+	a.mu.Lock()
+	msgs := copyMessages(a.messages)
+	blocks := a.systemBlocks
+	sp := a.systemPrompt
+	convertFn := a.convertToLLM
+	a.mu.Unlock()
+
+	if convertFn == nil {
+		convertFn = DefaultConvertToLLM
+	}
+	llmMessages := convertFn(msgs)
+	llmMessages = RepairMessageSequence(llmMessages)
+
+	if len(blocks) > 0 {
+		sysMsgs := make([]Message, len(blocks))
+		for i, b := range blocks {
+			sysMsgs[i] = SystemMsg(b.Text)
+			if b.CacheControl != "" {
+				sysMsgs[i].Metadata = map[string]any{"cache_control": b.CacheControl}
+			}
+		}
+		llmMessages = append(sysMsgs, llmMessages...)
+	} else if sp != "" {
+		llmMessages = append([]Message{SystemMsg(sp)}, llmMessages...)
+	}
+	return llmMessages
 }
 
 // SetTools replaces the tool set. Takes effect on the next turn.

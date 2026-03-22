@@ -1,4 +1,4 @@
-github.com/voocel/litellm v1.6.3 h1:FKHx+XQbXCZVvjnnMk2kuJ5dyXuXa8j5MVStWL7NaQs=
-github.com/voocel/litellm v1.6.3/go.mod h1:6MBUu3I4DHm7h72Vl+3nqLruSwYmgqMf/I9BGoordJ4=
+github.com/voocel/litellm v1.6.4 h1:0F9cJusOn73NZu3QLDOAvIrVqAUUVDNBxbppvQozoL4=
+github.com/voocel/litellm v1.6.4/go.mod h1:6MBUu3I4DHm7h72Vl+3nqLruSwYmgqMf/I9BGoordJ4=
 golang.org/x/image v0.37.0 h1:ZiRjArKI8GwxZOoEtUfhrBtaCN+4b/7709dlT6SSnQA=
 golang.org/x/image v0.37.0/go.mod h1:/3f6vaXC+6CEanU4KJxbcUZyEePbyKbaLoDOe4ehFYY=

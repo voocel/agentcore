@@ -415,7 +415,12 @@ func applyCallConfig(req *litellm.Request, opts []agentcore.CallOption) {
 
 	// Thinking level + budget
 	// Anthropic requires temperature=1 when thinking is enabled.
-	if callCfg.ThinkingLevel != "" && callCfg.ThinkingLevel != agentcore.ThinkingOff {
+	switch callCfg.ThinkingLevel {
+	case "":
+		// Leave unspecified to allow model/provider defaults.
+	case agentcore.ThinkingOff:
+		req.Thinking = litellm.NewThinkingDisabled()
+	default:
 		req.Thinking = litellm.NewThinkingWithLevel(string(callCfg.ThinkingLevel))
 		if callCfg.ThinkingBudget > 0 {
 			req.Thinking.BudgetTokens = &callCfg.ThinkingBudget
