@@ -2,6 +2,8 @@ package agentcore
 
 import (
 	"context"
+	"fmt"
+	"sync"
 	"time"
 )
 
@@ -187,6 +189,59 @@ type ChatModel interface {
 // Used by the agent loop to pass provider context to GetApiKey callbacks.
 type ProviderNamer interface {
 	ProviderName() string
+}
+
+// SwappableModel wraps a ChatModel and allows replacing the underlying model
+// at runtime. Swaps take effect on the next call.
+type SwappableModel struct {
+	mu    sync.RWMutex
+	model ChatModel
+}
+
+func NewSwappableModel(initial ChatModel) *SwappableModel {
+	return &SwappableModel{model: initial}
+}
+
+func (m *SwappableModel) Swap(next ChatModel) {
+	m.mu.Lock()
+	m.model = next
+	m.mu.Unlock()
+}
+
+func (m *SwappableModel) Current() ChatModel {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	return m.model
+}
+
+func (m *SwappableModel) Generate(ctx context.Context, messages []Message, tools []ToolSpec, opts ...CallOption) (*LLMResponse, error) {
+	model := m.Current()
+	if model == nil {
+		return nil, fmt.Errorf("no model configured")
+	}
+	return model.Generate(ctx, messages, tools, opts...)
+}
+
+func (m *SwappableModel) GenerateStream(ctx context.Context, messages []Message, tools []ToolSpec, opts ...CallOption) (<-chan StreamEvent, error) {
+	model := m.Current()
+	if model == nil {
+		return nil, fmt.Errorf("no model configured")
+	}
+	return model.GenerateStream(ctx, messages, tools, opts...)
+}
+
+func (m *SwappableModel) SupportsTools() bool {
+	model := m.Current()
+	return model != nil && model.SupportsTools()
+}
+
+func (m *SwappableModel) ProviderName() string {
+	model := m.Current()
+	pn, ok := model.(ProviderNamer)
+	if !ok {
+		return ""
+	}
+	return pn.ProviderName()
 }
 
 // ---------------------------------------------------------------------------

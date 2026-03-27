@@ -425,7 +425,7 @@ func (t *BashTool) executeForeground(ctx context.Context, a bashArgs) (json.RawM
 					if idx < 0 {
 						break
 					}
-					agentcore.ReportToolProgress(ctx, append([]byte(nil), pending[:idx]...))
+					agentcore.ReportToolProgress(ctx, agentcore.ProgressPayload{Kind: agentcore.ProgressSummary, Summary: string(append([]byte(nil), pending[:idx]...))})
 					pending = pending[idx+1:]
 				}
 			}
@@ -433,7 +433,7 @@ func (t *BashTool) executeForeground(ctx context.Context, a bashArgs) (json.RawM
 				if !(errors.Is(readE, io.EOF) || errors.Is(readE, os.ErrClosed)) {
 					readErr = readE
 				} else if len(pending) > 0 {
-					agentcore.ReportToolProgress(ctx, append([]byte(nil), pending...))
+					agentcore.ReportToolProgress(ctx, agentcore.ProgressPayload{Kind: agentcore.ProgressSummary, Summary: string(append([]byte(nil), pending...))})
 				}
 				return
 			}

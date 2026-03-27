@@ -44,6 +44,10 @@ func main() {
 		case agentcore.EventToolExecStart:
 			fmt.Printf("  [tool] %s(%s)\n", ev.Tool, string(ev.Args))
 		case agentcore.EventToolExecUpdate:
+			if ev.Progress != nil {
+				fmt.Printf("  [progress:%s] %s\n", ev.Progress.Kind, formatProgress(ev.Progress))
+				break
+			}
 			switch ev.UpdateKind {
 			case agentcore.ToolExecUpdatePreview:
 				fmt.Printf("  [preview] %s\n", string(ev.Result))
@@ -67,4 +71,23 @@ func main() {
 	}
 
 	agent.WaitForIdle()
+}
+
+func formatProgress(progress *agentcore.ProgressPayload) string {
+	if progress == nil {
+		return ""
+	}
+	if progress.Summary != "" {
+		return progress.Summary
+	}
+	if progress.Tool != "" {
+		return progress.Tool
+	}
+	if progress.Message != "" {
+		return progress.Message
+	}
+	if progress.Delta != "" {
+		return progress.Delta
+	}
+	return string(progress.Kind)
 }

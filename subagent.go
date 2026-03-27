@@ -74,8 +74,11 @@ const (
 
 // SubAgentConfig defines a sub-agent's identity and capabilities.
 type SubAgentConfig struct {
-	Name         string
-	Description  string
+	Name        string
+	Description string
+	// Model is resolved when each sub-agent run starts. Wrappers that swap
+	// the underlying model at runtime are supported and take effect on the
+	// next sub-agent run.
 	Model        ChatModel
 	SystemPrompt string
 	Tools        []Tool
@@ -139,13 +142,13 @@ type subagentUsage struct {
 // The main agent calls this tool to delegate tasks to specialized sub-agents
 // with isolated contexts.
 type SubAgentTool struct {
-	agents       map[string]SubAgentConfig
-	notifyFn        func(AgentMessage)                   // called when a background task completes
-	createModel     func(name string) (ChatModel, error) // resolves model name to ChatModel at runtime
+	agents          map[string]SubAgentConfig
+	notifyFn        func(AgentMessage)                                             // called when a background task completes
+	createModel     func(name string) (ChatModel, error)                           // resolves model name to ChatModel at runtime
 	bgOutputFactory func(taskID, agentName string) (io.WriteCloser, string, error) // creates output writer for background tasks
-	mu           sync.Mutex
-	bgSeq        int
-	bgTasks      map[string]*BackgroundTask // background task registry
+	mu              sync.Mutex
+	bgSeq           int
+	bgTasks         map[string]*BackgroundTask // background task registry
 }
 
 // NewSubAgentTool creates a subagent tool from a set of agent configs.
@@ -590,29 +593,30 @@ func (t *SubAgentTool) runAgent(ctx context.Context, agentName, task string, mod
 				}
 				bg.bt.addProgress(label)
 			} else {
-				data, _ := json.Marshal(map[string]any{
-					"agent": agentName,
-					"tool":  ev.Tool,
-					"args":  ev.Args,
+				ReportToolProgress(ctx, ProgressPayload{
+					Kind:    ProgressToolStart,
+					Agent:   agentName,
+					Tool:    ev.Tool,
+					Summary: ev.Tool,
+					Args:    ev.Args,
 				})
-				ReportToolProgress(ctx, data)
 			}
 		case EventMessageUpdate:
 			if bg == nil {
 				if ev.Delta != "" {
-					data, _ := json.Marshal(map[string]any{
-						"agent": agentName,
-						"delta": ev.Delta,
+					ReportToolProgress(ctx, ProgressPayload{
+						Kind:  ProgressToolDelta,
+						Agent: agentName,
+						Delta: ev.Delta,
 					})
-					ReportToolProgress(ctx, data)
 				}
 				if ev.Message != nil {
 					if thinking := ev.Message.ThinkingContent(); thinking != "" {
-						data, _ := json.Marshal(map[string]any{
-							"agent":    agentName,
-							"thinking": thinking,
+						ReportToolProgress(ctx, ProgressPayload{
+							Kind:     ProgressThinking,
+							Agent:    agentName,
+							Thinking: thinking,
 						})
-						ReportToolProgress(ctx, data)
 					}
 				}
 			}
@@ -622,13 +626,13 @@ func (t *SubAgentTool) runAgent(ctx context.Context, agentName, task string, mod
 				if len(errMsg) > 200 {
 					errMsg = errMsg[:200]
 				}
-				data, _ := json.Marshal(map[string]any{
-					"agent":   agentName,
-					"tool":    ev.Tool,
-					"error":   true,
-					"message": errMsg,
+				ReportToolProgress(ctx, ProgressPayload{
+					Kind:    ProgressToolError,
+					Agent:   agentName,
+					Tool:    ev.Tool,
+					Message: errMsg,
+					IsError: true,
 				})
-				ReportToolProgress(ctx, data)
 			}
 		case EventMessageEnd:
 			if ev.Message == nil {
@@ -646,11 +650,12 @@ func (t *SubAgentTool) runAgent(ctx context.Context, agentName, task string, mod
 				lastAssistantContent = ev.Message.TextContent()
 				su.Turns++
 				if bg == nil {
-					data, _ := json.Marshal(map[string]any{
-						"agent": agentName,
-						"turn":  su.Turns,
+					ReportToolProgress(ctx, ProgressPayload{
+						Kind:    ProgressTurnCounter,
+						Agent:   agentName,
+						Turn:    su.Turns,
+						Summary: fmt.Sprintf("turn %d", su.Turns),
 					})
-					ReportToolProgress(ctx, data)
 				}
 				if msg, ok := ev.Message.(Message); ok && msg.Usage != nil {
 					su.Input += msg.Usage.Input
@@ -667,14 +672,13 @@ func (t *SubAgentTool) runAgent(ctx context.Context, agentName, task string, mod
 			}
 		case EventRetry:
 			if bg == nil && ev.RetryInfo != nil {
-				data, _ := json.Marshal(map[string]any{
-					"agent":       agentName,
-					"retry":       true,
-					"attempt":     ev.RetryInfo.Attempt,
-					"max_retries": ev.RetryInfo.MaxRetries,
-					"error":       ev.RetryInfo.Err.Error(),
+				ReportToolProgress(ctx, ProgressPayload{
+					Kind:       ProgressRetry,
+					Agent:      agentName,
+					Attempt:    ev.RetryInfo.Attempt,
+					MaxRetries: ev.RetryInfo.MaxRetries,
+					Message:    ev.RetryInfo.Err.Error(),
 				})
-				ReportToolProgress(ctx, data)
 			}
 		case EventError:
 			if ev.Err != nil {

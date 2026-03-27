@@ -106,7 +106,7 @@ func (t *previewProgressTool) Preview(ctx context.Context, args json.RawMessage)
 	return json.RawMessage(`"preview"`), nil
 }
 func (t *previewProgressTool) Execute(ctx context.Context, args json.RawMessage) (json.RawMessage, error) {
-	ReportToolProgress(ctx, json.RawMessage(`"progress"`))
+	ReportToolProgress(ctx, ProgressPayload{Kind: ProgressSummary, Summary: "progress"})
 	return json.RawMessage(`"ok"`), nil
 }
 
@@ -486,6 +486,21 @@ func TestAgentLoop_PreviewAndProgress(t *testing.T) {
 			for i := range gotKinds {
 				if gotKinds[i] != tc.wantUpdateKinds[i] {
 					t.Fatalf("update[%d]: got %q, want %q", i, gotKinds[i], tc.wantUpdateKinds[i])
+				}
+			}
+			if tc.name == "valid args emit preview and progress" {
+				var progressEvent *Event
+				for i := range events {
+					if events[i].Type == EventToolExecUpdate && events[i].UpdateKind == ToolExecUpdateProgress {
+						progressEvent = &events[i]
+						break
+					}
+				}
+				if progressEvent == nil || progressEvent.Progress == nil {
+					t.Fatal("expected structured progress payload")
+				}
+				if progressEvent.Progress.Kind != ProgressSummary || progressEvent.Progress.Summary != "progress" {
+					t.Fatalf("unexpected progress payload: %+v", progressEvent.Progress)
 				}
 			}
 

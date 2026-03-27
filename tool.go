@@ -12,20 +12,53 @@ import (
 // toolProgressKey is the context key for tool progress callbacks.
 type toolProgressKey struct{}
 
+// ProgressPayloadKind distinguishes structured progress update semantics.
+type ProgressPayloadKind string
+
+const (
+	ProgressToolStart   ProgressPayloadKind = "tool_start"
+	ProgressToolDelta   ProgressPayloadKind = "tool_delta"
+	ProgressThinking    ProgressPayloadKind = "thinking"
+	ProgressSummary     ProgressPayloadKind = "summary"
+	ProgressToolError   ProgressPayloadKind = "tool_error"
+	ProgressTurnCounter ProgressPayloadKind = "turn_counter"
+	ProgressRetry       ProgressPayloadKind = "retry"
+)
+
+// ProgressPayload is the structured progress envelope emitted by tools.
+type ProgressPayload struct {
+	Kind       ProgressPayloadKind `json:"kind"`
+	Agent      string              `json:"agent,omitempty"`
+	Tool       string              `json:"tool,omitempty"`
+	Summary    string              `json:"summary,omitempty"`
+	Delta      string              `json:"delta,omitempty"`
+	Thinking   string              `json:"thinking,omitempty"`
+	Message    string              `json:"message,omitempty"`
+	Turn       int                 `json:"turn,omitempty"`
+	Attempt    int                 `json:"attempt,omitempty"`
+	MaxRetries int                 `json:"max_retries,omitempty"`
+	IsError    bool                `json:"is_error,omitempty"`
+	Args       json.RawMessage     `json:"args,omitempty"`
+	Meta       json.RawMessage     `json:"meta,omitempty"`
+}
+
 // ToolProgressFunc is a callback for reporting tool execution progress.
 // Tools call ReportToolProgress to emit partial results during long operations.
-type ToolProgressFunc func(partialResult json.RawMessage)
+type ToolProgressFunc func(progress ProgressPayload)
 
 // WithToolProgress injects a progress callback into the context.
 func WithToolProgress(ctx context.Context, fn ToolProgressFunc) context.Context {
 	return context.WithValue(ctx, toolProgressKey{}, fn)
 }
 
-// ReportToolProgress reports partial progress during tool execution.
+// ReportToolProgress reports structured progress during tool execution.
 // Silently ignored if no callback is registered in the context.
-func ReportToolProgress(ctx context.Context, partial json.RawMessage) {
+func ReportToolProgress(ctx context.Context, progress ProgressPayload) {
+	if progress.Kind == "" {
+		progress.Kind = ProgressSummary
+	}
 	if fn, ok := ctx.Value(toolProgressKey{}).(ToolProgressFunc); ok {
-		fn(partial)
+		fn(progress)
 	}
 }
 
@@ -56,7 +89,7 @@ type ToolResult struct {
 
 // Tool defines the minimal tool interface.
 // Timeout control goes through context.Context.
-// Tools can report execution progress via ReportToolProgress(ctx, partial).
+// Tools can report execution progress via ReportToolProgress(ctx, payload).
 type Tool interface {
 	Name() string
 	Description() string

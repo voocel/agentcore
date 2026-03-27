@@ -811,14 +811,15 @@ func executeSingleToolCall(ctx context.Context, tools []Tool, call ToolCall, con
 		}
 
 		// Inject progress callback so tools can report partial results
-		progressCtx := WithToolProgress(ctx, func(partial json.RawMessage) {
+		progressCtx := WithToolProgress(ctx, func(progress ProgressPayload) {
+			p := progress
 			emit(ch, Event{
 				Type:       EventToolExecUpdate,
 				ToolID:     call.ID,
 				Tool:       call.Name,
 				ToolLabel:  label,
 				Args:       call.Args,
-				Result:     partial,
+				Progress:   &p,
 				UpdateKind: ToolExecUpdateProgress,
 			})
 		})

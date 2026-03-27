@@ -163,6 +163,43 @@ agent.Subscribe(func(ev agentcore.Event) {
 })
 ```
 
+### Structured Tool Progress
+
+Long-running tools can emit structured progress updates instead of ad-hoc JSON:
+
+```go
+agentcore.ReportToolProgress(ctx, agentcore.ProgressPayload{
+    Kind:    agentcore.ProgressSummary,
+    Agent:   "worker",
+    Tool:    "bash",
+    Summary: "worker → bash",
+})
+```
+
+Subscribers should read `ev.Progress` directly for tool progress updates:
+
+```go
+agent.Subscribe(func(ev agentcore.Event) {
+    if ev.Type == agentcore.EventToolExecUpdate && ev.Progress != nil {
+        fmt.Printf("[%s] %s\n", ev.Progress.Kind, ev.Progress.Summary)
+    }
+})
+```
+
+### Swappable Models
+
+When a model needs to change at runtime, wrap it with `SwappableModel`. The swap takes effect on the next call. `SubAgentConfig.Model` is resolved at the start of each sub-agent run, so the same wrapper also works for sub-agents.
+
+```go
+defaultModel, _ := llm.NewOpenAIModel("gpt-5-mini", apiKey)
+sw := agentcore.NewSwappableModel(defaultModel)
+
+agent := agentcore.NewAgent(agentcore.WithModel(sw))
+
+nextModel, _ := llm.NewOpenAIModel("gpt-5", apiKey)
+sw.Swap(nextModel) // next turn uses the new model
+```
+
 ### Custom LLM (StreamFn)
 
 Swap the LLM call with a proxy, mock, or custom implementation:

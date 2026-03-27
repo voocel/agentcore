@@ -66,7 +66,8 @@ type Event struct {
 	Tool             string          // tool name for tool_exec_*
 	ToolLabel        string          // human-readable tool label (from ToolLabeler)
 	Args             json.RawMessage // tool args for tool_exec_start/tool_exec_update
-	Result           json.RawMessage // tool result for tool_exec_end/update
+	Result           json.RawMessage // tool result for tool_exec_end and preview updates
+	Progress         *ProgressPayload
 	UpdateKind       ToolExecUpdateKind
 	IsError          bool // tool error flag for tool_exec_end
 	ApprovalDecision ToolApprovalDecision

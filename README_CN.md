@@ -163,6 +163,43 @@ agent.Subscribe(func(ev agentcore.Event) {
 })
 ```
 
+### 结构化工具进度
+
+长耗时工具现在可以发结构化进度，而不是依赖各项目自己约定 JSON：
+
+```go
+agentcore.ReportToolProgress(ctx, agentcore.ProgressPayload{
+    Kind:    agentcore.ProgressSummary,
+    Agent:   "worker",
+    Tool:    "bash",
+    Summary: "worker → bash",
+})
+```
+
+订阅方应直接读取 `ev.Progress` 作为工具进度更新：
+
+```go
+agent.Subscribe(func(ev agentcore.Event) {
+    if ev.Type == agentcore.EventToolExecUpdate && ev.Progress != nil {
+        fmt.Printf("[%s] %s\n", ev.Progress.Kind, ev.Progress.Summary)
+    }
+})
+```
+
+### 可热切换模型
+
+如果需要运行时换模型，可以用 `SwappableModel` 包一层。切换会在下一次调用生效。`SubAgentConfig.Model` 会在每次子 Agent 运行开始时重新解引用，所以同一个包装器对主 Agent 和子 Agent 都生效。
+
+```go
+defaultModel, _ := llm.NewOpenAIModel("gpt-5-mini", apiKey)
+sw := agentcore.NewSwappableModel(defaultModel)
+
+agent := agentcore.NewAgent(agentcore.WithModel(sw))
+
+nextModel, _ := llm.NewOpenAIModel("gpt-5", apiKey)
+sw.Swap(nextModel) // 下一轮开始使用新模型
+```
+
 ### 自定义 LLM（StreamFn）
 
 替换 LLM 调用为代理、Mock 或自定义实现：
