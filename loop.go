@@ -60,7 +60,9 @@ func AgentLoopContinue(ctx context.Context, agentCtx AgentContext, config LoopCo
 	if len(agentCtx.Messages) == 0 {
 		go func() {
 			defer close(ch)
-			emitError(ch, fmt.Errorf("cannot continue: no messages in context"))
+			emitError(ch, fmt.Errorf("cannot continue: no messages in context"), &RunSummary{
+				EndReason: EndReasonError,
+			})
 		}()
 		return ch
 	}
@@ -87,6 +89,20 @@ func AgentLoopContinue(ctx context.Context, agentCtx AgentContext, config LoopCo
 
 // runLoop is the main double-loop logic shared by AgentLoop and AgentLoopContinue.
 func runLoop(ctx context.Context, currentCtx *AgentContext, newMessages *[]AgentMessage, config LoopConfig, ch chan<- Event) {
+	type runSummaryState struct {
+		toolCalls  int
+		toolErrors int
+	}
+	summaryState := runSummaryState{}
+	buildSummary := func(turnCount int, reason EndReason) *RunSummary {
+		return &RunSummary{
+			TurnCount:  turnCount,
+			ToolCalls:  summaryState.toolCalls,
+			ToolErrors: summaryState.toolErrors,
+			EndReason:  reason,
+		}
+	}
+
 	maxTurns := config.MaxTurns
 	if maxTurns <= 0 {
 		maxTurns = defaultMaxTurns
@@ -124,13 +140,13 @@ func runLoop(ctx context.Context, currentCtx *AgentContext, newMessages *[]Agent
 					*newMessages = append(*newMessages, abortMsg)
 				}
 				emit(ch, Event{Type: EventError, Err: ctx.Err()})
-				emit(ch, Event{Type: EventAgentEnd, NewMessages: *newMessages})
+				emit(ch, Event{Type: EventAgentEnd, NewMessages: *newMessages, Summary: buildSummary(turnCount, EndReasonAborted)})
 				return
 			}
 
 			if turnCount >= maxTurns {
 				emit(ch, Event{Type: EventError, Err: fmt.Errorf("max turns (%d) reached", maxTurns)})
-				emit(ch, Event{Type: EventAgentEnd, NewMessages: *newMessages})
+				emit(ch, Event{Type: EventAgentEnd, NewMessages: *newMessages, Summary: buildSummary(turnCount, EndReasonMaxTurns)})
 				return
 			}
 
@@ -161,10 +177,10 @@ func runLoop(ctx context.Context, currentCtx *AgentContext, newMessages *[]Agent
 						*newMessages = append(*newMessages, abortMsg)
 					}
 					emit(ch, Event{Type: EventError, Err: ctx.Err()})
-					emit(ch, Event{Type: EventAgentEnd, NewMessages: *newMessages})
+					emit(ch, Event{Type: EventAgentEnd, NewMessages: *newMessages, Summary: buildSummary(turnCount, EndReasonAborted)})
 					return
 				}
-				emitError(ch, fmt.Errorf("llm call failed: %w", err))
+				emitError(ch, fmt.Errorf("llm call failed: %w", err), buildSummary(turnCount, EndReasonError))
 				return
 			}
 
@@ -173,7 +189,12 @@ func runLoop(ctx context.Context, currentCtx *AgentContext, newMessages *[]Agent
 				currentCtx.Messages = append(currentCtx.Messages, assistantMsg)
 				*newMessages = append(*newMessages, assistantMsg)
 				emit(ch, Event{Type: EventTurnEnd, Message: assistantMsg})
-				emit(ch, Event{Type: EventAgentEnd, NewMessages: *newMessages})
+				turnCount++
+				reason := EndReasonError
+				if assistantMsg.StopReason == StopReasonAborted {
+					reason = EndReasonAborted
+				}
+				emit(ch, Event{Type: EventAgentEnd, NewMessages: *newMessages, Summary: buildSummary(turnCount, reason)})
 				return
 			}
 
@@ -189,6 +210,7 @@ func runLoop(ctx context.Context, currentCtx *AgentContext, newMessages *[]Agent
 
 			// Check for tool calls
 			toolCalls := assistantMsg.ToolCalls()
+			summaryState.toolCalls += len(toolCalls)
 			hasMoreToolCalls = len(toolCalls) > 0
 
 			var turnToolResults []ToolResult
@@ -206,6 +228,11 @@ func runLoop(ctx context.Context, currentCtx *AgentContext, newMessages *[]Agent
 				}
 
 				steeringAfterTools = steering
+			}
+			for _, tr := range turnToolResults {
+				if tr.IsError {
+					summaryState.toolErrors++
+				}
 			}
 
 			emit(ch, Event{Type: EventTurnEnd, Message: assistantMsg, ToolResults: turnToolResults})
@@ -232,7 +259,7 @@ func runLoop(ctx context.Context, currentCtx *AgentContext, newMessages *[]Agent
 		break
 	}
 
-	emit(ch, Event{Type: EventAgentEnd, NewMessages: *newMessages})
+	emit(ch, Event{Type: EventAgentEnd, NewMessages: *newMessages, Summary: buildSummary(turnCount, EndReasonStop)})
 }
 
 // callLLMWithRetry wraps callLLM with retry logic for retryable errors.

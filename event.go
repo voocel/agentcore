@@ -37,6 +37,25 @@ const (
 	ToolExecUpdateProgress ToolExecUpdateKind = "progress"
 )
 
+// EndReason describes why a single agent run stopped.
+type EndReason string
+
+const (
+	EndReasonStop     EndReason = "stop"
+	EndReasonMaxTurns EndReason = "max_turns"
+	EndReasonAborted  EndReason = "aborted"
+	EndReasonError    EndReason = "error"
+)
+
+// RunSummary captures loop facts that are known at the end of a run.
+// It intentionally excludes higher-level policy judgments.
+type RunSummary struct {
+	TurnCount  int
+	ToolCalls  int
+	ToolErrors int
+	EndReason  EndReason
+}
+
 // Event is a lifecycle event emitted by the agent loop.
 // This is the single output channel for all lifecycle information.
 type Event struct {
@@ -57,6 +76,7 @@ type Event struct {
 	Err              error          // for error events
 	NewMessages      []AgentMessage // for agent_end: messages added during this loop
 	RetryInfo        *RetryInfo     // for retry events
+	Summary          *RunSummary    // for agent_end: factual run summary
 }
 
 // RetryInfo carries retry context for EventRetry events.
@@ -78,9 +98,9 @@ func emit(ch chan<- Event, ev Event) {
 }
 
 // emitError sends an error event followed by agent_end.
-func emitError(ch chan<- Event, err error) {
+func emitError(ch chan<- Event, err error, summary *RunSummary) {
 	emit(ch, Event{Type: EventError, Err: err})
-	emit(ch, Event{Type: EventAgentEnd, Err: err})
+	emit(ch, Event{Type: EventAgentEnd, Err: err, Summary: summary})
 }
 
 // ---------------------------------------------------------------------------

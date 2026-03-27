@@ -665,6 +665,17 @@ func (t *SubAgentTool) runAgent(ctx context.Context, agentName, task string, mod
 					}
 				}
 			}
+		case EventRetry:
+			if bg == nil && ev.RetryInfo != nil {
+				data, _ := json.Marshal(map[string]any{
+					"agent":       agentName,
+					"retry":       true,
+					"attempt":     ev.RetryInfo.Attempt,
+					"max_retries": ev.RetryInfo.MaxRetries,
+					"error":       ev.RetryInfo.Err.Error(),
+				})
+				ReportToolProgress(ctx, data)
+			}
 		case EventError:
 			if ev.Err != nil {
 				lastErr = ev.Err

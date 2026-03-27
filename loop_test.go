@@ -180,6 +180,12 @@ func TestAgentLoop_SimpleTextResponse(t *testing.T) {
 	if len(ev.NewMessages) < 2 {
 		t.Fatalf("agent_end NewMessages: expected >= 2, got %d", len(ev.NewMessages))
 	}
+	if ev.Summary == nil {
+		t.Fatal("expected agent_end summary")
+	}
+	if ev.Summary.TurnCount != 1 || ev.Summary.ToolCalls != 0 || ev.Summary.ToolErrors != 0 || ev.Summary.EndReason != EndReasonStop {
+		t.Fatalf("unexpected summary: %#v", ev.Summary)
+	}
 }
 
 func TestAgentLoop_ToolCallAndResult(t *testing.T) {
@@ -197,6 +203,14 @@ func TestAgentLoop_ToolCallAndResult(t *testing.T) {
 	}
 	requireEvent(t, events, EventToolExecStart)
 	requireEvent(t, events, EventToolExecEnd)
+
+	ev, _ := findEvent(events, EventAgentEnd)
+	if ev.Summary == nil {
+		t.Fatal("expected agent_end summary")
+	}
+	if ev.Summary.TurnCount != 2 || ev.Summary.ToolCalls != 1 || ev.Summary.ToolErrors != 0 || ev.Summary.EndReason != EndReasonStop {
+		t.Fatalf("unexpected summary: %#v", ev.Summary)
+	}
 }
 
 func TestAgentLoop_MaxTurns(t *testing.T) {
@@ -213,6 +227,13 @@ func TestAgentLoop_MaxTurns(t *testing.T) {
 	)
 
 	requireEvent(t, events, EventError)
+	ev, _ := findEvent(events, EventAgentEnd)
+	if ev.Summary == nil {
+		t.Fatal("expected agent_end summary")
+	}
+	if ev.Summary.TurnCount != 3 || ev.Summary.ToolCalls != 3 || ev.Summary.EndReason != EndReasonMaxTurns {
+		t.Fatalf("unexpected summary: %#v", ev.Summary)
+	}
 }
 
 func TestAgentLoop_AbortBehavior(t *testing.T) {
@@ -240,6 +261,10 @@ func TestAgentLoop_AbortBehavior(t *testing.T) {
 			))
 
 			requireEvent(t, events, EventAgentEnd)
+			ev, _ := findEvent(events, EventAgentEnd)
+			if ev.Summary == nil || ev.Summary.EndReason != EndReasonAborted {
+				t.Fatalf("unexpected summary: %#v", ev.Summary)
+			}
 
 			var abortMsg Message
 			found := false
@@ -574,6 +599,10 @@ func TestAgentLoopContinue_EmptyContext(t *testing.T) {
 		LoopConfig{StreamFn: mockStreamFn()},
 	))
 	requireEvent(t, events, EventError)
+	ev, _ := findEvent(events, EventAgentEnd)
+	if ev.Summary == nil || ev.Summary.EndReason != EndReasonError {
+		t.Fatalf("unexpected summary: %#v", ev.Summary)
+	}
 }
 
 func TestCollect(t *testing.T) {
