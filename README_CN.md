@@ -270,6 +270,30 @@ agent := agentcore.NewAgent(
 | `edit` | 精确文本替换，支持模糊匹配、BOM/行ending 归一化、unified diff 输出 |
 | `bash` | 执行 shell 命令，tail 截断（2000 行 / 50KB） |
 
+## 运行时注入
+
+当调用方的意图是“让这条消息尽快送达”，而不想自己判断当前是运行中还是空闲时，使用 `Inject(msg)`。
+
+```go
+result, err := agent.Inject(agentcore.UserMsg("结束前先重新检查未完成任务。"))
+if err != nil {
+    panic(err)
+}
+fmt.Println(result.Disposition)
+```
+
+`Inject` 有三种结果：
+
+- `steered_current_run`：当前正在运行，消息进入本轮 steering 路径
+- `resumed_idle_run`：当前空闲且会话尾部是 assistant，消息入队后立即触发 `Continue()`
+- `queued`：消息已入队，但没有立即启动新 run
+
+需要更强控制时，继续使用低层 API：
+
+- `Steer(msg)`：只走 steering 队列，不附带 idle 自动续跑
+- `FollowUp(msg)`：排到当前 run 结束之后
+- prompt 侧注入：如果消息必须并入“下一次显式用户输入”，应继续放在应用层处理，而不是混入 agent 队列
+
 ## API 参考
 
 ### Agent
@@ -280,6 +304,7 @@ agent := agentcore.NewAgent(
 | `Prompt(input)` | 发起新对话轮次 |
 | `PromptMessages(msgs...)` | 用任意 AgentMessage 发起对话 |
 | `Continue()` | 从当前上下文继续 |
+| `Inject(msg)` | 根据当前状态自动选择 steer / idle 续跑 / 排队 |
 | `Steer(msg)` | 中断注入 steering 消息 |
 | `FollowUp(msg)` | 排队 follow-up 消息 |
 | `Abort()` | 取消当前执行 |

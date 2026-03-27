@@ -270,6 +270,31 @@ agent := agentcore.NewAgent(
 | `edit` | Exact text replacement with fuzzy match, BOM/line-ending normalization, unified diff output |
 | `bash` | Execute shell commands with tail truncation (2000 lines / 50KB) |
 
+## Runtime Injection
+
+Use `Inject(msg)` when the caller's intent is "deliver this as soon as the current
+agent state allows" without manually branching on running vs idle state.
+
+```go
+result, err := agent.Inject(agentcore.UserMsg("Re-check unfinished tasks before stopping."))
+if err != nil {
+    panic(err)
+}
+fmt.Println(result.Disposition)
+```
+
+`Inject` has three outcomes:
+
+- `steered_current_run`: the agent is running, so the message was queued into the current run's steering path
+- `resumed_idle_run`: the agent was idle with an assistant-tail conversation, so the message was queued and `Continue()` was started immediately
+- `queued`: the message was queued, but no run was started
+
+Use the lower-level APIs when you need stricter control:
+
+- `Steer(msg)`: queue for the steering path without any idle auto-resume logic
+- `FollowUp(msg)`: queue for after the current run stops
+- prompt-side injection: keep this in the application layer if the message must be merged into the next explicit user prompt rather than the agent queues
+
 ## API Reference
 
 ### Agent
@@ -280,6 +305,7 @@ agent := agentcore.NewAgent(
 | `Prompt(input)` | Start new conversation turn |
 | `PromptMessages(msgs...)` | Start turn with arbitrary AgentMessages |
 | `Continue()` | Resume from current context |
+| `Inject(msg)` | Deliver message via steer / idle resume / queue, depending on current state |
 | `Steer(msg)` | Inject steering message mid-run |
 | `FollowUp(msg)` | Queue message for after completion |
 | `Abort()` | Cancel current execution |

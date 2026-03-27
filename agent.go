@@ -112,23 +112,7 @@ func (a *Agent) PromptMessages(msgs ...AgentMessage) error {
 		a.mu.Unlock()
 		return fmt.Errorf("agent is already running; use Steer() or FollowUp() to queue messages")
 	}
-	a.isRunning = true
-	a.lastError = ""
-
-	ctx, cancel := context.WithCancel(context.Background())
-	a.cancel = cancel
-	a.done = make(chan struct{})
-
-	agentCtx := AgentContext{
-		SystemPrompt: a.systemPrompt,
-		SystemBlocks: a.systemBlocks,
-		Messages:     copyMessages(a.messages),
-		Tools:        a.tools,
-	}
-	config := a.buildConfig()
-	a.mu.Unlock()
-
-	go a.consumeLoop(AgentLoop(ctx, msgs, agentCtx, config))
+	a.startPromptRunLocked(msgs)
 	return nil
 }
 
@@ -150,35 +134,19 @@ func (a *Agent) Continue() error {
 	if lastMsg.GetRole() == RoleAssistant {
 		if queued := dequeue(&a.steeringQ, a.steeringMode); len(queued) > 0 {
 			a.skipNextInitialSteeringPoll = true
-			a.mu.Unlock()
-			return a.PromptMessages(queued...)
+			a.startPromptRunLocked(queued)
+			return nil
 		}
 		if queued := dequeue(&a.followUpQ, a.followUpMode); len(queued) > 0 {
 			a.skipNextInitialSteeringPoll = true
-			a.mu.Unlock()
-			return a.PromptMessages(queued...)
+			a.startPromptRunLocked(queued)
+			return nil
 		}
 		a.mu.Unlock()
 		return fmt.Errorf("cannot continue from assistant message without queued messages")
 	}
 
-	a.isRunning = true
-	a.lastError = ""
-
-	ctx, cancel := context.WithCancel(context.Background())
-	a.cancel = cancel
-	a.done = make(chan struct{})
-
-	agentCtx := AgentContext{
-		SystemPrompt: a.systemPrompt,
-		SystemBlocks: a.systemBlocks,
-		Messages:     copyMessages(a.messages),
-		Tools:        a.tools,
-	}
-	config := a.buildConfig()
-	a.mu.Unlock()
-
-	go a.consumeLoop(AgentLoopContinue(ctx, agentCtx, config))
+	a.startContinueRunLocked()
 	return nil
 }
 
@@ -296,6 +264,48 @@ func (a *Agent) ClearMessages() {
 	a.mu.Lock()
 	defer a.mu.Unlock()
 	a.messages = nil
+}
+
+// startPromptRunLocked starts a prompt-based run. Caller must hold a.mu.
+func (a *Agent) startPromptRunLocked(msgs []AgentMessage) {
+	a.isRunning = true
+	a.lastError = ""
+
+	ctx, cancel := context.WithCancel(context.Background())
+	a.cancel = cancel
+	a.done = make(chan struct{})
+
+	agentCtx := AgentContext{
+		SystemPrompt: a.systemPrompt,
+		SystemBlocks: a.systemBlocks,
+		Messages:     copyMessages(a.messages),
+		Tools:        a.tools,
+	}
+	config := a.buildConfig()
+	a.mu.Unlock()
+
+	go a.consumeLoop(AgentLoop(ctx, msgs, agentCtx, config))
+}
+
+// startContinueRunLocked starts a continue run from the current context. Caller must hold a.mu.
+func (a *Agent) startContinueRunLocked() {
+	a.isRunning = true
+	a.lastError = ""
+
+	ctx, cancel := context.WithCancel(context.Background())
+	a.cancel = cancel
+	a.done = make(chan struct{})
+
+	agentCtx := AgentContext{
+		SystemPrompt: a.systemPrompt,
+		SystemBlocks: a.systemBlocks,
+		Messages:     copyMessages(a.messages),
+		Tools:        a.tools,
+	}
+	config := a.buildConfig()
+	a.mu.Unlock()
+
+	go a.consumeLoop(AgentLoopContinue(ctx, agentCtx, config))
 }
 
 // ContextUsage returns an estimate of the current context window occupancy.
