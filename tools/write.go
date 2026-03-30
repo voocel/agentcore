@@ -67,7 +67,7 @@ func (t *WriteTool) parseWrite(args json.RawMessage) (*writeState, error) {
 	}, nil
 }
 
-const writePreviewMaxLines = 16
+const writePreviewMaxLines = 12
 
 func (t *WriteTool) Preview(_ context.Context, args json.RawMessage) (json.RawMessage, error) {
 	state, err := t.parseWrite(args)
