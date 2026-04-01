@@ -135,6 +135,13 @@ func WithMaxToolConcurrency(n int) AgentOption {
 	return func(a *Agent) { a.maxToolConcurrency = n }
 }
 
+// WithTaskRuntime sets a shared TaskRuntime for background task management.
+// Tools that support background execution (Bash, SubAgent) register their
+// tasks here, enabling a unified Tasks()/StopTask()/StopAllTasks() API on Agent.
+func WithTaskRuntime(rt *TaskRuntime) AgentOption {
+	return func(a *Agent) { a.taskRuntime = rt }
+}
+
 // WithContextPipeline sets both TransformContext and ConvertToLLM in one call.
 // This is the recommended way to configure context compaction:
 //

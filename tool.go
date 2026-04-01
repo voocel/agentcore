@@ -180,6 +180,43 @@ func ReactivateDeferred(tools []Tool, msgs []AgentMessage) {
 	}
 }
 
+// ---------------------------------------------------------------------------
+// Tool Behavior Interfaces (optional)
+// ---------------------------------------------------------------------------
+
+// ReadOnlyer is an optional interface for tools that declare read-only behavior.
+// Read-only tools are eligible for concurrent execution by default.
+// The args parameter allows input-dependent classification
+// (e.g., bash is read-only for "ls" but not for "rm").
+type ReadOnlyer interface {
+	ReadOnly(args json.RawMessage) bool
+}
+
+// ConcurrencySafer is an optional interface for tools that declare
+// whether they can safely execute concurrently with other tools.
+// Takes precedence over ReadOnlyer for concurrency scheduling.
+type ConcurrencySafer interface {
+	ConcurrencySafe(args json.RawMessage) bool
+}
+
+// ActivityDescriber is an optional interface for tools that provide
+// a human-readable activity description for UI display.
+type ActivityDescriber interface {
+	ActivityDescription(args json.RawMessage) string
+}
+
+// isToolConcurrencySafe checks whether a tool call is safe for concurrent execution.
+// Priority: ConcurrencySafer > ReadOnlyer > false.
+func isToolConcurrencySafe(tool Tool, args json.RawMessage) bool {
+	if cs, ok := tool.(ConcurrencySafer); ok {
+		return cs.ConcurrencySafe(args)
+	}
+	if ro, ok := tool.(ReadOnlyer); ok {
+		return ro.ReadOnly(args)
+	}
+	return false
+}
+
 // ToolExecuteFunc is the function signature for tool execution.
 // Used as the "next" parameter in middleware chains.
 type ToolExecuteFunc func(ctx context.Context, args json.RawMessage) (json.RawMessage, error)

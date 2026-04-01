@@ -24,8 +24,11 @@ type GrepTool struct {
 
 func NewGrep(workDir string) *GrepTool { return &GrepTool{WorkDir: workDir} }
 
-func (t *GrepTool) Name() string  { return "grep" }
-func (t *GrepTool) Label() string { return "Search Content" }
+func (t *GrepTool) Name() string                              { return "grep" }
+func (t *GrepTool) Label() string                              { return "Search Content" }
+func (t *GrepTool) ReadOnly(_ json.RawMessage) bool            { return true }
+func (t *GrepTool) ConcurrencySafe(_ json.RawMessage) bool     { return true }
+func (t *GrepTool) ActivityDescription(_ json.RawMessage) string { return "Searching content" }
 func (t *GrepTool) Description() string {
 	return "Fast content search across files. Supports regex patterns by default, or exact text with literal=true. Use glob to narrow which files are searched. Returns relative file paths, line numbers, and matching lines (default limit: 100). Use bash only when you need shell-specific pipelines, counting, or custom post-processing."
 }

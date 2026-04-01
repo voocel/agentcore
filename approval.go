@@ -33,3 +33,25 @@ type ToolApprovalResult struct {
 // system is configured. Returning nil means "no approval needed".
 // Returning a non-nil result applies the decision immediately.
 type ToolApprovalFunc func(ctx context.Context, req ToolApprovalRequest) (*ToolApprovalResult, error)
+
+// ChainApproval composes multiple approval functions into a single chain.
+// Each function is called in order. The first one to return a non-nil result
+// (allow or deny) short-circuits the chain. If all return nil, the result is
+// nil (no approval needed). If any returns an error, the chain stops with that error.
+func ChainApproval(fns ...ToolApprovalFunc) ToolApprovalFunc {
+	return func(ctx context.Context, req ToolApprovalRequest) (*ToolApprovalResult, error) {
+		for _, fn := range fns {
+			if fn == nil {
+				continue
+			}
+			result, err := fn(ctx, req)
+			if err != nil {
+				return nil, err
+			}
+			if result != nil {
+				return result, nil
+			}
+		}
+		return nil, nil
+	}
+}

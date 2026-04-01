@@ -18,10 +18,14 @@ type InjectResult struct {
 
 // Inject delivers a message as soon as the current agent state allows.
 //
-// Semantics:
-//   - running: enqueue into steeringQ for the current run
-//   - idle with assistant tail: enqueue then synchronously Continue()
-//   - other idle states: enqueue for a later run
+// Outcomes:
+//   - running → steer into current run
+//   - idle + assistant tail → enqueue and Continue()
+//   - idle + no assistant tail → enqueue for next run
+//
+// Returns an error if idle resume was attempted but Continue() failed.
+// In that case the message remains in the steering queue and will be
+// delivered on the next run.
 func (a *Agent) Inject(msg AgentMessage) (InjectResult, error) {
 	if msg == nil {
 		return InjectResult{}, fmt.Errorf("inject message is nil")
@@ -45,7 +49,7 @@ func (a *Agent) Inject(msg AgentMessage) (InjectResult, error) {
 		return InjectResult{Disposition: InjectQueued}, nil
 	}
 	if err := a.Continue(); err != nil {
-		return InjectResult{Disposition: InjectQueued}, nil
+		return InjectResult{Disposition: InjectQueued}, fmt.Errorf("inject: idle resume failed: %w", err)
 	}
 	return InjectResult{Disposition: InjectResumedIdleRun}, nil
 }

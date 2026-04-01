@@ -58,7 +58,10 @@ func NewToolSearchTool(deferred ...agentcore.Tool) *ToolSearchTool {
 	}
 }
 
-func (t *ToolSearchTool) Name() string { return "tool_search" }
+func (t *ToolSearchTool) Name() string                              { return "tool_search" }
+func (t *ToolSearchTool) ReadOnly(_ json.RawMessage) bool            { return true }
+func (t *ToolSearchTool) ConcurrencySafe(_ json.RawMessage) bool     { return true }
+func (t *ToolSearchTool) ActivityDescription(_ json.RawMessage) string { return "Searching tools" }
 
 func (t *ToolSearchTool) Description() string {
 	return "Fetches full schema definitions for deferred tools so they can be called. " +

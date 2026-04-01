@@ -3,7 +3,6 @@ package agentcore
 import (
 	"context"
 	"encoding/json"
-	"errors"
 	"fmt"
 	"math"
 	"strings"
@@ -339,45 +338,9 @@ func recoverOverflow(ctx context.Context, agentCtx *AgentContext, config LoopCon
 	return callLLM(ctx, agentCtx, config, ch)
 }
 
-// contextOverflowPatterns are substrings in error messages that indicate
-// the request exceeded the model's context window.
-var contextOverflowPatterns = []string{
-	"maximum context length",
-	"context length exceeded",
-	"context window",
-	"token limit",
-	"too many tokens",
-	"max_tokens",
-	"maximum number of tokens",
-	"input is too long",
-	"prompt is too long",
-	"request too large",
-	"content too large",
-	"exceeds the model",
-	"reduce the length",
-	"reduce your prompt",
-}
-
 // IsContextOverflow reports whether the error indicates a context window overflow.
 func IsContextOverflow(err error) bool {
-	if err == nil {
-		return false
-	}
-	msg := strings.ToLower(err.Error())
-	for _, pattern := range contextOverflowPatterns {
-		if strings.Contains(msg, pattern) {
-			return true
-		}
-	}
-	for cause := errors.Unwrap(err); cause != nil; cause = errors.Unwrap(cause) {
-		lowerMsg := strings.ToLower(cause.Error())
-		for _, pattern := range contextOverflowPatterns {
-			if strings.Contains(lowerMsg, pattern) {
-				return true
-			}
-		}
-	}
-	return false
+	return litellm.IsContextOverflowError(err)
 }
 
 // retryDelay calculates the wait duration using exponential backoff.
@@ -556,13 +519,51 @@ func callLLMStream(ctx context.Context, model ChatModel, messages []Message, too
 	return partial, nil
 }
 
-// executeToolCalls runs tool calls, choosing sequential or parallel based on config.
-// toolErrors tracks consecutive failures per tool for circuit breaking.
+// executeToolCalls runs tool calls using smart concurrency partitioning.
+// Consecutive concurrency-safe tool calls are batched and run in parallel;
+// unsafe calls run sequentially. When MaxToolConcurrency <= 1, all calls
+// run sequentially (backward compatible).
 func executeToolCalls(ctx context.Context, tools []Tool, calls []ToolCall, config LoopConfig, toolErrors map[string]int, ch chan<- Event) ([]ToolResult, []AgentMessage) {
-	if config.MaxToolConcurrency > 1 && len(calls) > 1 {
-		return executeToolCallsParallel(ctx, tools, calls, config, toolErrors, config.MaxToolConcurrency, ch)
+	maxConc := config.MaxToolConcurrency
+	if maxConc <= 1 {
+		return executeToolCallsSequential(ctx, tools, calls, config, toolErrors, ch)
 	}
-	return executeToolCallsSequential(ctx, tools, calls, config, toolErrors, ch)
+
+	// Partition into batches: consecutive safe calls grouped for parallel execution.
+	type batch struct {
+		calls []ToolCall
+		safe  bool
+	}
+	var batches []batch
+	for _, call := range calls {
+		tool := findTool(tools, call.Name)
+		safe := tool != nil && isToolConcurrencySafe(tool, call.Args)
+		if len(batches) > 0 && batches[len(batches)-1].safe == safe {
+			// Extend current batch (safe or unsafe)
+			batches[len(batches)-1].calls = append(batches[len(batches)-1].calls, call)
+		} else {
+			batches = append(batches, batch{calls: []ToolCall{call}, safe: safe})
+		}
+	}
+
+	var allResults []ToolResult
+	for _, b := range batches {
+		if ctx.Err() != nil {
+			break
+		}
+		var results []ToolResult
+		var steering []AgentMessage
+		if b.safe && len(b.calls) > 1 {
+			results, steering = executeToolCallsParallel(ctx, tools, b.calls, config, toolErrors, maxConc, ch)
+		} else {
+			results, steering = executeToolCallsSequential(ctx, tools, b.calls, config, toolErrors, ch)
+		}
+		allResults = append(allResults, results...)
+		if len(steering) > 0 {
+			return allResults, steering
+		}
+	}
+	return allResults, nil
 }
 
 // executeToolCallsSequential runs tool calls one by one, checking steering after each.

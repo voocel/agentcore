@@ -9,44 +9,11 @@ import (
 	"io"
 	"os"
 	"os/exec"
-	"sync"
 	"time"
 
 	"github.com/voocel/agentcore"
 	"github.com/voocel/agentcore/schema"
 )
-
-// BackgroundShell tracks a background shell command's lifecycle.
-// Output is written to a file on disk (OutputFile) instead of memory.
-type BackgroundShell struct {
-	ID          string
-	Command     string
-	Description string
-	Status      string // "running" | "completed" | "failed"
-	StartedAt   time.Time
-	EndedAt     time.Time
-	OutputFile  string // path to output file on disk
-	ExitCode    int
-	PID         int
-	mu          sync.Mutex
-	cancel      context.CancelFunc
-}
-
-func (bs *BackgroundShell) snapshot() BackgroundShell {
-	bs.mu.Lock()
-	defer bs.mu.Unlock()
-	return BackgroundShell{
-		ID:          bs.ID,
-		Command:     bs.Command,
-		Description: bs.Description,
-		Status:      bs.Status,
-		StartedAt:   bs.StartedAt,
-		EndedAt:     bs.EndedAt,
-		OutputFile:  bs.OutputFile,
-		ExitCode:    bs.ExitCode,
-		PID:         bs.PID,
-	}
-}
 
 // BashTool executes shell commands.
 // Streams stdout+stderr via ReportToolProgress for real-time display.
@@ -57,17 +24,13 @@ type BashTool struct {
 	Timeout         time.Duration // default: 2 minutes
 	notifyFn        func(agentcore.AgentMessage)
 	bgOutputFactory func(shellID string) (io.WriteCloser, string, error) // creates output writer for background shells
-
-	mu       sync.Mutex
-	bgSeq    int
-	bgShells map[string]*BackgroundShell
+	taskRT          *agentcore.TaskRuntime                               // shared background task registry
 }
 
 func NewBash(workDir string) *BashTool {
 	return &BashTool{
-		WorkDir:  workDir,
-		Timeout:  2 * time.Minute,
-		bgShells: make(map[string]*BackgroundShell),
+		WorkDir: workDir,
+		Timeout: 2 * time.Minute,
 	}
 }
 
@@ -84,55 +47,28 @@ func (t *BashTool) SetBgOutputFactory(fn func(shellID string) (io.WriteCloser, s
 	t.bgOutputFactory = fn
 }
 
-// BackgroundShells returns a snapshot of all background shells.
-func (t *BashTool) BackgroundShells() []BackgroundShell {
-	t.mu.Lock()
-	defer t.mu.Unlock()
-	shells := make([]BackgroundShell, 0, len(t.bgShells))
-	for _, bs := range t.bgShells {
-		shells = append(shells, bs.snapshot())
-	}
-	return shells
-}
-
-// StopBackgroundShell cancels a running background shell by ID.
-func (t *BashTool) StopBackgroundShell(id string) bool {
-	t.mu.Lock()
-	defer t.mu.Unlock()
-	bs, ok := t.bgShells[id]
-	if !ok || bs.Status != "running" {
-		return false
-	}
-	bs.cancel()
-	bs.mu.Lock()
-	bs.Status = "failed"
-	bs.ExitCode = -1
-	bs.EndedAt = time.Now()
-	bs.mu.Unlock()
-	return true
-}
-
-// StopAllBackgroundShells cancels all running background shells.
-func (t *BashTool) StopAllBackgroundShells() int {
-	t.mu.Lock()
-	defer t.mu.Unlock()
-	count := 0
-	for _, bs := range t.bgShells {
-		if bs.Status == "running" {
-			bs.cancel()
-			bs.mu.Lock()
-			bs.Status = "failed"
-			bs.ExitCode = -1
-			bs.EndedAt = time.Now()
-			bs.mu.Unlock()
-			count++
-		}
-	}
-	return count
+// SetTaskRuntime sets the shared task runtime for background task registration.
+func (t *BashTool) SetTaskRuntime(rt *agentcore.TaskRuntime) {
+	t.taskRT = rt
 }
 
 func (t *BashTool) Name() string  { return "bash" }
 func (t *BashTool) Label() string { return "Execute Command" }
+
+// ReadOnly reports false — bash commands may have side effects.
+func (t *BashTool) ReadOnly(_ json.RawMessage) bool { return false }
+
+// ConcurrencySafe reports false — bash commands are not safe for concurrent execution.
+func (t *BashTool) ConcurrencySafe(_ json.RawMessage) bool { return false }
+
+// ActivityDescription returns a short description including the command.
+func (t *BashTool) ActivityDescription(args json.RawMessage) string {
+	var a struct{ Command string `json:"command"` }
+	if json.Unmarshal(args, &a) == nil && a.Command != "" {
+		return "Running: " + bashTruncate(a.Command, 40)
+	}
+	return "Running command"
+}
 func (t *BashTool) Description() string {
 	return fmt.Sprintf(
 		"Execute a shell command in the workspace. Prefer read, edit, write, find, grep, and ls for file operations. "+
@@ -220,6 +156,11 @@ func (t *BashTool) executeBackground(a bashArgs) (json.RawMessage, error) {
 		return nil, err
 	}
 
+	rt := t.taskRT
+	if rt == nil {
+		return nil, fmt.Errorf("background mode requires a TaskRuntime; call SetTaskRuntime before use")
+	}
+
 	bgCtx, cancel := context.WithTimeout(context.Background(), timeout)
 
 	cmdArgs := append(append([]string{}, shellArgs...), a.Command)
@@ -244,8 +185,7 @@ func (t *BashTool) executeBackground(a bashArgs) (json.RawMessage, error) {
 		return nil, fmt.Errorf("start command: %w", err)
 	}
 	pw.Close()
-
-	shellID := t.nextBgID()
+	shellID := rt.NextID("shell")
 	desc := a.Description
 	if desc == "" {
 		desc = bashTruncate(a.Command, 60)
@@ -263,19 +203,18 @@ func (t *BashTool) executeBackground(a bashArgs) (json.RawMessage, error) {
 		}
 	}
 
-	bs := &BackgroundShell{
+	entry := &agentcore.BackgroundTaskEntry{
 		ID:          shellID,
+		Type:        agentcore.TaskTypeShell,
 		Command:     a.Command,
 		Description: desc,
-		Status:      "running",
+		Status:      agentcore.TaskRunning,
 		StartedAt:   time.Now(),
 		OutputFile:  outPath,
 		PID:         cmd.Process.Pid,
-		cancel:      cancel,
 	}
-	t.mu.Lock()
-	t.bgShells[shellID] = bs
-	t.mu.Unlock()
+	entry.SetCancel(cancel)
+	rt.Register(entry)
 
 	// Background goroutine: stream output to file, wait for exit, notify.
 	go func() {
@@ -303,9 +242,9 @@ func (t *BashTool) executeBackground(a bashArgs) (json.RawMessage, error) {
 		<-done
 
 		exitCode := 0
-		status := "completed"
+		status := agentcore.TaskCompleted
 		if waitErr != nil {
-			status = "failed"
+			status = agentcore.TaskFailed
 			if exitErr, ok := waitErr.(*exec.ExitError); ok {
 				exitCode = exitErr.ExitCode()
 			} else {
@@ -313,17 +252,13 @@ func (t *BashTool) executeBackground(a bashArgs) (json.RawMessage, error) {
 			}
 		}
 
-		bs.mu.Lock()
-		if bs.Status != "running" {
-			bs.mu.Unlock()
-			return
-		}
-		bs.Status = status
-		bs.ExitCode = exitCode
-		bs.EndedAt = time.Now()
-		bs.mu.Unlock()
+		rt.Update(shellID, func(e *agentcore.BackgroundTaskEntry) {
+			e.Status = status
+			e.ExitCode = exitCode
+			e.EndedAt = time.Now()
+		})
 
-		t.notifyCompletion(bs)
+		t.notifyCompletion(rt, shellID)
 	}()
 
 	return json.Marshal(map[string]any{
@@ -335,20 +270,22 @@ func (t *BashTool) executeBackground(a bashArgs) (json.RawMessage, error) {
 	})
 }
 
-func (t *BashTool) notifyCompletion(bs *BackgroundShell) {
+func (t *BashTool) notifyCompletion(rt *agentcore.TaskRuntime, shellID string) {
 	if t.notifyFn == nil {
 		return
 	}
-	bs.mu.Lock()
-	result := map[string]any{
-		"shell_id":    bs.ID,
-		"command":     bs.Command,
-		"description": bs.Description,
-		"status":      bs.Status,
-		"exit_code":   bs.ExitCode,
-		"output_file": bs.OutputFile,
+	e := rt.Get(shellID)
+	if e == nil {
+		return
 	}
-	bs.mu.Unlock()
+	result := map[string]any{
+		"shell_id":    e.ID,
+		"command":     e.Command,
+		"description": e.Description,
+		"status":      string(e.Status),
+		"exit_code":   e.ExitCode,
+		"output_file": e.OutputFile,
+	}
 
 	data, err := json.Marshal(result)
 	if err != nil {
@@ -356,13 +293,6 @@ func (t *BashTool) notifyCompletion(bs *BackgroundShell) {
 	}
 	msg := agentcore.UserMsg(fmt.Sprintf("<background-shell-completed>\n%s\n</background-shell-completed>", string(data)))
 	t.notifyFn(msg)
-}
-
-func (t *BashTool) nextBgID() string {
-	t.mu.Lock()
-	defer t.mu.Unlock()
-	t.bgSeq++
-	return fmt.Sprintf("shell-%d", t.bgSeq)
 }
 
 // executeForeground runs the command synchronously (original behavior).

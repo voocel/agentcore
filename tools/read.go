@@ -46,8 +46,11 @@ type ReadTool struct {
 
 func NewRead(workDir string) *ReadTool { return &ReadTool{WorkDir: workDir} }
 
-func (t *ReadTool) Name() string  { return "read" }
-func (t *ReadTool) Label() string { return "Read File" }
+func (t *ReadTool) Name() string                              { return "read" }
+func (t *ReadTool) Label() string                              { return "Read File" }
+func (t *ReadTool) ReadOnly(_ json.RawMessage) bool            { return true }
+func (t *ReadTool) ConcurrencySafe(_ json.RawMessage) bool     { return true }
+func (t *ReadTool) ActivityDescription(_ json.RawMessage) string { return "Reading file" }
 func (t *ReadTool) Description() string {
 	return fmt.Sprintf(
 		"Read a file or directory from the local filesystem. Supports relative or absolute paths. Text output is streamed and truncated to %d lines or %s. Use offset to continue reading later sections, and avoid tiny repeated slices when you need broader context. Directory entries are returned one per line with a trailing '/' for subdirectories. Long lines are truncated. Use grep to find specific content in large files, and use glob if you are unsure of the path. Supports JPEG, PNG, GIF, and WebP images. Binary files are rejected.",

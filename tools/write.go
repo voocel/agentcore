@@ -18,8 +18,11 @@ type WriteTool struct {
 
 func NewWrite(workDir string) *WriteTool { return &WriteTool{WorkDir: workDir} }
 
-func (t *WriteTool) Name() string  { return "write" }
-func (t *WriteTool) Label() string { return "Write File" }
+func (t *WriteTool) Name() string                              { return "write" }
+func (t *WriteTool) Label() string                              { return "Write File" }
+func (t *WriteTool) ReadOnly(_ json.RawMessage) bool            { return false }
+func (t *WriteTool) ConcurrencySafe(_ json.RawMessage) bool     { return false }
+func (t *WriteTool) ActivityDescription(_ json.RawMessage) string { return "Writing file" }
 func (t *WriteTool) Description() string {
 	return "Write or overwrite a file on disk. Prefer edit for partial changes to existing files. If you are replacing an existing file, read it first so you understand the current content before overwriting it. Creates parent directories if needed. Avoid creating docs or README files unless the user explicitly asks for them."
 }

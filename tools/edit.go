@@ -19,8 +19,11 @@ type EditTool struct {
 
 func NewEdit(workDir string) *EditTool { return &EditTool{WorkDir: workDir} }
 
-func (t *EditTool) Name() string  { return "edit" }
-func (t *EditTool) Label() string { return "Edit File" }
+func (t *EditTool) Name() string                              { return "edit" }
+func (t *EditTool) Label() string                              { return "Edit File" }
+func (t *EditTool) ReadOnly(_ json.RawMessage) bool            { return false }
+func (t *EditTool) ConcurrencySafe(_ json.RawMessage) bool     { return false }
+func (t *EditTool) ActivityDescription(_ json.RawMessage) string { return "Editing file" }
 func (t *EditTool) Description() string {
 	return "Edit an existing file by replacing one unique text block. Use read first, then copy the exact file content into old_text without any line numbers or prefixes. Preserve indentation for multi-line edits. If the target appears multiple times, include more surrounding context or set replace_all=true to replace every occurrence."
 }

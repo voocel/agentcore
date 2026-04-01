@@ -48,6 +48,7 @@ type Agent struct {
 	middlewares        []ToolMiddleware
 	maxRetryDelay      time.Duration
 	maxToolConcurrency int
+	taskRuntime        *TaskRuntime
 
 	// State
 	messages         []AgentMessage
@@ -335,6 +336,36 @@ func (a *Agent) TotalUsage() Usage {
 	a.mu.Lock()
 	defer a.mu.Unlock()
 	return a.totalUsage
+}
+
+// TaskRuntime returns the shared TaskRuntime, or nil if not configured.
+func (a *Agent) TaskRuntime() *TaskRuntime {
+	return a.taskRuntime
+}
+
+// Tasks returns snapshots of all background tasks.
+// Returns nil if no TaskRuntime is configured.
+func (a *Agent) Tasks() []BackgroundTaskEntry {
+	if a.taskRuntime == nil {
+		return nil
+	}
+	return a.taskRuntime.List()
+}
+
+// StopTask cancels a running background task by ID.
+func (a *Agent) StopTask(id string) bool {
+	if a.taskRuntime == nil {
+		return false
+	}
+	return a.taskRuntime.Stop(id)
+}
+
+// StopAllTasks cancels all running background tasks.
+func (a *Agent) StopAllTasks() int {
+	if a.taskRuntime == nil {
+		return 0
+	}
+	return a.taskRuntime.StopAll()
 }
 
 // SetModel changes the LLM provider. Takes effect on the next turn.

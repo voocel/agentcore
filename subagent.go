@@ -12,60 +12,6 @@ import (
 	"github.com/voocel/agentcore/schema"
 )
 
-// BackgroundTask tracks a background sub-agent's lifecycle.
-// Output is written to a persistent file (OutputFile) with a symlink in the tasks dir.
-type BackgroundTask struct {
-	ID          string
-	Agent       string // agent config name
-	Description string
-	Prompt      string // original task prompt
-	Status      string // "running" | "completed" | "failed"
-	StartedAt   time.Time
-	EndedAt     time.Time
-	OutputFile  string // path to output file on disk
-	Error       string
-	Progress    []string // tool call history: "Tool(args...)"
-	TokensIn    int
-	TokensOut   int
-	ToolCount   int
-	mu          sync.Mutex
-	cancel      context.CancelFunc
-}
-
-func (bt *BackgroundTask) addProgress(entry string) {
-	bt.mu.Lock()
-	bt.Progress = append(bt.Progress, entry)
-	bt.mu.Unlock()
-}
-
-func (bt *BackgroundTask) updateTokens(input, output int) {
-	bt.mu.Lock()
-	bt.TokensIn += input
-	bt.TokensOut += output
-	bt.mu.Unlock()
-}
-
-func (bt *BackgroundTask) snapshot() BackgroundTask {
-	bt.mu.Lock()
-	defer bt.mu.Unlock()
-	prog := make([]string, len(bt.Progress))
-	copy(prog, bt.Progress)
-	return BackgroundTask{
-		ID:          bt.ID,
-		Agent:       bt.Agent,
-		Description: bt.Description,
-		Prompt:      bt.Prompt,
-		Status:      bt.Status,
-		StartedAt:   bt.StartedAt,
-		EndedAt:     bt.EndedAt,
-		OutputFile:  bt.OutputFile,
-		Error:       bt.Error,
-		Progress:    prog,
-		TokensIn:    bt.TokensIn,
-		TokensOut:   bt.TokensOut,
-		ToolCount:   bt.ToolCount,
-	}
-}
 
 const (
 	maxParallelTasks = 8
@@ -146,9 +92,7 @@ type SubAgentTool struct {
 	notifyFn        func(AgentMessage)                                             // called when a background task completes
 	createModel     func(name string) (ChatModel, error)                           // resolves model name to ChatModel at runtime
 	bgOutputFactory func(taskID, agentName string) (io.WriteCloser, string, error) // creates output writer for background tasks
-	mu              sync.Mutex
-	bgSeq           int
-	bgTasks         map[string]*BackgroundTask // background task registry
+	taskRT          *TaskRuntime                                                   // shared background task registry
 }
 
 // NewSubAgentTool creates a subagent tool from a set of agent configs.
@@ -158,56 +102,14 @@ func NewSubAgentTool(agents ...SubAgentConfig) *SubAgentTool {
 		m[a.Name] = a
 	}
 	return &SubAgentTool{
-		agents:  m,
-		bgTasks: make(map[string]*BackgroundTask),
+		agents: m,
 	}
 }
 
-// BackgroundTasks returns a snapshot of all background tasks.
-func (t *SubAgentTool) BackgroundTasks() []BackgroundTask {
-	t.mu.Lock()
-	defer t.mu.Unlock()
-	tasks := make([]BackgroundTask, 0, len(t.bgTasks))
-	for _, bt := range t.bgTasks {
-		tasks = append(tasks, bt.snapshot())
-	}
-	return tasks
-}
-
-// StopBackgroundTask cancels a running background task by ID.
-func (t *SubAgentTool) StopBackgroundTask(id string) bool {
-	t.mu.Lock()
-	defer t.mu.Unlock()
-	bt, ok := t.bgTasks[id]
-	if !ok || bt.Status != "running" {
-		return false
-	}
-	bt.cancel()
-	bt.mu.Lock()
-	bt.Status = "failed"
-	bt.Error = "stopped by user"
-	bt.EndedAt = time.Now()
-	bt.mu.Unlock()
-	return true
-}
-
-// StopAllBackgroundTasks cancels all running background tasks.
-func (t *SubAgentTool) StopAllBackgroundTasks() int {
-	t.mu.Lock()
-	defer t.mu.Unlock()
-	count := 0
-	for _, bt := range t.bgTasks {
-		if bt.Status == "running" {
-			bt.cancel()
-			bt.mu.Lock()
-			bt.Status = "failed"
-			bt.Error = "stopped by user"
-			bt.EndedAt = time.Now()
-			bt.mu.Unlock()
-			count++
-		}
-	}
-	return count
+// SetTaskRuntime sets the shared task runtime for background task registration.
+// When set, background tasks are registered here instead of managed internally.
+func (t *SubAgentTool) SetTaskRuntime(rt *TaskRuntime) {
+	t.taskRT = rt
 }
 
 // SetNotifyFn sets the callback invoked when a background task completes.
@@ -323,25 +225,30 @@ func (t *SubAgentTool) executeBackground(agentName, task, description string, mo
 		})
 	}
 
-	taskID := t.nextBgID()
+	rt := t.taskRT
+	if rt == nil {
+		return json.Marshal(map[string]any{
+			"error": "background mode requires a TaskRuntime; call SetTaskRuntime before use",
+		})
+	}
+	taskID := rt.NextID("bg")
 	if description == "" {
 		description = truncate(task, 80)
 	}
 
 	bgCtx, cancel := context.WithCancel(context.Background())
 
-	bt := &BackgroundTask{
+	entry := &BackgroundTaskEntry{
 		ID:          taskID,
+		Type:        TaskTypeSubAgent,
 		Agent:       agentName,
-		Description: description,
 		Prompt:      task,
-		Status:      "running",
+		Description: description,
+		Status:      TaskRunning,
 		StartedAt:   time.Now(),
-		cancel:      cancel,
 	}
-	t.mu.Lock()
-	t.bgTasks[taskID] = bt
-	t.mu.Unlock()
+	entry.SetCancel(cancel)
+	rt.Register(entry)
 
 	go func() {
 		defer cancel()
@@ -351,31 +258,26 @@ func (t *SubAgentTool) executeBackground(agentName, task, description string, mo
 			w, path, ferr := t.bgOutputFactory(taskID, agentName)
 			if ferr == nil {
 				outFile = w
-				bt.mu.Lock()
-				bt.OutputFile = path
-				bt.mu.Unlock()
+				rt.Update(taskID, func(e *BackgroundTaskEntry) { e.OutputFile = path })
 			}
 		}
 
-		_, usage, err := t.runAgent(bgCtx, agentName, task, modelOverride, &bgRunOpts{bt: bt, outFile: outFile})
+		_, usage, err := t.runAgent(bgCtx, agentName, task, modelOverride, &bgRunOpts{taskID: taskID, rt: rt, outFile: outFile})
 		if outFile != nil {
 			outFile.Close()
 		}
 
-		bt.mu.Lock()
-		if bt.Status != "running" {
-			bt.mu.Unlock()
-			return
-		}
-		bt.EndedAt = time.Now()
-		if err != nil {
-			bt.Status = "failed"
-			bt.Error = err.Error()
-		} else {
-			bt.Status = "completed"
-		}
-		outputFile := bt.OutputFile
-		bt.mu.Unlock()
+		var outputFile string
+		rt.Update(taskID, func(e *BackgroundTaskEntry) {
+			e.EndedAt = time.Now()
+			if err != nil {
+				e.Status = TaskFailed
+				e.Error = err.Error()
+			} else {
+				e.Status = TaskCompleted
+			}
+			outputFile = e.OutputFile
+		})
 
 		result := map[string]any{
 			"task_id":     taskID,
@@ -401,14 +303,6 @@ func (t *SubAgentTool) executeBackground(agentName, task, description string, mo
 		"status":      "running",
 		"message":     fmt.Sprintf("Background task %s started with agent %q. You will receive a notification when it completes.", taskID, agentName),
 	})
-}
-
-// nextBgID generates a sequential background task ID.
-func (t *SubAgentTool) nextBgID() string {
-	t.mu.Lock()
-	defer t.mu.Unlock()
-	t.bgSeq++
-	return fmt.Sprintf("bg-%d", t.bgSeq)
 }
 
 // notify sends background task results via notifyFn as a follow-up message.
@@ -531,8 +425,9 @@ func (t *SubAgentTool) executeParallel(ctx context.Context, tasks []subagentTask
 // bgRunOpts configures background-specific behavior for runAgent.
 // When nil, runAgent runs in foreground mode (reports progress to parent context).
 type bgRunOpts struct {
-	bt      *BackgroundTask // background task to update with progress
-	outFile io.Writer       // output stream for session persistence (optional)
+	taskID  string       // task ID in the TaskRuntime
+	rt      *TaskRuntime // shared runtime for updates
+	outFile io.Writer    // output stream for session persistence (optional)
 }
 
 // runAgent executes an isolated agent loop for the given agent config and task.
@@ -584,14 +479,14 @@ func (t *SubAgentTool) runAgent(ctx context.Context, agentName, task string, mod
 		case EventToolExecStart:
 			su.Tools++
 			if bg != nil {
-				bg.bt.mu.Lock()
-				bg.bt.ToolCount++
-				bg.bt.mu.Unlock()
-				label := ev.Tool
-				if len(ev.Args) > 0 {
-					label += "(" + truncate(string(ev.Args), 60) + ")"
+				bg.rt.Update(bg.taskID, func(e *BackgroundTaskEntry) { e.ToolCount++ })
+				if bg.outFile != nil {
+					label := ev.Tool
+					if len(ev.Args) > 0 {
+						label += "(" + truncate(string(ev.Args), 60) + ")"
+					}
+					fmt.Fprintf(bg.outFile, "[tool] %s\n", label)
 				}
-				bg.bt.addProgress(label)
 			} else {
 				ReportToolProgress(ctx, ProgressPayload{
 					Kind:    ProgressToolStart,
@@ -666,7 +561,10 @@ func (t *SubAgentTool) runAgent(ctx context.Context, agentName, task string, mod
 						su.Cost += msg.Usage.Cost.Total
 					}
 					if bg != nil {
-						bg.bt.updateTokens(msg.Usage.Input, msg.Usage.Output)
+						bg.rt.Update(bg.taskID, func(e *BackgroundTaskEntry) {
+							e.TokensIn += msg.Usage.Input
+							e.TokensOut += msg.Usage.Output
+						})
 					}
 				}
 			}

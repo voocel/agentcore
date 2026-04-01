@@ -20,8 +20,11 @@ type LsTool struct {
 
 func NewLs(workDir string) *LsTool { return &LsTool{WorkDir: workDir} }
 
-func (t *LsTool) Name() string  { return "ls" }
-func (t *LsTool) Label() string { return "List Directory" }
+func (t *LsTool) Name() string                              { return "ls" }
+func (t *LsTool) Label() string                              { return "List Directory" }
+func (t *LsTool) ReadOnly(_ json.RawMessage) bool            { return true }
+func (t *LsTool) ConcurrencySafe(_ json.RawMessage) bool     { return true }
+func (t *LsTool) ActivityDescription(_ json.RawMessage) string { return "Listing directory" }
 func (t *LsTool) Description() string {
 	return "List directory contents as a tree. Use this for quick directory structure checks before reading files. Depth controls recursive listing (default 1, max 5). Use ignore to hide generated or irrelevant paths. Common generated directories (node_modules, .git, dist, build, etc.) are hidden by default."
 }

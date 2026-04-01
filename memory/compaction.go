@@ -12,8 +12,9 @@ import (
 )
 
 const (
-	defaultReserveTokens    = 16384
-	defaultKeepRecentTokens = 20000
+	defaultReserveTokens         = 16384
+	defaultKeepRecentTokens      = 20000
+	defaultMaxConsecutiveFailures = 3
 )
 
 // CompactionInfo holds details about a completed compaction for observability.
@@ -48,6 +49,16 @@ type CompactionConfig struct {
 	// Default: 20000.
 	KeepRecentTokens int
 
+	// MaxConsecutiveFailures is the circuit breaker threshold.
+	// After this many consecutive compaction failures, compaction is disabled
+	// for the rest of the session. Default: 3. 0 means no limit.
+	MaxConsecutiveFailures int
+
+	// StripImages controls whether image content blocks are removed before
+	// summarization. Images consume large amounts of tokens but cannot be
+	// meaningfully summarized by text. Default: true.
+	StripImages *bool
+
 	// OnCompaction is called after a successful compaction with details.
 	// Optional — nil means no callback.
 	OnCompaction func(CompactionInfo)
@@ -72,9 +83,25 @@ func NewCompaction(cfg CompactionConfig) func(context.Context, []agentcore.Agent
 	if cfg.KeepRecentTokens <= 0 {
 		cfg.KeepRecentTokens = defaultKeepRecentTokens
 	}
+	if cfg.MaxConsecutiveFailures < 0 {
+		cfg.MaxConsecutiveFailures = defaultMaxConsecutiveFailures
+	}
+	stripImages := true
+	if cfg.StripImages != nil {
+		stripImages = *cfg.StripImages
+	}
+
+	// Circuit breaker state (closed over, survives across calls).
+	consecutiveFailures := 0
+	tripped := false
 
 	return func(ctx context.Context, msgs []agentcore.AgentMessage) ([]agentcore.AgentMessage, error) {
 		if len(msgs) == 0 || cfg.Model == nil {
+			return msgs, nil
+		}
+
+		// Circuit breaker: skip compaction if tripped.
+		if tripped {
 			return msgs, nil
 		}
 
@@ -101,6 +128,11 @@ func NewCompaction(cfg CompactionConfig) func(context.Context, []agentcore.Agent
 		toSummarize := msgs[:historyEnd]
 		toKeep := msgs[cut.firstKeptIndex:]
 
+		// Strip images before summarization — they consume tokens but can't be text-summarized.
+		if stripImages {
+			toSummarize = stripImageBlocks(toSummarize)
+		}
+
 		// Find previous CompactionSummary for incremental update
 		var previousSummary string
 		for _, m := range toSummarize {
@@ -124,6 +156,9 @@ func NewCompaction(cfg CompactionConfig) func(context.Context, []agentcore.Agent
 		var turnPrefix []agentcore.AgentMessage
 		if needTurnPrefix {
 			turnPrefix = msgs[cut.turnStartIndex:cut.firstKeptIndex]
+			if stripImages {
+				turnPrefix = stripImageBlocks(turnPrefix)
+			}
 			needTurnPrefix = len(turnPrefix) > 0
 		}
 
@@ -152,10 +187,14 @@ func NewCompaction(cfg CompactionConfig) func(context.Context, []agentcore.Agent
 			hr := <-historyCh
 			pr := <-prefixCh
 
-			if hr.err != nil {
-				return nil, fmt.Errorf("compaction: %w", hr.err)
-			}
-			if pr.err != nil {
+			if hr.err != nil || pr.err != nil {
+				consecutiveFailures++
+				if cfg.MaxConsecutiveFailures > 0 && consecutiveFailures >= cfg.MaxConsecutiveFailures {
+					tripped = true
+				}
+				if hr.err != nil {
+					return nil, fmt.Errorf("compaction: %w", hr.err)
+				}
 				return nil, fmt.Errorf("compaction turn prefix: %w", pr.err)
 			}
 			summary = hr.text
@@ -166,9 +205,16 @@ func NewCompaction(cfg CompactionConfig) func(context.Context, []agentcore.Agent
 			var err error
 			summary, err = generateSummary(ctx, cfg.Model, toSummarize, previousSummary, historyOpts...)
 			if err != nil {
+				consecutiveFailures++
+				if cfg.MaxConsecutiveFailures > 0 && consecutiveFailures >= cfg.MaxConsecutiveFailures {
+					tripped = true
+				}
 				return nil, fmt.Errorf("compaction: %w", err)
 			}
 		}
+
+		// Success — reset circuit breaker.
+		consecutiveFailures = 0
 
 		// Extract file ops from ALL compacted messages (history + turn prefix)
 		allCompacted := msgs[:cut.firstKeptIndex]
@@ -204,6 +250,45 @@ func NewCompaction(cfg CompactionConfig) func(context.Context, []agentcore.Agent
 
 		return result, nil
 	}
+}
+
+// stripImageBlocks returns a copy of msgs with image content blocks removed.
+// Text descriptions like "[image: screenshot.png]" are preserved if present.
+// This reduces token usage during summarization — images can't be text-summarized.
+func stripImageBlocks(msgs []agentcore.AgentMessage) []agentcore.AgentMessage {
+	out := make([]agentcore.AgentMessage, 0, len(msgs))
+	for _, m := range msgs {
+		msg, ok := m.(agentcore.Message)
+		if !ok {
+			out = append(out, m)
+			continue
+		}
+		hasImage := false
+		for _, b := range msg.Content {
+			if b.Type == agentcore.ContentImage {
+				hasImage = true
+				break
+			}
+		}
+		if !hasImage {
+			out = append(out, m)
+			continue
+		}
+		// Filter out image blocks, keep everything else.
+		filtered := make([]agentcore.ContentBlock, 0, len(msg.Content))
+		for _, b := range msg.Content {
+			if b.Type == agentcore.ContentImage {
+				// Replace with placeholder text so the summary knows an image was here.
+				filtered = append(filtered, agentcore.TextBlock("[image content omitted for summarization]"))
+				continue
+			}
+			filtered = append(filtered, b)
+		}
+		cp := msg
+		cp.Content = filtered
+		out = append(out, cp)
+	}
+	return out
 }
 
 // cutResult holds the result of findCutPoint, including turn split information.

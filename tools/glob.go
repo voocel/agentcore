@@ -23,8 +23,11 @@ type GlobTool struct {
 
 func NewGlob(workDir string) *GlobTool { return &GlobTool{WorkDir: workDir} }
 
-func (t *GlobTool) Name() string  { return "glob" }
-func (t *GlobTool) Label() string { return "Match Files" }
+func (t *GlobTool) Name() string                              { return "glob" }
+func (t *GlobTool) Label() string                              { return "Match Files" }
+func (t *GlobTool) ReadOnly(_ json.RawMessage) bool            { return true }
+func (t *GlobTool) ConcurrencySafe(_ json.RawMessage) bool     { return true }
+func (t *GlobTool) ActivityDescription(_ json.RawMessage) string { return "Searching files" }
 func (t *GlobTool) Description() string {
 	return "Fast file pattern matching for any codebase size. Supports path-aware glob patterns like '**/*.js' and 'src/**/*.ts'. Returns matching relative file paths sorted by modification time (newest first). Use this when you need to find files by name pattern before reading or grepping them."
 }
