@@ -5,8 +5,10 @@ import (
 	"encoding/json"
 	"fmt"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/voocel/agentcore/permission"
 )
@@ -166,6 +168,42 @@ func toolCallMsg(calls ...ToolCall) Message {
 func runTestLoop(t *testing.T, msgs []AgentMessage, actx AgentContext, cfg LoopConfig) []Event {
 	t.Helper()
 	return collectEvents(AgentLoop(context.Background(), msgs, actx, cfg))
+}
+
+type scriptedStreamModel struct {
+	mu       sync.Mutex
+	requests [][]Message
+	streams  []func(chan<- StreamEvent)
+}
+
+func (m *scriptedStreamModel) Generate(ctx context.Context, messages []Message, tools []ToolSpec, opts ...CallOption) (*LLMResponse, error) {
+	return nil, fmt.Errorf("unexpected Generate call")
+}
+
+func (m *scriptedStreamModel) GenerateStream(ctx context.Context, messages []Message, tools []ToolSpec, opts ...CallOption) (<-chan StreamEvent, error) {
+	m.mu.Lock()
+	idx := len(m.requests)
+	m.requests = append(m.requests, append([]Message(nil), messages...))
+	streamFn := m.streams[idx]
+	m.mu.Unlock()
+
+	ch := make(chan StreamEvent, 16)
+	go func() {
+		defer close(ch)
+		streamFn(ch)
+	}()
+	return ch, nil
+}
+
+func (m *scriptedStreamModel) SupportsTools() bool { return true }
+
+func (m *scriptedStreamModel) Request(i int) []Message {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if i < 0 || i >= len(m.requests) {
+		return nil
+	}
+	return append([]Message(nil), m.requests[i]...)
 }
 
 // ---------------------------------------------------------------------------
@@ -602,6 +640,375 @@ func TestAgentLoop_ContentToolUsesMiddleware(t *testing.T) {
 	end, ok := findEvent(events, EventToolExecEnd)
 	if !ok || end.IsError {
 		t.Fatal("expected successful tool_exec_end")
+	}
+}
+
+func TestAgentLoop_StreamingToolExecutionStartsBeforeAssistantEnds(t *testing.T) {
+	var calls []string
+	tc := ToolCall{ID: "tc-stream", Name: "echo", Args: json.RawMessage(`{"value":"ping"}`)}
+
+	model := &scriptedStreamModel{
+		streams: []func(chan<- StreamEvent){
+			func(ch chan<- StreamEvent) {
+				partial := Message{Role: RoleAssistant, Content: []ContentBlock{TextBlock("")}}
+				ch <- StreamEvent{Type: StreamEventTextStart, Message: partial}
+
+				partial.Content[0].Text = "working"
+				ch <- StreamEvent{Type: StreamEventTextDelta, Message: partial, Delta: "working"}
+
+				ch <- StreamEvent{Type: StreamEventToolCallStart, Message: partial}
+
+				partial.Content = append(partial.Content, ToolCallBlock(tc))
+				ch <- StreamEvent{Type: StreamEventToolCallEnd, Message: partial, CompletedToolCall: &tc}
+
+				time.Sleep(40 * time.Millisecond)
+				ch <- StreamEvent{
+					Type: StreamEventDone,
+					Message: Message{
+						Role:       RoleAssistant,
+						Content:    []ContentBlock{TextBlock("working"), ToolCallBlock(tc)},
+						StopReason: StopReasonToolUse,
+					},
+				}
+			},
+			func(ch chan<- StreamEvent) {
+				ch <- StreamEvent{
+					Type: StreamEventDone,
+					Message: Message{
+						Role:       RoleAssistant,
+						Content:    []ContentBlock{TextBlock("done")},
+						StopReason: StopReasonStop,
+					},
+				}
+			},
+		},
+	}
+
+	events := runTestLoop(t,
+		[]AgentMessage{UserMsg("stream tools")},
+		AgentContext{Tools: []Tool{echoTool(&calls)}},
+		LoopConfig{Model: model},
+	)
+
+	if len(calls) != 1 || calls[0] != "ping" {
+		t.Fatalf("expected streaming tool execution, got %v", calls)
+	}
+
+	toolExecStart := -1
+	assistantToolMessageEnd := -1
+	for i, ev := range events {
+		if toolExecStart < 0 && ev.Type == EventToolExecStart {
+			toolExecStart = i
+		}
+		if ev.Type == EventMessageEnd {
+			if msg, ok := ev.Message.(Message); ok && msg.Role == RoleAssistant && len(msg.ToolCalls()) > 0 {
+				assistantToolMessageEnd = i
+				break
+			}
+		}
+	}
+
+	if toolExecStart < 0 || assistantToolMessageEnd < 0 {
+		t.Fatalf("unexpected event sequence: tool_exec_start=%d assistant_tool_message_end=%d", toolExecStart, assistantToolMessageEnd)
+	}
+	if toolExecStart >= assistantToolMessageEnd {
+		t.Fatalf("expected tool execution to start before assistant message ended, got start=%d end=%d", toolExecStart, assistantToolMessageEnd)
+	}
+}
+
+func TestAgentLoop_StreamingToolExecutionKeepsContextOrder(t *testing.T) {
+	var calls []string
+	tc := ToolCall{ID: "tc-order", Name: "echo", Args: json.RawMessage(`{"value":"ordered"}`)}
+
+	model := &scriptedStreamModel{
+		streams: []func(chan<- StreamEvent){
+			func(ch chan<- StreamEvent) {
+				partial := Message{Role: RoleAssistant, Content: []ContentBlock{TextBlock("plan")}}
+				ch <- StreamEvent{Type: StreamEventTextStart, Message: partial}
+				ch <- StreamEvent{Type: StreamEventToolCallStart, Message: partial}
+				partial.Content = append(partial.Content, ToolCallBlock(tc))
+				ch <- StreamEvent{Type: StreamEventToolCallEnd, Message: partial, CompletedToolCall: &tc}
+				time.Sleep(20 * time.Millisecond)
+				ch <- StreamEvent{
+					Type: StreamEventDone,
+					Message: Message{
+						Role:       RoleAssistant,
+						Content:    []ContentBlock{TextBlock("plan"), ToolCallBlock(tc)},
+						StopReason: StopReasonToolUse,
+					},
+				}
+			},
+			func(ch chan<- StreamEvent) {
+				ch <- StreamEvent{
+					Type: StreamEventDone,
+					Message: Message{
+						Role:       RoleAssistant,
+						Content:    []ContentBlock{TextBlock("done")},
+						StopReason: StopReasonStop,
+					},
+				}
+			},
+		},
+	}
+
+	runTestLoop(t,
+		[]AgentMessage{UserMsg("order")},
+		AgentContext{Tools: []Tool{echoTool(&calls)}},
+		LoopConfig{Model: model},
+	)
+
+	if len(calls) != 1 || calls[0] != "ordered" {
+		t.Fatalf("expected ordered tool execution, got %v", calls)
+	}
+
+	secondReq := model.Request(1)
+	if len(secondReq) < 3 {
+		t.Fatalf("expected second request to include assistant tool call and tool result, got %d messages", len(secondReq))
+	}
+
+	assistantIdx := -1
+	toolIdx := -1
+	for i, msg := range secondReq {
+		if msg.Role == RoleAssistant && len(msg.ToolCalls()) > 0 {
+			assistantIdx = i
+		}
+		if msg.Role == RoleTool {
+			toolIdx = i
+		}
+	}
+
+	if assistantIdx < 0 || toolIdx < 0 {
+		t.Fatalf("expected assistant tool call and tool result in second request, assistant=%d tool=%d", assistantIdx, toolIdx)
+	}
+	if assistantIdx >= toolIdx {
+		t.Fatalf("expected assistant tool call before tool result, got assistant=%d tool=%d", assistantIdx, toolIdx)
+	}
+}
+
+func TestAgentLoop_StreamingToolExecutionPreservesCompletedCallsOnLengthStop(t *testing.T) {
+	var calls []string
+	tc := ToolCall{ID: "tc-length", Name: "echo", Args: json.RawMessage(`{"value":"kept"}`)}
+
+	model := &scriptedStreamModel{
+		streams: []func(chan<- StreamEvent){
+			func(ch chan<- StreamEvent) {
+				partial := Message{Role: RoleAssistant, Content: []ContentBlock{TextBlock("partial")}}
+				ch <- StreamEvent{Type: StreamEventTextStart, Message: partial}
+				ch <- StreamEvent{Type: StreamEventToolCallStart, Message: partial}
+				partial.Content = append(partial.Content, ToolCallBlock(tc))
+				ch <- StreamEvent{Type: StreamEventToolCallEnd, Message: partial, CompletedToolCall: &tc}
+				ch <- StreamEvent{
+					Type: StreamEventDone,
+					Message: Message{
+						Role:       RoleAssistant,
+						Content:    []ContentBlock{TextBlock("partial"), ToolCallBlock(tc)},
+						StopReason: StopReasonLength,
+					},
+				}
+			},
+			func(ch chan<- StreamEvent) {
+				ch <- StreamEvent{
+					Type: StreamEventDone,
+					Message: Message{
+						Role:       RoleAssistant,
+						Content:    []ContentBlock{TextBlock("done")},
+						StopReason: StopReasonStop,
+					},
+				}
+			},
+		},
+	}
+
+	runTestLoop(t,
+		[]AgentMessage{UserMsg("length stop")},
+		AgentContext{Tools: []Tool{echoTool(&calls)}},
+		LoopConfig{Model: model},
+	)
+
+	if len(calls) != 1 || calls[0] != "kept" {
+		t.Fatalf("expected completed tool call to survive StopReasonLength, got %v", calls)
+	}
+
+	secondReq := model.Request(1)
+	foundAssistantToolCall := false
+	for _, msg := range secondReq {
+		if msg.Role == RoleAssistant && len(msg.ToolCalls()) > 0 {
+			foundAssistantToolCall = true
+			break
+		}
+	}
+	if !foundAssistantToolCall {
+		t.Fatal("expected completed tool call to remain in context after StopReasonLength")
+	}
+}
+
+func TestAgentLoop_StreamingToolExecutionHonorsSteeringForQueuedTools(t *testing.T) {
+	var calls []string
+	var mu sync.Mutex
+	steeringDelivered := false
+
+	sleepyEcho := NewFuncTool("sleepy_echo", "serial echo", map[string]any{
+		"type": "object",
+		"properties": map[string]any{
+			"value": map[string]any{"type": "string"},
+		},
+		"required": []string{"value"},
+	}, func(ctx context.Context, args json.RawMessage) (json.RawMessage, error) {
+		var p struct{ Value string }
+		_ = json.Unmarshal(args, &p)
+		time.Sleep(30 * time.Millisecond)
+		mu.Lock()
+		calls = append(calls, p.Value)
+		mu.Unlock()
+		return json.Marshal("ok")
+	})
+
+	tc1 := ToolCall{ID: "tc-s1", Name: "sleepy_echo", Args: json.RawMessage(`{"value":"first"}`)}
+	tc2 := ToolCall{ID: "tc-s2", Name: "sleepy_echo", Args: json.RawMessage(`{"value":"second"}`)}
+
+	model := &scriptedStreamModel{
+		streams: []func(chan<- StreamEvent){
+			func(ch chan<- StreamEvent) {
+				partial := Message{Role: RoleAssistant, Content: []ContentBlock{TextBlock("do work")}}
+				ch <- StreamEvent{Type: StreamEventTextStart, Message: partial}
+				ch <- StreamEvent{Type: StreamEventToolCallStart, Message: partial}
+				partial.Content = append(partial.Content, ToolCallBlock(tc1))
+				ch <- StreamEvent{Type: StreamEventToolCallEnd, Message: partial, CompletedToolCall: &tc1}
+				ch <- StreamEvent{Type: StreamEventToolCallStart, Message: partial}
+				partial.Content = append(partial.Content, ToolCallBlock(tc2))
+				ch <- StreamEvent{Type: StreamEventToolCallEnd, Message: partial, CompletedToolCall: &tc2}
+				time.Sleep(60 * time.Millisecond)
+				ch <- StreamEvent{
+					Type: StreamEventDone,
+					Message: Message{
+						Role:       RoleAssistant,
+						Content:    []ContentBlock{TextBlock("do work"), ToolCallBlock(tc1), ToolCallBlock(tc2)},
+						StopReason: StopReasonToolUse,
+					},
+				}
+			},
+			func(ch chan<- StreamEvent) {
+				ch <- StreamEvent{
+					Type: StreamEventDone,
+					Message: Message{
+						Role:       RoleAssistant,
+						Content:    []ContentBlock{TextBlock("redirected")},
+						StopReason: StopReasonStop,
+					},
+				}
+			},
+		},
+	}
+
+	events := runTestLoop(t,
+		[]AgentMessage{UserMsg("steer stream")},
+		AgentContext{Tools: []Tool{sleepyEcho}},
+		LoopConfig{
+			Model: model,
+			GetSteeringMessages: func() []AgentMessage {
+				mu.Lock()
+				defer mu.Unlock()
+				if len(calls) == 1 && !steeringDelivered {
+					steeringDelivered = true
+					return []AgentMessage{UserMsg("redirect")}
+				}
+				return nil
+			},
+		},
+	)
+
+	mu.Lock()
+	gotCalls := append([]string(nil), calls...)
+	mu.Unlock()
+	if len(gotCalls) != 1 || gotCalls[0] != "first" {
+		t.Fatalf("expected only first queued tool to execute after steering, got %v", gotCalls)
+	}
+
+	sawSkippedSecond := false
+	for _, ev := range events {
+		if ev.Type == EventToolExecEnd && ev.ToolID == "tc-s2" && strings.Contains(string(ev.Result), "Skipped due to queued user message.") {
+			sawSkippedSecond = true
+			break
+		}
+	}
+	if !sawSkippedSecond {
+		t.Fatal("expected second queued tool to be skipped after steering")
+	}
+}
+
+func TestAgentLoop_StreamingToolExecutionDrainsOnStreamError(t *testing.T) {
+	started := make(chan struct{}, 1)
+	tc := ToolCall{ID: "tc-err", Name: "wait_for_cancel", Args: json.RawMessage(`{}`)}
+
+	waitForCancel := NewFuncTool("wait_for_cancel", "waits for cancellation", map[string]any{
+		"type":       "object",
+		"properties": map[string]any{},
+	}, func(ctx context.Context, args json.RawMessage) (json.RawMessage, error) {
+		select {
+		case started <- struct{}{}:
+		default:
+		}
+		<-ctx.Done()
+		return nil, ctx.Err()
+	})
+
+	model := &scriptedStreamModel{
+		streams: []func(chan<- StreamEvent){
+			func(ch chan<- StreamEvent) {
+				partial := Message{Role: RoleAssistant, Content: []ContentBlock{TextBlock("working")}}
+				ch <- StreamEvent{Type: StreamEventTextStart, Message: partial}
+				ch <- StreamEvent{Type: StreamEventToolCallStart, Message: partial}
+				partial.Content = append(partial.Content, ToolCallBlock(tc))
+				ch <- StreamEvent{Type: StreamEventToolCallEnd, Message: partial, CompletedToolCall: &tc}
+				select {
+				case <-started:
+				case <-time.After(time.Second):
+				}
+				ch <- StreamEvent{Type: StreamEventError, Err: fmt.Errorf("stream failed")}
+			},
+		},
+	}
+
+	events := runTestLoop(t,
+		[]AgentMessage{UserMsg("stream error")},
+		AgentContext{Tools: []Tool{waitForCancel}},
+		LoopConfig{Model: model},
+	)
+
+	toolStart := -1
+	toolEnd := -1
+	errIdx := -1
+	agentEnd := -1
+	for i, ev := range events {
+		switch ev.Type {
+		case EventToolExecStart:
+			if ev.ToolID == "tc-err" && toolStart < 0 {
+				toolStart = i
+			}
+		case EventToolExecEnd:
+			if ev.ToolID == "tc-err" && strings.Contains(string(ev.Result), "context canceled") {
+				toolEnd = i
+			}
+		case EventError:
+			if ev.Err != nil && strings.Contains(ev.Err.Error(), "stream failed") {
+				errIdx = i
+			}
+		case EventAgentEnd:
+			agentEnd = i
+		}
+	}
+
+	if toolStart < 0 || toolEnd < 0 || errIdx < 0 || agentEnd < 0 {
+		t.Fatalf("unexpected event sequence: tool_start=%d tool_end=%d err=%d agent_end=%d", toolStart, toolEnd, errIdx, agentEnd)
+	}
+	if toolStart >= toolEnd {
+		t.Fatalf("expected cancelled tool to emit end after start, got start=%d end=%d", toolStart, toolEnd)
+	}
+	if toolEnd >= errIdx {
+		t.Fatalf("expected tool cleanup before stream error surfaced, got tool_end=%d err=%d", toolEnd, errIdx)
+	}
+	if errIdx >= agentEnd {
+		t.Fatalf("expected agent_end after error, got err=%d agent_end=%d", errIdx, agentEnd)
 	}
 }
 

@@ -217,16 +217,18 @@ func (l *LiteLLMAdapter) GenerateStream(ctx context.Context, messages []agentcor
 				}
 			},
 			OnToolCallEnd: func(call litellm.ToolCall) {
-				partial.Content = append(partial.Content, agentcore.ToolCallBlock(agentcore.ToolCall{
+				completed := agentcore.ToolCall{
 					ID:   call.ID,
 					Name: call.Function.Name,
 					Args: safeArgs(call.Function.Arguments),
-				}))
+				}
+				partial.Content = append(partial.Content, agentcore.ToolCallBlock(completed))
 				idx := len(partial.Content) - 1
 				eventChan <- agentcore.StreamEvent{
 					Type:         agentcore.StreamEventToolCallEnd,
 					ContentIndex: idx,
 					Message:      partial,
+					CompletedToolCall: &completed,
 				}
 			},
 		})

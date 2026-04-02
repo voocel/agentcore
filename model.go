@@ -279,6 +279,10 @@ type StreamEvent struct {
 	ContentIndex int        // which content block is being updated
 	Delta        string     // text/thinking/toolcall argument delta
 	Message      Message    // partial (during streaming) or final (done)
+	// CompletedToolCall is populated on StreamEventToolCallEnd with the fully
+	// reconstructed tool call. It lets the loop start execution immediately
+	// without re-parsing the partial assistant message.
+	CompletedToolCall *ToolCall
 	StopReason   StopReason // finish reason (for done events)
 	Err          error      // for error events
 }
