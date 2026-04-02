@@ -213,6 +213,22 @@ type ConcurrencySafer interface {
 	ConcurrencySafe(args json.RawMessage) bool
 }
 
+// InterruptBehavior controls what happens when a queued user message arrives
+// while a tool is still running.
+type InterruptBehavior string
+
+const (
+	InterruptBehaviorBlock  InterruptBehavior = "block"
+	InterruptBehaviorCancel InterruptBehavior = "cancel"
+)
+
+// InterruptBehaviorer is an optional interface for tools that declare whether
+// they should be cancelled or allowed to finish when a steering message arrives.
+// Defaults to InterruptBehaviorBlock when not implemented.
+type InterruptBehaviorer interface {
+	InterruptBehavior(args json.RawMessage) InterruptBehavior
+}
+
 // ActivityDescriber is an optional interface for tools that provide
 // a human-readable activity description for UI display.
 type ActivityDescriber interface {
@@ -229,6 +245,18 @@ func isToolConcurrencySafe(tool Tool, args json.RawMessage) bool {
 		return ro.ReadOnly(args)
 	}
 	return false
+}
+
+func toolInterruptBehavior(tool Tool, args json.RawMessage) InterruptBehavior {
+	if ib, ok := tool.(InterruptBehaviorer); ok {
+		switch behavior := ib.InterruptBehavior(args); behavior {
+		case InterruptBehaviorCancel:
+			return InterruptBehaviorCancel
+		case InterruptBehaviorBlock:
+			return InterruptBehaviorBlock
+		}
+	}
+	return InterruptBehaviorBlock
 }
 
 // ToolExecuteFunc is the function signature for tool execution.

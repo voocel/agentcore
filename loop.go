@@ -13,11 +13,14 @@ import (
 )
 
 const (
-	defaultMaxTurns      = 100
-	defaultMaxRetries    = 3
-	defaultMaxToolErrors = 3
-	defaultMaxRetryDelay = 60 * time.Second
+	defaultMaxTurns            = 100
+	defaultMaxRetries          = 3
+	defaultMaxLengthRecoveries = 3
+	defaultMaxToolErrors       = 3
+	defaultMaxRetryDelay       = 60 * time.Second
 )
+
+const defaultLengthRecoveryPrompt = "Output token limit hit. Resume directly - no apology, no recap of what you were doing. Pick up mid-thought if that is where the cut happened. Break remaining work into smaller pieces."
 
 // AgentLoop starts an agent loop with new prompt messages.
 // Prompts are added to context and events are emitted for them.
@@ -109,6 +112,7 @@ func runLoop(ctx context.Context, currentCtx *AgentContext, newMessages *[]Agent
 
 	firstTurn := true
 	turnCount := 0
+	lengthRecoveryCount := 0
 	toolErrors := make(map[string]int) // consecutive failure count per tool
 
 	// Check for steering messages at start
@@ -210,6 +214,8 @@ func runLoop(ctx context.Context, currentCtx *AgentContext, newMessages *[]Agent
 				return
 			}
 
+			hadToolCallBlocks := hasToolCallBlocks(assistantMsg.Content)
+
 			// When output was truncated (max_tokens hit), tool calls are likely
 			// incomplete with malformed JSON args. Strip them to avoid validation
 			// errors and API rejections.
@@ -224,6 +230,10 @@ func runLoop(ctx context.Context, currentCtx *AgentContext, newMessages *[]Agent
 			toolCalls := assistantMsg.ToolCalls()
 			summaryState.toolCalls += len(toolCalls)
 			hasMoreToolCalls = len(toolCalls) > 0
+			shouldRecoverLength := assistantMsg.StopReason == StopReasonLength &&
+				len(toolCalls) == 0 &&
+				!hadToolCallBlocks &&
+				lengthRecoveryCount < defaultMaxLengthRecoveries
 
 			var turnToolResults []ToolResult
 			if hasMoreToolCalls {
@@ -253,6 +263,12 @@ func runLoop(ctx context.Context, currentCtx *AgentContext, newMessages *[]Agent
 
 			emit(ch, Event{Type: EventTurnEnd, Message: assistantMsg, ToolResults: turnToolResults})
 			turnCount++
+
+			if shouldRecoverLength {
+				lengthRecoveryCount++
+				pendingMessages = []AgentMessage{UserMsg(defaultLengthRecoveryPrompt)}
+				continue
+			}
 
 			// Get steering messages after turn completes
 			if len(steeringAfterTools) > 0 {
@@ -574,14 +590,30 @@ func executeToolCalls(ctx context.Context, tools []Tool, calls []ToolCall, confi
 // should update toolErrors; empty means skip (circuit-breaker hit, denial, or
 // context cancellation).
 func executeSingleToolCall(ctx context.Context, tools []Tool, call ToolCall, config LoopConfig, failCount int, ch chan<- Event) ToolResult {
+	tool := findTool(tools, call.Name)
+	label := toolLabel(tool)
+
 	// Fast exit: context already cancelled — don't start any tool work.
 	if ctx.Err() != nil {
 		content, _ := json.Marshal("Tool execution cancelled.")
-		return ToolResult{ToolCallID: call.ID, Content: content, IsError: true}
+		result := ToolResult{ToolCallID: call.ID, Content: content, IsError: true}
+		emit(ch, Event{
+			Type:      EventToolExecStart,
+			ToolID:    call.ID,
+			Tool:      call.Name,
+			ToolLabel: label,
+			Args:      call.Args,
+		})
+		emit(ch, Event{
+			Type:      EventToolExecEnd,
+			ToolID:    call.ID,
+			Tool:      call.Name,
+			ToolLabel: label,
+			Result:    result.Content,
+			IsError:   true,
+		})
+		return result
 	}
-
-	tool := findTool(tools, call.Name)
-	label := toolLabel(tool)
 
 	// Circuit breaker: skip if tool has exceeded consecutive failure threshold
 	if config.MaxToolErrors > 0 && failCount >= config.MaxToolErrors {
@@ -896,6 +928,15 @@ func stripToolCallBlocks(blocks []ContentBlock) []ContentBlock {
 		}
 	}
 	return filtered
+}
+
+func hasToolCallBlocks(blocks []ContentBlock) bool {
+	for _, b := range blocks {
+		if b.Type == ContentToolCall {
+			return true
+		}
+	}
+	return false
 }
 
 // toolLabel returns the human-readable label for a tool.

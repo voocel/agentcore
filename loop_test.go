@@ -234,6 +234,42 @@ func TestAgentLoop_SimpleTextResponse(t *testing.T) {
 	}
 }
 
+func TestExecuteSingleToolCall_CancelledContextStillEmitsLifecycle(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	call := ToolCall{
+		ID:   "tc-cancelled",
+		Name: "echo",
+		Args: json.RawMessage(`{"value":"x"}`),
+	}
+	eventsCh := make(chan Event, 4)
+	var calls []string
+
+	result := executeSingleToolCall(ctx, []Tool{echoTool(&calls)}, call, LoopConfig{}, 0, eventsCh)
+	close(eventsCh)
+	events := collectEvents(eventsCh)
+
+	if len(calls) != 0 {
+		t.Fatalf("expected tool body not to run, got %v", calls)
+	}
+	if !result.IsError || !strings.Contains(string(result.Content), "Tool execution cancelled.") {
+		t.Fatalf("expected cancelled result, got %+v", result)
+	}
+	if len(events) != 2 {
+		t.Fatalf("expected 2 lifecycle events, got %+v", events)
+	}
+	if events[0].Type != EventToolExecStart || events[0].ToolID != call.ID {
+		t.Fatalf("unexpected start event: %+v", events[0])
+	}
+	if events[1].Type != EventToolExecEnd || events[1].ToolID != call.ID {
+		t.Fatalf("unexpected end event: %+v", events[1])
+	}
+	if !events[1].IsError || !strings.Contains(string(events[1].Result), "Tool execution cancelled.") {
+		t.Fatalf("unexpected cancelled end event: %+v", events[1])
+	}
+}
+
 func TestAgentLoop_ToolCallAndResult(t *testing.T) {
 	var calls []string
 	tc := ToolCall{ID: "tc1", Name: "echo", Args: json.RawMessage(`{"value":"ping"}`)}
@@ -839,6 +875,87 @@ func TestAgentLoop_StreamingToolExecutionPreservesCompletedCallsOnLengthStop(t *
 	}
 	if !foundAssistantToolCall {
 		t.Fatal("expected completed tool call to remain in context after StopReasonLength")
+	}
+}
+
+func TestAgentLoop_LengthStopRecoversPureTextResponse(t *testing.T) {
+	model := &scriptedStreamModel{
+		streams: []func(chan<- StreamEvent){
+			func(ch chan<- StreamEvent) {
+				ch <- StreamEvent{
+					Type: StreamEventDone,
+					Message: Message{
+						Role:       RoleAssistant,
+						Content:    []ContentBlock{TextBlock("partial answer")},
+						StopReason: StopReasonLength,
+					},
+				}
+			},
+			func(ch chan<- StreamEvent) {
+				ch <- StreamEvent{
+					Type: StreamEventDone,
+					Message: Message{
+						Role:       RoleAssistant,
+						Content:    []ContentBlock{TextBlock("continued answer")},
+						StopReason: StopReasonStop,
+					},
+				}
+			},
+		},
+	}
+
+	events := runTestLoop(t,
+		[]AgentMessage{UserMsg("recover length")},
+		AgentContext{},
+		LoopConfig{Model: model},
+	)
+
+	if got := len(model.requests); got != 2 {
+		t.Fatalf("expected 2 LLM calls with one automatic recovery, got %d", got)
+	}
+
+	secondReq := model.Request(1)
+	if len(secondReq) < 3 {
+		t.Fatalf("expected recovery request to include prior assistant and recovery user message, got %d messages", len(secondReq))
+	}
+	last := secondReq[len(secondReq)-1]
+	if last.Role != RoleUser || last.TextContent() != defaultLengthRecoveryPrompt {
+		t.Fatalf("expected default recovery prompt as last message, got %#v", last)
+	}
+
+	ev, ok := findEvent(events, EventAgentEnd)
+	if !ok || ev.Summary == nil || ev.Summary.TurnCount != 2 {
+		t.Fatalf("expected 2 turns after recovery, got %#v", ev.Summary)
+	}
+}
+
+func TestAgentLoop_LengthStopDoesNotRecoverToolCallOutput(t *testing.T) {
+	callCount := 0
+	streamFn := sequentialStreamFn(func(i int, req *LLMRequest) (*LLMResponse, error) {
+		callCount++
+		if i > 0 {
+			t.Fatalf("unexpected recovery call for truncated tool-call output")
+		}
+		return &LLMResponse{
+			Message: Message{
+				Role: RoleAssistant,
+				Content: []ContentBlock{
+					TextBlock("partial"),
+					{Type: ContentToolCall},
+				},
+				StopReason: StopReasonLength,
+			},
+		}, nil
+	})
+
+	runTestLoop(t,
+		[]AgentMessage{UserMsg("do not recover tool call")},
+		AgentContext{},
+		LoopConfig{StreamFn: streamFn},
+	)
+
+	if callCount != 1 {
+		t.Fatalf("expected no automatic recovery when truncated output contains tool call blocks, got %d calls", callCount)
 	}
 }
 

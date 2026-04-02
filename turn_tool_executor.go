@@ -6,13 +6,15 @@ import (
 )
 
 type turnToolEntry struct {
-	call      ToolCall
-	safe      bool
-	failCount int
+	call              ToolCall
+	safe              bool
+	failCount         int
+	interruptBehavior InterruptBehavior
 
 	started bool
 	done    bool
 	result  ToolResult
+	cancel  context.CancelFunc
 }
 
 // turnToolExecutor is the single scheduling primitive for one assistant turn.
@@ -58,8 +60,9 @@ func newTurnToolExecutor(ctx context.Context, tools []Tool, config LoopConfig, t
 func (e *turnToolExecutor) Add(call ToolCall) {
 	tool := findTool(e.tools, call.Name)
 	entry := &turnToolEntry{
-		call: call,
-		safe: tool != nil && isToolConcurrencySafe(tool, call.Args),
+		call:              call,
+		safe:              tool != nil && isToolConcurrencySafe(tool, call.Args),
+		interruptBehavior: toolInterruptBehavior(tool, call.Args),
 	}
 
 	e.mu.Lock()
@@ -153,15 +156,20 @@ func (e *turnToolExecutor) startLocked(entry *turnToolEntry) {
 	if !entry.safe {
 		e.runningUnsafe = true
 	}
+	runCtx, cancel := context.WithCancel(e.ctx)
+	entry.cancel = cancel
 
 	go func(ent *turnToolEntry) {
-		result := executeSingleToolCall(e.ctx, e.tools, ent.call, e.config, ent.failCount, e.ch)
+		defer cancel()
+
+		result := executeSingleToolCall(runCtx, e.tools, ent.call, e.config, ent.failCount, e.ch)
 
 		e.mu.Lock()
 		defer e.mu.Unlock()
 
 		ent.done = true
 		ent.result = result
+		ent.cancel = nil
 		e.running--
 		if !ent.safe {
 			e.runningUnsafe = false
@@ -179,10 +187,22 @@ func (e *turnToolExecutor) startLocked(entry *turnToolEntry) {
 			if steering := e.config.GetSteeringMessages(); len(steering) > 0 {
 				e.stopStarting = true
 				e.steering = steering
+				e.cancelInterruptibleLocked()
 			}
 		}
 
 		e.processQueueLocked()
 		e.cond.Broadcast()
 	}(entry)
+}
+
+func (e *turnToolExecutor) cancelInterruptibleLocked() {
+	for _, entry := range e.entries {
+		if !entry.started || entry.done || entry.cancel == nil {
+			continue
+		}
+		if entry.interruptBehavior == InterruptBehaviorCancel {
+			entry.cancel()
+		}
+	}
 }

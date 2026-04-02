@@ -200,7 +200,7 @@ type Message struct {
 	Timestamp  time.Time      `json:"timestamp"`
 }
 
-func (m Message) GetRole() Role          { return m.Role }
+func (m Message) GetRole() Role           { return m.Role }
 func (m Message) GetTimestamp() time.Time { return m.Timestamp }
 
 // TextContent returns the concatenated text from all text blocks.
@@ -249,6 +249,88 @@ func (m Message) HasToolCalls() bool {
 // IsEmpty reports whether the message has no meaningful content.
 func (m Message) IsEmpty() bool {
 	return len(m.Content) == 0
+}
+
+// ---------------------------------------------------------------------------
+// Message Sequence Validation
+// ---------------------------------------------------------------------------
+
+type MessageSequenceIssueKind string
+
+const (
+	MessageSequenceIssueMissingToolResult MessageSequenceIssueKind = "missing_tool_result"
+	MessageSequenceIssueOrphanToolResult  MessageSequenceIssueKind = "orphan_tool_result"
+)
+
+// MessageSequenceIssue describes a structural problem in a tool call / tool
+// result transcript. The current validator intentionally stays narrow and
+// focuses on the two invariants the loop already repairs today:
+//   - every tool call should have a following tool result
+//   - every tool result should reference a known tool call
+type MessageSequenceIssue struct {
+	Kind           MessageSequenceIssueKind
+	MessageIndex   int
+	AssistantIndex int
+	ToolCallID     string
+	ToolName       string
+}
+
+// ValidateMessageSequence reports message-sequence issues that could cause
+// provider rejections or inconsistent replay.
+func ValidateMessageSequence(msgs []Message) []MessageSequenceIssue {
+	issues := make([]MessageSequenceIssue, 0)
+	callIDs := make(map[string]bool)
+
+	for i, msg := range msgs {
+		if msg.Role != RoleAssistant {
+			continue
+		}
+		calls := msg.ToolCalls()
+		if len(calls) == 0 {
+			continue
+		}
+
+		answered := make(map[string]bool, len(calls))
+		for j := i + 1; j < len(msgs); j++ {
+			next := msgs[j]
+			if next.Role != RoleTool {
+				break
+			}
+			if id, ok := next.Metadata["tool_call_id"].(string); ok {
+				answered[id] = true
+			}
+		}
+
+		for _, call := range calls {
+			callIDs[call.ID] = true
+			if !answered[call.ID] {
+				issues = append(issues, MessageSequenceIssue{
+					Kind:           MessageSequenceIssueMissingToolResult,
+					MessageIndex:   i,
+					AssistantIndex: i,
+					ToolCallID:     call.ID,
+					ToolName:       call.Name,
+				})
+			}
+		}
+	}
+
+	for i, msg := range msgs {
+		if msg.Role != RoleTool {
+			continue
+		}
+		id, _ := msg.Metadata["tool_call_id"].(string)
+		if id == "" || callIDs[id] {
+			continue
+		}
+		issues = append(issues, MessageSequenceIssue{
+			Kind:         MessageSequenceIssueOrphanToolResult,
+			MessageIndex: i,
+			ToolCallID:   id,
+		})
+	}
+
+	return issues
 }
 
 // ---------------------------------------------------------------------------
