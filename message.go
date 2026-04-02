@@ -2,6 +2,7 @@ package agentcore
 
 import (
 	"encoding/json"
+	"fmt"
 	"strings"
 	"time"
 )
@@ -331,6 +332,91 @@ func ValidateMessageSequence(msgs []Message) []MessageSequenceIssue {
 	}
 
 	return issues
+}
+
+// AssertMessageSequence returns an error when the transcript would require
+// synthetic repair before being sent to an LLM provider.
+func AssertMessageSequence(msgs []Message) error {
+	issues := ValidateMessageSequence(msgs)
+	if len(issues) == 0 {
+		return nil
+	}
+	return fmt.Errorf("invalid message sequence: %s", formatMessageSequenceIssues(issues))
+}
+
+func formatMessageSequenceIssues(issues []MessageSequenceIssue) string {
+	parts := make([]string, 0, len(issues))
+	for _, issue := range issues {
+		switch issue.Kind {
+		case MessageSequenceIssueMissingToolResult:
+			parts = append(parts, fmt.Sprintf("missing tool result for %q (%s) at message %d", issue.ToolCallID, issue.ToolName, issue.MessageIndex))
+		case MessageSequenceIssueOrphanToolResult:
+			parts = append(parts, fmt.Sprintf("orphan tool result for %q at message %d", issue.ToolCallID, issue.MessageIndex))
+		default:
+			parts = append(parts, fmt.Sprintf("%s at message %d", issue.Kind, issue.MessageIndex))
+		}
+	}
+	return strings.Join(parts, "; ")
+}
+
+// RepairMessageSequence ensures tool call / tool result pairs are complete.
+// Orphaned tool calls (no matching result) get a synthetic error result inserted.
+// Orphaned tool results (no matching call) are removed.
+// This prevents LLM providers from rejecting malformed message sequences.
+func RepairMessageSequence(msgs []Message) []Message {
+	out := make([]Message, 0, len(msgs))
+
+	for i, msg := range msgs {
+		out = append(out, msg)
+
+		if msg.Role != RoleAssistant {
+			continue
+		}
+		calls := msg.ToolCalls()
+		if len(calls) == 0 {
+			continue
+		}
+
+		// Collect tool result IDs that follow this assistant message.
+		answered := make(map[string]bool, len(calls))
+		for j := i + 1; j < len(msgs); j++ {
+			next := msgs[j]
+			if next.Role == RoleTool {
+				if id, ok := next.Metadata["tool_call_id"].(string); ok {
+					answered[id] = true
+				}
+				continue
+			}
+			break
+		}
+
+		// Insert synthetic results for unanswered tool calls.
+		for _, call := range calls {
+			if !answered[call.ID] {
+				out = append(out, ToolResultMsg(call.ID, []byte(`"Tool result missing (conversation was truncated or interrupted)."`), true))
+			}
+		}
+	}
+
+	// Remove orphaned tool results (no matching call).
+	callIDs := make(map[string]bool)
+	for _, msg := range out {
+		for _, call := range msg.ToolCalls() {
+			callIDs[call.ID] = true
+		}
+	}
+
+	cleaned := make([]Message, 0, len(out))
+	for _, msg := range out {
+		if msg.Role == RoleTool {
+			if id, ok := msg.Metadata["tool_call_id"].(string); ok && !callIDs[id] {
+				continue
+			}
+		}
+		cleaned = append(cleaned, msg)
+	}
+
+	return cleaned
 }
 
 // ---------------------------------------------------------------------------

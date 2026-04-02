@@ -53,12 +53,13 @@ type ToolSpec struct {
 
 // LoopConfig configures the agent loop.
 type LoopConfig struct {
-	Model         ChatModel
-	StreamFn      StreamFn      // nil = use Model directly
-	MaxTurns      int           // safety limit, default 10
-	MaxRetries    int           // LLM call retry limit for retryable errors, default 3
-	MaxToolErrors int           // consecutive tool failure threshold per tool, 0 = unlimited
-	ThinkingLevel ThinkingLevel // reasoning depth
+	Model                 ChatModel
+	StreamFn              StreamFn      // nil = use Model directly
+	MaxTurns              int           // safety limit, default 10
+	MaxRetries            int           // LLM call retry limit for retryable errors, default 3
+	MaxToolErrors         int           // consecutive tool failure threshold per tool, 0 = unlimited
+	StrictMessageSequence bool          // fail fast instead of repairing malformed tool call / result history
+	ThinkingLevel         ThinkingLevel // reasoning depth
 
 	// Two-stage pipeline: TransformContext -> ConvertToLLM
 	TransformContext func(ctx context.Context, msgs []AgentMessage) ([]AgentMessage, error)

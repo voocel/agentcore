@@ -270,6 +270,39 @@ func TestExecuteSingleToolCall_CancelledContextStillEmitsLifecycle(t *testing.T)
 	}
 }
 
+func TestAgentLoop_StrictMessageSequenceRejectsMalformedHistory(t *testing.T) {
+	tc := ToolCall{ID: "tc-strict", Name: "echo", Args: json.RawMessage(`{"value":"x"}`)}
+	var modelCalled atomic.Bool
+
+	events := runTestLoop(t,
+		[]AgentMessage{UserMsg("strict mode")},
+		AgentContext{
+			Messages: []AgentMessage{
+				toolCallMsg(tc),
+			},
+		},
+		LoopConfig{
+			StreamFn: func(ctx context.Context, req *LLMRequest) (*LLMResponse, error) {
+				modelCalled.Store(true)
+				return nil, fmt.Errorf("model should not be called in strict mode")
+			},
+			StrictMessageSequence: true,
+		},
+	)
+
+	if modelCalled.Load() {
+		t.Fatal("expected strict message validation to fail before model invocation")
+	}
+
+	errEvent, ok := findEvent(events, EventError)
+	if !ok || errEvent.Err == nil {
+		t.Fatalf("expected strict message sequence error, got %+v", events)
+	}
+	if !strings.Contains(errEvent.Err.Error(), `missing tool result for "tc-strict"`) {
+		t.Fatalf("unexpected strict mode error: %v", errEvent.Err)
+	}
+}
+
 func TestAgentLoop_ToolCallAndResult(t *testing.T) {
 	var calls []string
 	tc := ToolCall{ID: "tc1", Name: "echo", Args: json.RawMessage(`{"value":"ping"}`)}

@@ -125,66 +125,6 @@ func DefaultConvertToLLM(msgs []AgentMessage) []Message {
 	return out
 }
 
-// RepairMessageSequence ensures tool call / tool result pairs are complete.
-// Orphaned tool calls (no matching result) get a synthetic error result inserted.
-// Orphaned tool results (no matching call) are removed.
-// This prevents LLM providers from rejecting malformed message sequences.
-func RepairMessageSequence(msgs []Message) []Message {
-	out := make([]Message, 0, len(msgs))
-
-	for i, msg := range msgs {
-		out = append(out, msg)
-
-		if msg.Role != RoleAssistant {
-			continue
-		}
-		calls := msg.ToolCalls()
-		if len(calls) == 0 {
-			continue
-		}
-
-		// Collect tool result IDs that follow this assistant message
-		answered := make(map[string]bool, len(calls))
-		for j := i + 1; j < len(msgs); j++ {
-			next := msgs[j]
-			if next.Role == RoleTool {
-				if id, ok := next.Metadata["tool_call_id"].(string); ok {
-					answered[id] = true
-				}
-				continue
-			}
-			break // stop at first non-tool message
-		}
-
-		// Insert synthetic results for unanswered tool calls
-		for _, call := range calls {
-			if !answered[call.ID] {
-				out = append(out, ToolResultMsg(call.ID, []byte(`"Tool result missing (conversation was truncated or interrupted)."`), true))
-			}
-		}
-	}
-
-	// Remove orphaned tool results (no matching call)
-	callIDs := make(map[string]bool)
-	for _, msg := range out {
-		for _, call := range msg.ToolCalls() {
-			callIDs[call.ID] = true
-		}
-	}
-
-	cleaned := make([]Message, 0, len(out))
-	for _, msg := range out {
-		if msg.Role == RoleTool {
-			if id, ok := msg.Metadata["tool_call_id"].(string); ok && !callIDs[id] {
-				continue
-			}
-		}
-		cleaned = append(cleaned, msg)
-	}
-
-	return cleaned
-}
-
 // dequeue removes messages from a queue according to the given mode.
 // QueueModeAll drains everything; QueueModeOneAtATime takes only the first message.
 func dequeue(queue *[]AgentMessage, mode QueueMode) []AgentMessage {

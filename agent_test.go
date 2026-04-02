@@ -2,6 +2,8 @@ package agentcore
 
 import (
 	"context"
+	"encoding/json"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -205,5 +207,27 @@ func TestAgentInject_IsAtomicUnderConcurrentCalls(t *testing.T) {
 		if !found {
 			t.Fatalf("expected injected message %q in history, got %v", want, texts)
 		}
+	}
+}
+
+func TestAgentBuildLLMMessages_StrictMessageSequenceRejectsMalformedHistory(t *testing.T) {
+	agent := NewAgent(WithStrictMessageSequence(true))
+	if err := agent.SetMessages([]AgentMessage{
+		Message{
+			Role: RoleAssistant,
+			Content: []ContentBlock{
+				ToolCallBlock(ToolCall{ID: "tc-build", Name: "echo", Args: json.RawMessage(`{"value":"x"}`)}),
+			},
+		},
+	}); err != nil {
+		t.Fatalf("set messages failed: %v", err)
+	}
+
+	msgs, err := agent.BuildLLMMessages()
+	if err == nil {
+		t.Fatalf("expected strict BuildLLMMessages to fail, got msgs=%+v", msgs)
+	}
+	if !strings.Contains(err.Error(), `missing tool result for "tc-build"`) {
+		t.Fatalf("unexpected error: %v", err)
 	}
 }

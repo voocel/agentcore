@@ -75,6 +75,12 @@ func WithMaxRetries(n int) AgentOption {
 	return func(a *Agent) { a.maxRetries = n }
 }
 
+// WithStrictMessageSequence makes malformed tool call / result transcripts fail
+// fast instead of being repaired before the next LLM call.
+func WithStrictMessageSequence(enabled bool) AgentOption {
+	return func(a *Agent) { a.strictMessageSequence = enabled }
+}
+
 // WithMaxToolErrors sets the consecutive failure threshold per tool.
 // After reaching this limit, the tool is disabled for the rest of the loop.
 // 0 means unlimited (no circuit breaker).

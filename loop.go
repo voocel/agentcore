@@ -90,6 +90,16 @@ func AgentLoopContinue(ctx context.Context, agentCtx AgentContext, config LoopCo
 }
 
 // runLoop is the main double-loop logic shared by AgentLoop and AgentLoopContinue.
+//
+// Core loop contracts:
+//   - Streamed tool-call lifecycle signals are authoritative; stop reasons are
+//     only hints and must not be used as the sole source of tool state.
+//   - Tool results are appended to context only after the assistant message
+//     that requested them, even when execution started during streaming.
+//   - Once a streamed tool call has completed, the turn is no longer retried
+//     automatically; replay could duplicate side effects.
+//   - Steering stops not-yet-started tools. Started tools follow their
+//     InterruptBehavior and may continue or be cancelled.
 func runLoop(ctx context.Context, currentCtx *AgentContext, newMessages *[]AgentMessage, config LoopConfig, ch chan<- Event) {
 	type runSummaryState struct {
 		toolCalls  int
@@ -433,8 +443,16 @@ func callLLM(ctx context.Context, agentCtx *AgentContext, config LoopConfig, ch 
 	}
 	llmMessages := convertFn(messages)
 
-	// Repair orphaned tool call / result pairs
-	llmMessages = RepairMessageSequence(llmMessages)
+	// Provider-facing transcripts must satisfy tool-call / tool-result pairing
+	// invariants. Strict mode fails fast for debugging and high-fidelity runs;
+	// default mode repairs conservatively to preserve compatibility.
+	if config.StrictMessageSequence {
+		if err := AssertMessageSequence(llmMessages); err != nil {
+			return Message{}, llmCallInfo{}, err
+		}
+	} else {
+		llmMessages = RepairMessageSequence(llmMessages)
+	}
 
 	// Build tool specs
 	toolSpecs := buildToolSpecs(agentCtx.Tools)

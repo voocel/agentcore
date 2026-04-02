@@ -28,29 +28,30 @@ type AgentState struct {
 // It consumes loop events to update internal state, just like any external listener.
 type Agent struct {
 	// Configuration (set via options)
-	model              ChatModel
-	systemPrompt       string
-	systemBlocks       []SystemBlock
-	tools              []Tool
-	maxTurns           int
-	maxRetries         int
-	maxToolErrors      int
-	thinkingLevel      ThinkingLevel
-	streamFn           StreamFn
-	transformContext   func(ctx context.Context, msgs []AgentMessage) ([]AgentMessage, error)
-	convertToLLM       func([]AgentMessage) []Message
-	steeringMode       QueueMode
-	followUpMode       QueueMode
-	contextWindow      int
-	contextEstimateFn  ContextEstimateFn
-	permissionEngine   permission.DecisionEngine
-	getApiKey          func(provider string) (string, error)
-	thinkingBudgets    map[ThinkingLevel]int
-	sessionID          string
-	middlewares        []ToolMiddleware
-	maxRetryDelay      time.Duration
-	maxToolConcurrency int
-	taskRuntime        *TaskRuntime
+	model                 ChatModel
+	systemPrompt          string
+	systemBlocks          []SystemBlock
+	tools                 []Tool
+	maxTurns              int
+	maxRetries            int
+	maxToolErrors         int
+	strictMessageSequence bool
+	thinkingLevel         ThinkingLevel
+	streamFn              StreamFn
+	transformContext      func(ctx context.Context, msgs []AgentMessage) ([]AgentMessage, error)
+	convertToLLM          func([]AgentMessage) []Message
+	steeringMode          QueueMode
+	followUpMode          QueueMode
+	contextWindow         int
+	contextEstimateFn     ContextEstimateFn
+	permissionEngine      permission.DecisionEngine
+	getApiKey             func(provider string) (string, error)
+	thinkingBudgets       map[ThinkingLevel]int
+	sessionID             string
+	middlewares           []ToolMiddleware
+	maxRetryDelay         time.Duration
+	maxToolConcurrency    int
+	taskRuntime           *TaskRuntime
 
 	// State
 	messages         []AgentMessage
@@ -406,19 +407,27 @@ func (a *Agent) SetSystemBlocks(blocks []SystemBlock) {
 // for an LLM call: system blocks/prompt → converted conversation messages.
 // This enables external callers (e.g., prompt suggestion) to make background
 // LLM calls that share the same message prefix for prompt cache hits.
-func (a *Agent) BuildLLMMessages() []Message {
+// Strict message-sequence mode is honored here just like in the main loop.
+func (a *Agent) BuildLLMMessages() ([]Message, error) {
 	a.mu.Lock()
 	msgs := copyMessages(a.messages)
 	blocks := a.systemBlocks
 	sp := a.systemPrompt
 	convertFn := a.convertToLLM
+	strict := a.strictMessageSequence
 	a.mu.Unlock()
 
 	if convertFn == nil {
 		convertFn = DefaultConvertToLLM
 	}
 	llmMessages := convertFn(msgs)
-	llmMessages = RepairMessageSequence(llmMessages)
+	if strict {
+		if err := AssertMessageSequence(llmMessages); err != nil {
+			return nil, err
+		}
+	} else {
+		llmMessages = RepairMessageSequence(llmMessages)
+	}
 
 	if len(blocks) > 0 {
 		sysMsgs := make([]Message, len(blocks))
@@ -432,7 +441,7 @@ func (a *Agent) BuildLLMMessages() []Message {
 	} else if sp != "" {
 		llmMessages = append([]Message{SystemMsg(sp)}, llmMessages...)
 	}
-	return llmMessages
+	return llmMessages, nil
 }
 
 // SetTools replaces the tool set. Takes effect on the next turn.
@@ -512,18 +521,19 @@ func (a *Agent) buildConfig() LoopConfig {
 	a.skipNextInitialSteeringPoll = false
 
 	return LoopConfig{
-		Model:            a.model,
-		StreamFn:         a.streamFn,
-		MaxTurns:         a.maxTurns,
-		MaxRetries:       a.maxRetries,
-		MaxToolErrors:    a.maxToolErrors,
-		ThinkingLevel:    a.thinkingLevel,
-		TransformContext: a.transformContext,
-		ConvertToLLM:     a.convertToLLM,
-		PermissionEngine: a.permissionEngine,
-		GetApiKey:        a.getApiKey,
-		ThinkingBudgets:  a.thinkingBudgets,
-		SessionID:        a.sessionID,
+		Model:                 a.model,
+		StreamFn:              a.streamFn,
+		MaxTurns:              a.maxTurns,
+		MaxRetries:            a.maxRetries,
+		MaxToolErrors:         a.maxToolErrors,
+		StrictMessageSequence: a.strictMessageSequence,
+		ThinkingLevel:         a.thinkingLevel,
+		TransformContext:      a.transformContext,
+		ConvertToLLM:          a.convertToLLM,
+		PermissionEngine:      a.permissionEngine,
+		GetApiKey:             a.getApiKey,
+		ThinkingBudgets:       a.thinkingBudgets,
+		SessionID:             a.sessionID,
 		GetSteeringMessages: func() []AgentMessage {
 			a.mu.Lock()
 			defer a.mu.Unlock()
