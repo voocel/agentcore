@@ -7,11 +7,19 @@ import (
 	"strings"
 	"sync/atomic"
 	"testing"
+
+	"github.com/voocel/agentcore/permission"
 )
 
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
+
+type permissionEngineFunc func(ctx context.Context, req permission.Request) (*permission.Decision, error)
+
+func (fn permissionEngineFunc) Decide(ctx context.Context, req permission.Request) (*permission.Decision, error) {
+	return fn(ctx, req)
+}
 
 // mockStreamFn creates a StreamFn that returns responses in order.
 func mockStreamFn(responses ...Message) StreamFn {
@@ -405,14 +413,14 @@ func TestAgentLoop_ApprovalDenied(t *testing.T) {
 				}
 				return &LLMResponse{Message: assistantMsg("done", StopReasonStop)}, nil
 			}),
-			CheckToolApproval: func(ctx context.Context, req ToolApprovalRequest) (*ToolApprovalResult, error) {
+			PermissionEngine: permissionEngineFunc(func(ctx context.Context, req permission.Request) (*permission.Decision, error) {
 				approvalChecks++
-				return &ToolApprovalResult{
-					Approved: false,
-					Decision: ToolApprovalDeny,
-					Reason:   "denied",
+				return &permission.Decision{
+					Kind:   permission.DecisionDeny,
+					Source: permission.DecisionSourcePrompt,
+					Reason: "denied",
 				}, nil
-			},
+			}),
 			MaxToolErrors: 1,
 		},
 	)
@@ -431,6 +439,36 @@ func TestAgentLoop_ApprovalDenied(t *testing.T) {
 		if ev.Type == EventToolExecEnd && strings.Contains(string(ev.Result), "disabled after") {
 			t.Fatalf("approval denial should not disable the tool, got result %s", string(ev.Result))
 		}
+	}
+}
+
+func TestAgentLoop_PermissionUpdatedArgsAreExecuted(t *testing.T) {
+	var calls []string
+
+	runTestLoop(t,
+		[]AgentMessage{UserMsg("test")},
+		AgentContext{Tools: []Tool{echoTool(&calls)}},
+		LoopConfig{
+			StreamFn: mockStreamFn(
+				toolCallMsg(ToolCall{
+					ID:   "tc1",
+					Name: "echo",
+					Args: json.RawMessage(`{"value":"original"}`),
+				}),
+				assistantMsg("done", StopReasonStop),
+			),
+			PermissionEngine: permissionEngineFunc(func(ctx context.Context, req permission.Request) (*permission.Decision, error) {
+				return &permission.Decision{
+					Kind:        permission.DecisionAllow,
+					Source:      permission.DecisionSourceMode,
+					UpdatedArgs: json.RawMessage(`{"value":"rewritten"}`),
+				}, nil
+			}),
+		},
+	)
+
+	if len(calls) != 1 || calls[0] != "rewritten" {
+		t.Fatalf("expected rewritten args to execute, got %v", calls)
 	}
 }
 

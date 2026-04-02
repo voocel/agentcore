@@ -3,6 +3,8 @@ package agentcore
 import (
 	"context"
 	"encoding/json"
+
+	"github.com/voocel/agentcore/permission"
 )
 
 // ---------------------------------------------------------------------------
@@ -115,6 +117,18 @@ type ContentTool interface {
 // result as EventToolExecUpdate so the UI can display it before the tool runs.
 type Previewer interface {
 	Preview(ctx context.Context, args json.RawMessage) (json.RawMessage, error)
+}
+
+// PermissionMetadataProvider lets a tool override the default permission
+// classification used by the decision engine.
+type PermissionMetadataProvider interface {
+	PermissionMetadata() permission.Metadata
+}
+
+// PermissionChecker lets a tool perform tool-specific permission checks before
+// the shared decision engine runs. Returning nil means "fall through".
+type PermissionChecker interface {
+	CheckPermission(ctx context.Context, req permission.Request) (*permission.Decision, error)
 }
 
 // DeferFilter controls deferred tool loading for the LLM.

@@ -5,6 +5,8 @@ import (
 	"fmt"
 	"sync"
 	"time"
+
+	"github.com/voocel/agentcore/permission"
 )
 
 // ---------------------------------------------------------------------------
@@ -62,10 +64,9 @@ type LoopConfig struct {
 	TransformContext func(ctx context.Context, msgs []AgentMessage) ([]AgentMessage, error)
 	ConvertToLLM     func(msgs []AgentMessage) []Message
 
-	// CheckToolApproval is called after validation/preview and before execution.
-	// Returning nil means no approval was required.
-	// Returning a non-nil result applies the approval decision immediately.
-	CheckToolApproval ToolApprovalFunc
+	// PermissionEngine is called after validation/preview and before execution.
+	// Returning nil means no extra approval step was required.
+	PermissionEngine permission.DecisionEngine
 
 	// GetApiKey resolves the API key before each LLM call.
 	// The provider parameter identifies which provider is being called (e.g. "openai", "anthropic").

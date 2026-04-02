@@ -9,6 +9,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/voocel/agentcore/permission"
 	"github.com/voocel/litellm"
 )
 
@@ -729,32 +730,83 @@ func executeSingleToolCall(ctx context.Context, tools []Tool, call ToolCall, con
 			}
 		}
 
-		if config.CheckToolApproval != nil {
-			req := ToolApprovalRequest{
-				Call:      call,
-				ToolLabel: label,
-				Summary:   approvalSummary(call),
-				Preview:   preview,
+		permReq := permission.Request{
+			ToolID:    call.ID,
+			ToolName:  call.Name,
+			ToolLabel: label,
+			Summary:   approvalSummary(call),
+			Args:      call.Args,
+			Preview:   preview,
+		}
+		if tool != nil {
+			if provider, ok := tool.(PermissionMetadataProvider); ok {
+				permReq.Metadata = provider.PermissionMetadata()
 			}
-			approval, err := config.CheckToolApproval(ctx, req)
+		}
+
+		var decision *permission.Decision
+		if checker, ok := tool.(PermissionChecker); ok {
+			toolDecision, err := checker.CheckPermission(ctx, permReq)
 			if err != nil {
+				decision = &permission.Decision{
+					Kind:       permission.DecisionDeny,
+					Source:     permission.DecisionSourceTool,
+					Reason:     err.Error(),
+					Summary:    permReq.Summary,
+					Capability: permReq.Metadata.Capability,
+				}
+			} else {
+				decision = toolDecision
+			}
+		}
+		if decision == nil && config.PermissionEngine != nil {
+			engineDecision, err := config.PermissionEngine.Decide(ctx, permReq)
+			if err != nil {
+				decision = &permission.Decision{
+					Kind:       permission.DecisionDeny,
+					Source:     permission.DecisionSourcePrompt,
+					Reason:     err.Error(),
+					Summary:    permReq.Summary,
+					Capability: permReq.Metadata.Capability,
+				}
+			} else {
+				decision = engineDecision
+			}
+		}
+		execArgs := call.Args
+		if decision != nil {
+			if len(decision.UpdatedArgs) > 0 {
+				execArgs = decision.UpdatedArgs
+			}
+			call.Args = execArgs
+			reqCopy := permReq
+			reqCopy.Args = execArgs
+			decisionCopy := *decision
+			if decision.Prompted {
 				emit(ch, Event{
-					Type:      EventToolApprovalRequest,
-					ToolID:    call.ID,
-					Tool:      call.Name,
-					ToolLabel: label,
-					Args:      call.Args,
-					Preview:   preview,
+					Type:              EventToolApprovalRequest,
+					ToolID:            call.ID,
+					Tool:              call.Name,
+					ToolLabel:         label,
+					Args:              execArgs,
+					Preview:           preview,
+					PermissionRequest: &reqCopy,
 				})
-				emit(ch, Event{
-					Type:             EventToolApprovalResolved,
-					ToolID:           call.ID,
-					Tool:             call.Name,
-					ToolLabel:        label,
-					ApprovalDecision: ToolApprovalDeny,
-					ApprovalReason:   err.Error(),
-				})
-				errContent, _ := json.Marshal(err.Error())
+			}
+			emit(ch, Event{
+				Type:               EventToolApprovalResolved,
+				ToolID:             call.ID,
+				Tool:               call.Name,
+				ToolLabel:          label,
+				PermissionRequest:  &reqCopy,
+				PermissionDecision: &decisionCopy,
+			})
+			if !decision.Allowed() {
+				reason := decision.Reason
+				if reason == "" {
+					reason = "tool execution denied"
+				}
+				errContent, _ := json.Marshal(reason)
 				result = ToolResult{
 					ToolCallID: call.ID,
 					Content:    errContent,
@@ -769,45 +821,6 @@ func executeSingleToolCall(ctx context.Context, tools []Tool, call ToolCall, con
 					IsError:   true,
 				})
 				return result
-			}
-			if approval != nil {
-				emit(ch, Event{
-					Type:      EventToolApprovalRequest,
-					ToolID:    call.ID,
-					Tool:      call.Name,
-					ToolLabel: label,
-					Args:      call.Args,
-					Preview:   preview,
-				})
-				emit(ch, Event{
-					Type:             EventToolApprovalResolved,
-					ToolID:           call.ID,
-					Tool:             call.Name,
-					ToolLabel:        label,
-					ApprovalDecision: approval.Decision,
-					ApprovalReason:   approval.Reason,
-				})
-				if !approval.Approved {
-					reason := approval.Reason
-					if reason == "" {
-						reason = "tool execution denied"
-					}
-					errContent, _ := json.Marshal(reason)
-					result = ToolResult{
-						ToolCallID: call.ID,
-						Content:    errContent,
-						IsError:    true,
-					}
-					emit(ch, Event{
-						Type:      EventToolExecEnd,
-						ToolID:    call.ID,
-						Tool:      call.Name,
-						ToolLabel: label,
-						Result:    result.Content,
-						IsError:   true,
-					})
-					return result
-				}
 			}
 		}
 
@@ -868,9 +881,9 @@ func executeSingleToolCall(ctx context.Context, tools []Tool, call ToolCall, con
 			var execErr error
 			if len(config.Middlewares) > 0 {
 				exec := buildMiddlewareChain(call, tool.Execute, config.Middlewares)
-				output, execErr = exec(progressCtx, call.Args)
+				output, execErr = exec(progressCtx, execArgs)
 			} else {
-				output, execErr = tool.Execute(progressCtx, call.Args)
+				output, execErr = tool.Execute(progressCtx, execArgs)
 			}
 			if execErr != nil {
 				errContent, _ := json.Marshal(execErr.Error())

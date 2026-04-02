@@ -50,7 +50,7 @@ import (
 
     "github.com/voocel/agentcore"
     "github.com/voocel/agentcore/llm"
-    "github.com/voocel/agentcore/policy"
+    "github.com/voocel/agentcore/permission"
     "github.com/voocel/agentcore/tools"
 )
 
@@ -69,7 +69,10 @@ func main() {
             tools.NewEdit("."),
             tools.NewBash("."),
         ),
-        agentcore.WithPermission(policy.WorkspaceProfile(".")),
+        agentcore.WithPermissionEngine(permission.NewEngine(permission.EngineConfig{
+            Workspace: ".",
+            Mode:      permission.ModeBalanced,
+        })),
     )
 
     agent.Subscribe(func(ev agentcore.Event) {
@@ -85,7 +88,18 @@ func main() {
 }
 ```
 
-更安全的默认配置可使用 `policy.ReadOnlyProfile(root)` 或 `policy.WorkspaceProfile(root)`。
+如果需要更严格的控制，使用 `agentcore.WithPermissionEngine(...)` 注入自定义决策引擎。
+
+```go
+engine := permission.NewEngine(permission.EngineConfig{
+    Workspace: ".",
+    Mode:      permission.ModeStrict,
+    Roots: permission.FilesystemRoots{
+        ReadRoots:  []string{"."},
+        WriteRoots: []string{"."},
+    },
+})
+```
 
 ### 多 Agent（SubAgent 工具）
 

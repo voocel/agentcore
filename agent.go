@@ -8,6 +8,8 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
+
+	"github.com/voocel/agentcore/permission"
 )
 
 // AgentState is a snapshot of the agent's current state.
@@ -41,7 +43,7 @@ type Agent struct {
 	followUpMode       QueueMode
 	contextWindow      int
 	contextEstimateFn  ContextEstimateFn
-	toolApprovalFn     ToolApprovalFunc
+	permissionEngine   permission.DecisionEngine
 	getApiKey          func(provider string) (string, error)
 	thinkingBudgets    map[ThinkingLevel]int
 	sessionID          string
@@ -510,18 +512,18 @@ func (a *Agent) buildConfig() LoopConfig {
 	a.skipNextInitialSteeringPoll = false
 
 	return LoopConfig{
-		Model:             a.model,
-		StreamFn:          a.streamFn,
-		MaxTurns:          a.maxTurns,
-		MaxRetries:        a.maxRetries,
-		MaxToolErrors:     a.maxToolErrors,
-		ThinkingLevel:     a.thinkingLevel,
-		TransformContext:  a.transformContext,
-		ConvertToLLM:      a.convertToLLM,
-		CheckToolApproval: a.toolApprovalFn,
-		GetApiKey:         a.getApiKey,
-		ThinkingBudgets:   a.thinkingBudgets,
-		SessionID:         a.sessionID,
+		Model:            a.model,
+		StreamFn:         a.streamFn,
+		MaxTurns:         a.maxTurns,
+		MaxRetries:       a.maxRetries,
+		MaxToolErrors:    a.maxToolErrors,
+		ThinkingLevel:    a.thinkingLevel,
+		TransformContext: a.transformContext,
+		ConvertToLLM:     a.convertToLLM,
+		PermissionEngine: a.permissionEngine,
+		GetApiKey:        a.getApiKey,
+		ThinkingBudgets:  a.thinkingBudgets,
+		SessionID:        a.sessionID,
 		GetSteeringMessages: func() []AgentMessage {
 			a.mu.Lock()
 			defer a.mu.Unlock()

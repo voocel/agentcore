@@ -3,6 +3,8 @@ package agentcore
 import (
 	"context"
 	"time"
+
+	"github.com/voocel/agentcore/permission"
 )
 
 // AgentOption configures an Agent.
@@ -92,9 +94,9 @@ func WithContextEstimate(fn ContextEstimateFn) AgentOption {
 	return func(a *Agent) { a.contextEstimateFn = fn }
 }
 
-// WithToolApproval sets a runtime approval callback called before tool execution.
-func WithToolApproval(fn ToolApprovalFunc) AgentOption {
-	return func(a *Agent) { a.toolApprovalFn = fn }
+// WithPermissionEngine sets the runtime permission engine called before tool execution.
+func WithPermissionEngine(engine permission.DecisionEngine) AgentOption {
+	return func(a *Agent) { a.permissionEngine = engine }
 }
 
 // WithGetApiKey sets a dynamic API key resolver called before each LLM call.

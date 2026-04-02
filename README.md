@@ -50,7 +50,7 @@ import (
 
     "github.com/voocel/agentcore"
     "github.com/voocel/agentcore/llm"
-    "github.com/voocel/agentcore/policy"
+    "github.com/voocel/agentcore/permission"
     "github.com/voocel/agentcore/tools"
 )
 
@@ -69,7 +69,10 @@ func main() {
             tools.NewEdit("."),
             tools.NewBash("."),
         ),
-        agentcore.WithPermission(policy.WorkspaceProfile(".")),
+        agentcore.WithPermissionEngine(permission.NewEngine(permission.EngineConfig{
+            Workspace: ".",
+            Mode:      permission.ModeBalanced,
+        })),
     )
 
     agent.Subscribe(func(ev agentcore.Event) {
@@ -85,7 +88,18 @@ func main() {
 }
 ```
 
-For a safer default, use `policy.ReadOnlyProfile(root)` or `policy.WorkspaceProfile(root)`.
+For stricter control, pass a custom decision engine with `agentcore.WithPermissionEngine(...)`.
+
+```go
+engine := permission.NewEngine(permission.EngineConfig{
+    Workspace: ".",
+    Mode:      permission.ModeStrict,
+    Roots: permission.FilesystemRoots{
+        ReadRoots:  []string{"."},
+        WriteRoots: []string{"."},
+    },
+})
+```
 
 ### Multi-Agent (SubAgent Tool)
 
