@@ -29,6 +29,8 @@ type CompactionInfo struct {
 	IsIncremental  bool          // updated an existing summary
 	SummaryLen     int           // summary length in runes
 	Duration       time.Duration // wall time including LLM calls
+	ReadFiles      []string      // files read during compacted conversation
+	ModifiedFiles  []string      // files modified during compacted conversation
 }
 
 // CompactionConfig configures automatic context compaction.
@@ -250,6 +252,8 @@ func runSummaryCompaction(ctx context.Context, cfg CompactionConfig, msgs []agen
 		IsIncremental:  previousSummary != "",
 		SummaryLen:     len([]rune(summary)),
 		Duration:       time.Since(start),
+		ReadFiles:      readFiles,
+		ModifiedFiles:  modifiedFiles,
 	}
 	return result, info, nil
 }

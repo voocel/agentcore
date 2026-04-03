@@ -43,6 +43,23 @@ func NewEngine(cfg EngineConfig) *ContextEngine {
 	return &ContextEngine{cfg: cfg}
 }
 
+// NewDefaultEngine creates an engine with sensible defaults: tool result
+// microcompact → light trim → full summary. This is the simplest way to
+// enable context compression — no configuration needed beyond model and window.
+//
+//	engine := memory.NewDefaultEngine(model, 128000)
+//	agentcore.WithContextManager(engine)
+func NewDefaultEngine(model agentcore.ChatModel, contextWindow int) *ContextEngine {
+	return NewEngine(EngineConfig{
+		ContextWindow: contextWindow,
+		Strategies: []Strategy{
+			NewToolResultMicrocompact(ToolResultMicrocompactConfig{}),
+			NewLightTrim(LightTrimConfig{}),
+			NewFullSummary(FullSummaryConfig{Model: model}),
+		},
+	})
+}
+
 func (e *ContextEngine) SetProjectHook(fn func(ChangeInfo)) {
 	e.mu.Lock()
 	defer e.mu.Unlock()

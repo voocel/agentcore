@@ -218,22 +218,35 @@ func truncateOldestUserGroups(msgs []agentcore.AgentMessage, fraction float64) [
 			starts = append(starts, i)
 		}
 	}
+	var result []agentcore.AgentMessage
 	if len(starts) <= 1 {
 		drop := int(math.Ceil(float64(len(msgs)) * fraction))
 		if drop <= 0 || drop >= len(msgs) {
 			return msgs
 		}
-		return append([]agentcore.AgentMessage(nil), msgs[drop:]...)
+		result = append([]agentcore.AgentMessage(nil), msgs[drop:]...)
+	} else {
+		dropGroups := int(math.Ceil(float64(len(starts)) * fraction))
+		if dropGroups <= 0 {
+			dropGroups = 1
+		}
+		if dropGroups >= len(starts) {
+			dropGroups = len(starts) - 1
+		}
+		cut := starts[dropGroups]
+		result = append([]agentcore.AgentMessage(nil), msgs[cut:]...)
 	}
-	dropGroups := int(math.Ceil(float64(len(starts)) * fraction))
-	if dropGroups <= 0 {
-		dropGroups = 1
+
+	// Ensure the truncated result starts with a user message.
+	// LLM APIs reject conversations that start with an assistant message.
+	if len(result) > 0 {
+		if m, ok := result[0].(agentcore.Message); ok && m.Role != agentcore.RoleUser {
+			result = append([]agentcore.AgentMessage{
+				agentcore.UserMsg("[Earlier context truncated for summarization]"),
+			}, result...)
+		}
 	}
-	if dropGroups >= len(starts) {
-		dropGroups = len(starts) - 1
-	}
-	cut := starts[dropGroups]
-	return append([]agentcore.AgentMessage(nil), msgs[cut:]...)
+	return result
 }
 
 // formatArgsKeyValue formats JSON tool args as key=value pairs.
