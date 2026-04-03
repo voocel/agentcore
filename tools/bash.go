@@ -63,7 +63,9 @@ func (t *BashTool) ConcurrencySafe(_ json.RawMessage) bool { return false }
 
 // ActivityDescription returns a short description including the command.
 func (t *BashTool) ActivityDescription(args json.RawMessage) string {
-	var a struct{ Command string `json:"command"` }
+	var a struct {
+		Command string `json:"command"`
+	}
 	if json.Unmarshal(args, &a) == nil && a.Command != "" {
 		return "Running: " + bashTruncate(a.Command, 40)
 	}
@@ -278,21 +280,7 @@ func (t *BashTool) notifyCompletion(rt *agentcore.TaskRuntime, shellID string) {
 	if e == nil {
 		return
 	}
-	result := map[string]any{
-		"shell_id":    e.ID,
-		"command":     e.Command,
-		"description": e.Description,
-		"status":      string(e.Status),
-		"exit_code":   e.ExitCode,
-		"output_file": e.OutputFile,
-	}
-
-	data, err := json.Marshal(result)
-	if err != nil {
-		return
-	}
-	msg := agentcore.UserMsg(fmt.Sprintf("<background-shell-completed>\n%s\n</background-shell-completed>", string(data)))
-	t.notifyFn(msg)
+	t.notifyFn(agentcore.NotificationFromEntry(e).ToAgentMessage())
 }
 
 // executeForeground runs the command synchronously (original behavior).

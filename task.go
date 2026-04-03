@@ -1,6 +1,8 @@
 package agentcore
 
 import (
+	"encoding/json"
+	"fmt"
 	"slices"
 	"strconv"
 	"sync"
@@ -34,11 +36,11 @@ type BackgroundTaskEntry struct {
 	Status      TaskStatus
 	StartedAt   time.Time
 	EndedAt     time.Time
-	OutputFile  string     // path to output file on disk
+	OutputFile  string // path to output file on disk
 	Error       string
-	ExitCode    int        // shell: process exit code
-	ToolCount   int        // number of tool calls executed
-	cancel      func()     // unexported: only Stop()/StopAll() should use this
+	ExitCode    int    // shell: process exit code
+	ToolCount   int    // number of tool calls executed
+	cancel      func() // unexported: only Stop()/StopAll() should use this
 
 	// Shell-specific
 	PID     int
@@ -164,3 +166,49 @@ func copyEntry(e *BackgroundTaskEntry) *BackgroundTaskEntry {
 	return &cp
 }
 
+// ---------------------------------------------------------------------------
+// Notification
+// ---------------------------------------------------------------------------
+
+const BackgroundTaskCompletedTag = "background-task-completed"
+
+type TaskNotification struct {
+	TaskID      string     `json:"task_id"`
+	Type        TaskType   `json:"type"`
+	Status      TaskStatus `json:"status"`
+	Description string     `json:"description,omitempty"`
+	OutputFile  string     `json:"output_file,omitempty"`
+	Error       string     `json:"error,omitempty"`
+	ExitCode    *int       `json:"exit_code,omitempty"`
+	Command     string     `json:"command,omitempty"`
+	Agent       string     `json:"agent,omitempty"`
+}
+
+func NotificationFromEntry(e *BackgroundTaskEntry) TaskNotification {
+	if e == nil {
+		return TaskNotification{}
+	}
+	n := TaskNotification{
+		TaskID:      e.ID,
+		Type:        e.Type,
+		Status:      e.Status,
+		Description: e.Description,
+		OutputFile:  e.OutputFile,
+		Error:       e.Error,
+		Command:     e.Command,
+		Agent:       e.Agent,
+	}
+	if e.Type == TaskTypeShell && e.Status != TaskRunning {
+		exitCode := e.ExitCode
+		n.ExitCode = &exitCode
+	}
+	return n
+}
+
+func (n TaskNotification) ToAgentMessage() AgentMessage {
+	data, err := json.Marshal(n)
+	if err != nil {
+		return UserMsg(fmt.Sprintf("<%s>\n{\"task_id\":%q,\"status\":\"failed\",\"error\":%q}\n</%s>", BackgroundTaskCompletedTag, n.TaskID, err.Error(), BackgroundTaskCompletedTag))
+	}
+	return UserMsg(fmt.Sprintf("<%s>\n%s\n</%s>", BackgroundTaskCompletedTag, string(data), BackgroundTaskCompletedTag))
+}

@@ -12,7 +12,6 @@ import (
 	"github.com/voocel/agentcore/schema"
 )
 
-
 const (
 	maxParallelTasks = 8
 	maxConcurrency   = 4
@@ -267,7 +266,6 @@ func (t *SubAgentTool) executeBackground(agentName, task, description string, mo
 			outFile.Close()
 		}
 
-		var outputFile string
 		rt.Update(taskID, func(e *BackgroundTaskEntry) {
 			e.EndedAt = time.Now()
 			if err != nil {
@@ -276,25 +274,12 @@ func (t *SubAgentTool) executeBackground(agentName, task, description string, mo
 			} else {
 				e.Status = TaskCompleted
 			}
-			outputFile = e.OutputFile
-		})
-
-		result := map[string]any{
-			"task_id":     taskID,
-			"agent":       agentName,
-			"description": description,
-			"usage":       usage,
-		}
-		if err != nil {
-			result["status"] = "failed"
-			result["error"] = err.Error()
-		} else {
-			result["status"] = "completed"
-			if outputFile != "" {
-				result["output_file"] = outputFile
+			if usage != nil {
+				e.TokensIn = usage.Input
+				e.TokensOut = usage.Output
 			}
-		}
-		t.notify(result)
+		})
+		t.notify(taskID)
 	}()
 
 	return json.Marshal(map[string]any{
@@ -306,16 +291,15 @@ func (t *SubAgentTool) executeBackground(agentName, task, description string, mo
 }
 
 // notify sends background task results via notifyFn as a follow-up message.
-func (t *SubAgentTool) notify(result map[string]any) {
-	if t.notifyFn == nil {
+func (t *SubAgentTool) notify(taskID string) {
+	if t.notifyFn == nil || t.taskRT == nil {
 		return
 	}
-	data, err := json.Marshal(result)
-	if err != nil {
+	entry := t.taskRT.Get(taskID)
+	if entry == nil {
 		return
 	}
-	msg := UserMsg(fmt.Sprintf("<task-notification>\n%s\n</task-notification>", string(data)))
-	t.notifyFn(msg)
+	t.notifyFn(NotificationFromEntry(entry).ToAgentMessage())
 }
 
 // executeSingle runs one sub-agent with an isolated context.
