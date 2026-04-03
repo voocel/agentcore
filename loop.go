@@ -374,7 +374,7 @@ func callLLMWithRetry(ctx context.Context, agentCtx *AgentContext, config LoopCo
 // recoverOverflow attempts to compact the context and retry the LLM call.
 // If no TransformContext is configured, the original error is returned.
 func recoverOverflow(ctx context.Context, agentCtx *AgentContext, config LoopConfig, ch chan<- Event, originalErr error, hooks llmCallHooks) (Message, llmCallInfo, error) {
-	if config.TransformContext == nil {
+	if config.ContextManager == nil && config.TransformContext == nil {
 		return Message{}, llmCallInfo{}, fmt.Errorf("context overflow (no compaction configured): %w", originalErr)
 	}
 
@@ -388,11 +388,27 @@ func recoverOverflow(ctx context.Context, agentCtx *AgentContext, config LoopCon
 		},
 	})
 
+	if config.ContextManager != nil {
+		recovery, err := config.ContextManager.RecoverOverflow(ctx, agentCtx.Messages, originalErr)
+		if err != nil {
+			return Message{}, llmCallInfo{}, fmt.Errorf("overflow recovery compaction failed: %w", err)
+		}
+		if len(recovery.View) == 0 {
+			return Message{}, llmCallInfo{}, fmt.Errorf("overflow recovery returned empty prompt view")
+		}
+		agentCtx.Messages = recovery.View
+		if recovery.ShouldCommit && len(recovery.CommitMessages) > 0 && config.CommitContext != nil {
+			if err := config.CommitContext(recovery.CommitMessages, recovery.Usage); err != nil {
+				return Message{}, llmCallInfo{}, fmt.Errorf("overflow recovery commit failed: %w", err)
+			}
+		}
+		return callLLM(ctx, agentCtx, config, ch, hooks)
+	}
+
 	compacted, err := config.TransformContext(ctx, agentCtx.Messages)
 	if err != nil {
 		return Message{}, llmCallInfo{}, fmt.Errorf("overflow recovery compaction failed: %w", err)
 	}
-
 	agentCtx.Messages = compacted
 	return callLLM(ctx, agentCtx, config, ch, hooks)
 }
@@ -427,8 +443,16 @@ func retryDelay(err error, attempt int, maxDelay time.Duration) time.Duration {
 func callLLM(ctx context.Context, agentCtx *AgentContext, config LoopConfig, ch chan<- Event, hooks llmCallHooks) (Message, llmCallInfo, error) {
 	messages := agentCtx.Messages
 
-	// Stage 1: TransformContext (AgentMessage[] → AgentMessage[])
-	if config.TransformContext != nil {
+	// Stage 1: ContextManager / TransformContext
+	if config.ContextManager != nil {
+		projection, err := config.ContextManager.Project(ctx, messages)
+		if err != nil {
+			return Message{}, llmCallInfo{}, fmt.Errorf("project context: %w", err)
+		}
+		if projection.Messages != nil {
+			messages = projection.Messages
+		}
+	} else if config.TransformContext != nil {
 		var err error
 		messages, err = config.TransformContext(ctx, messages)
 		if err != nil {

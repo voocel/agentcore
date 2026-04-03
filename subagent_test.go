@@ -120,3 +120,53 @@ func TestSubAgentTool_ModeValidation(t *testing.T) {
 		t.Fatalf("expected mode validation error, got %q", msg)
 	}
 }
+
+func TestSubAgentTool_ModelOverrideRebuildsContextManager(t *testing.T) {
+	baseModel := &fakeNamedModel{name: "base"}
+	overrideModel := &fakeNamedModel{name: "override"}
+
+	var received string
+	cfg := SubAgentConfig{
+		Name:        "writer",
+		Description: "writer agent",
+		Model:       baseModel,
+		StreamFn: mockStreamFn(Message{
+			Role:       RoleAssistant,
+			Content:    []ContentBlock{TextBlock("ok")},
+			StopReason: StopReasonStop,
+		}),
+		ContextManagerFactory: func(model ChatModel) ContextManager {
+			if named, ok := model.(*fakeNamedModel); ok {
+				received = named.name
+			}
+			return nil
+		},
+		MaxTurns: 3,
+	}
+
+	tool := NewSubAgentTool(cfg)
+	tool.SetCreateModel(func(name string) (ChatModel, error) {
+		return overrideModel, nil
+	})
+
+	if _, err := tool.Execute(context.Background(), json.RawMessage(`{"agent":"writer","task":"greet","model":"override"}`)); err != nil {
+		t.Fatal(err)
+	}
+	if received != "override" {
+		t.Fatalf("expected context manager factory to receive override model, got %q", received)
+	}
+}
+
+type fakeNamedModel struct {
+	name string
+}
+
+func (m *fakeNamedModel) Generate(ctx context.Context, messages []Message, tools []ToolSpec, opts ...CallOption) (*LLMResponse, error) {
+	return &LLMResponse{Message: Message{Role: RoleAssistant, Content: []ContentBlock{TextBlock(m.name)}}}, nil
+}
+
+func (m *fakeNamedModel) GenerateStream(ctx context.Context, messages []Message, tools []ToolSpec, opts ...CallOption) (<-chan StreamEvent, error) {
+	return nil, context.Canceled
+}
+
+func (m *fakeNamedModel) SupportsTools() bool { return true }

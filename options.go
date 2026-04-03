@@ -46,6 +46,13 @@ func WithTransformContext(fn func(ctx context.Context, msgs []AgentMessage) ([]A
 	return func(a *Agent) { a.transformContext = fn }
 }
 
+// WithContextManager sets the context lifecycle manager.
+// When configured, it takes precedence over TransformContext for prompt
+// projection, overflow recovery, and usage reporting.
+func WithContextManager(mgr ContextManager) AgentOption {
+	return func(a *Agent) { a.contextManager = mgr }
+}
+
 // WithConvertToLLM sets the message conversion function.
 func WithConvertToLLM(fn func([]AgentMessage) []Message) AgentOption {
 	return func(a *Agent) { a.convertToLLM = fn }

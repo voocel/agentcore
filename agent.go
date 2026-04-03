@@ -38,6 +38,7 @@ type Agent struct {
 	strictMessageSequence bool
 	thinkingLevel         ThinkingLevel
 	streamFn              StreamFn
+	contextManager        ContextManager
 	transformContext      func(ctx context.Context, msgs []AgentMessage) ([]AgentMessage, error)
 	convertToLLM          func([]AgentMessage) []Message
 	steeringMode          QueueMode
@@ -248,6 +249,7 @@ func (a *Agent) SetMessages(msgs []AgentMessage) error {
 		return fmt.Errorf("cannot set messages while agent is running")
 	}
 	a.messages = copyMessages(msgs)
+	a.syncContextManagerLocked()
 	return nil
 }
 
@@ -268,6 +270,7 @@ func (a *Agent) ClearMessages() {
 	a.mu.Lock()
 	defer a.mu.Unlock()
 	a.messages = nil
+	a.syncContextManagerLocked()
 }
 
 // startPromptRunLocked starts a prompt-based run. Caller must hold a.mu.
@@ -317,6 +320,13 @@ func (a *Agent) startContinueRunLocked() {
 func (a *Agent) ContextUsage() *ContextUsage {
 	a.mu.Lock()
 	defer a.mu.Unlock()
+
+	if a.contextManager != nil {
+		if usage := a.contextManager.Usage(); usage != nil {
+			cp := *usage
+			return &cp
+		}
+	}
 
 	if a.contextWindow <= 0 || a.contextEstimateFn == nil {
 		return nil
@@ -413,9 +423,20 @@ func (a *Agent) BuildLLMMessages() ([]Message, error) {
 	msgs := copyMessages(a.messages)
 	blocks := a.systemBlocks
 	sp := a.systemPrompt
+	mgr := a.contextManager
 	convertFn := a.convertToLLM
 	strict := a.strictMessageSequence
 	a.mu.Unlock()
+
+	if mgr != nil {
+		proj, err := mgr.Project(context.Background(), msgs)
+		if err != nil {
+			return nil, err
+		}
+		if proj.Messages != nil {
+			msgs = proj.Messages
+		}
+	}
 
 	if convertFn == nil {
 		convertFn = DefaultConvertToLLM
@@ -513,6 +534,7 @@ func (a *Agent) Reset() {
 	a.totalUsage = Usage{}
 	a.done = nil
 	a.cancel = nil
+	a.syncContextManagerLocked()
 }
 
 // buildConfig constructs a LoopConfig from the agent's settings. Must be called with lock held.
@@ -528,12 +550,20 @@ func (a *Agent) buildConfig() LoopConfig {
 		MaxToolErrors:         a.maxToolErrors,
 		StrictMessageSequence: a.strictMessageSequence,
 		ThinkingLevel:         a.thinkingLevel,
+		ContextManager:        a.contextManager,
 		TransformContext:      a.transformContext,
 		ConvertToLLM:          a.convertToLLM,
-		PermissionEngine:      a.permissionEngine,
-		GetApiKey:             a.getApiKey,
-		ThinkingBudgets:       a.thinkingBudgets,
-		SessionID:             a.sessionID,
+		CommitContext: func(msgs []AgentMessage, usage *ContextUsage) error {
+			a.mu.Lock()
+			defer a.mu.Unlock()
+			a.messages = copyMessages(msgs)
+			a.syncContextManagerLocked()
+			return nil
+		},
+		PermissionEngine: a.permissionEngine,
+		GetApiKey:        a.getApiKey,
+		ThinkingBudgets:  a.thinkingBudgets,
+		SessionID:        a.sessionID,
 		GetSteeringMessages: func() []AgentMessage {
 			a.mu.Lock()
 			defer a.mu.Unlock()
@@ -574,6 +604,7 @@ func (a *Agent) consumeLoop(events <-chan Event) {
 			if msg, ok := partial.(Message); ok {
 				if !msg.IsEmpty() {
 					a.messages = append(a.messages, partial)
+					a.syncContextManagerLocked()
 				}
 			}
 		}
@@ -605,6 +636,7 @@ func (a *Agent) consumeLoop(events <-chan Event) {
 			a.streamMessage = nil
 			if ev.Message != nil {
 				a.messages = append(a.messages, ev.Message)
+				a.syncContextManagerLocked()
 				// Accumulate usage from assistant messages
 				if msg, ok := ev.Message.(Message); ok && msg.Usage != nil {
 					a.totalUsage.Add(msg.Usage)
@@ -642,6 +674,7 @@ func (a *Agent) consumeLoop(events <-chan Event) {
 					Timestamp: time.Now(),
 				}
 				a.messages = append(a.messages, errMsg)
+				a.syncContextManagerLocked()
 			}
 
 		case EventAgentEnd:
@@ -661,4 +694,11 @@ func (a *Agent) consumeLoop(events <-chan Event) {
 			}
 		}
 	}
+}
+
+func (a *Agent) syncContextManagerLocked() {
+	if a.contextManager == nil {
+		return
+	}
+	a.contextManager.Sync(copyMessages(a.messages))
 }

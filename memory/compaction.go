@@ -12,8 +12,8 @@ import (
 )
 
 const (
-	defaultReserveTokens         = 16384
-	defaultKeepRecentTokens      = 20000
+	defaultReserveTokens          = 16384
+	defaultKeepRecentTokens       = 20000
 	defaultMaxConsecutiveFailures = 3
 )
 
@@ -23,8 +23,8 @@ type CompactionInfo struct {
 	TokensAfter    int
 	MessagesBefore int
 	MessagesAfter  int
-	CompactedCount int           // number of messages summarized
-	KeptCount      int           // number of messages retained verbatim
+	CompactedCount int // number of messages summarized
+	KeptCount      int // number of messages retained verbatim
 	IsSplitTurn    bool
 	IsIncremental  bool          // updated an existing summary
 	SummaryLen     int           // summary length in runes
@@ -111,145 +111,147 @@ func NewCompaction(cfg CompactionConfig) func(context.Context, []agentcore.Agent
 			return msgs, nil
 		}
 
-		cut := findCutPoint(msgs, cfg.KeepRecentTokens)
-		if cut.firstKeptIndex <= 0 {
-			return msgs, nil // nothing to compact
-		}
-
-		start := time.Now()
-
-		// Determine what to summarize vs keep.
-		// If split turn: history ends at turn start, turn prefix is [turnStart:firstKept].
-		historyEnd := cut.firstKeptIndex
-		if cut.isSplitTurn && cut.turnStartIndex >= 0 {
-			historyEnd = cut.turnStartIndex
-		}
-
-		toSummarize := msgs[:historyEnd]
-		toKeep := msgs[cut.firstKeptIndex:]
-
-		// Strip images before summarization — they consume tokens but can't be text-summarized.
-		if stripImages {
-			toSummarize = stripImageBlocks(toSummarize)
-		}
-
-		// Find previous CompactionSummary for incremental update
-		var previousSummary string
-		for _, m := range toSummarize {
-			if cs, ok := m.(CompactionSummary); ok {
-				previousSummary = cs.Summary
+		result, info, err := runSummaryCompaction(ctx, cfg, msgs, stripImages)
+		if err != nil {
+			consecutiveFailures++
+			if cfg.MaxConsecutiveFailures > 0 && consecutiveFailures >= cfg.MaxConsecutiveFailures {
+				tripped = true
 			}
+			return nil, err
 		}
-
-		// Call options: history gets higher budget + thinking, prefix gets smaller budget
-		historyOpts := []agentcore.CallOption{
-			agentcore.WithMaxTokens(int(float64(cfg.ReserveTokens) * 0.8)),
-			agentcore.WithThinking(agentcore.ThinkingHigh),
-		}
-		prefixOpts := []agentcore.CallOption{
-			agentcore.WithMaxTokens(int(float64(cfg.ReserveTokens) * 0.5)),
-		}
-
-		var summary string
-
-		needTurnPrefix := cut.isSplitTurn && cut.turnStartIndex >= 0
-		var turnPrefix []agentcore.AgentMessage
-		if needTurnPrefix {
-			turnPrefix = msgs[cut.turnStartIndex:cut.firstKeptIndex]
-			if stripImages {
-				turnPrefix = stripImageBlocks(turnPrefix)
-			}
-			needTurnPrefix = len(turnPrefix) > 0
-		}
-
-		if needTurnPrefix {
-			// Generate history + turn prefix summaries in parallel
-			type summaryResult struct {
-				text string
-				err  error
-			}
-			historyCh := make(chan summaryResult, 1)
-			prefixCh := make(chan summaryResult, 1)
-
-			go func() {
-				if len(toSummarize) == 0 {
-					historyCh <- summaryResult{text: "No prior history."}
-					return
-				}
-				s, e := generateSummary(ctx, cfg.Model, toSummarize, previousSummary, historyOpts...)
-				historyCh <- summaryResult{s, e}
-			}()
-			go func() {
-				s, e := generateTurnPrefixSummary(ctx, cfg.Model, turnPrefix, prefixOpts...)
-				prefixCh <- summaryResult{s, e}
-			}()
-
-			hr := <-historyCh
-			pr := <-prefixCh
-
-			if hr.err != nil || pr.err != nil {
-				consecutiveFailures++
-				if cfg.MaxConsecutiveFailures > 0 && consecutiveFailures >= cfg.MaxConsecutiveFailures {
-					tripped = true
-				}
-				if hr.err != nil {
-					return nil, fmt.Errorf("compaction: %w", hr.err)
-				}
-				return nil, fmt.Errorf("compaction turn prefix: %w", pr.err)
-			}
-			summary = hr.text
-			if pr.text != "" {
-				summary += "\n\n---\n\n**Turn Context (split turn):**\n\n" + pr.text
-			}
-		} else {
-			var err error
-			summary, err = generateSummary(ctx, cfg.Model, toSummarize, previousSummary, historyOpts...)
-			if err != nil {
-				consecutiveFailures++
-				if cfg.MaxConsecutiveFailures > 0 && consecutiveFailures >= cfg.MaxConsecutiveFailures {
-					tripped = true
-				}
-				return nil, fmt.Errorf("compaction: %w", err)
-			}
+		if info == nil {
+			return msgs, nil
 		}
 
 		// Success — reset circuit breaker.
 		consecutiveFailures = 0
-
-		// Extract file ops from ALL compacted messages (history + turn prefix)
-		allCompacted := msgs[:cut.firstKeptIndex]
-		readFiles, modifiedFiles := extractFileOps(allCompacted)
-		summary += formatFileOps(readFiles, modifiedFiles)
-
-		cs := CompactionSummary{
-			Summary:       summary,
-			TokensBefore:  tokens,
-			ReadFiles:     readFiles,
-			ModifiedFiles: modifiedFiles,
-			Timestamp:     time.Now(),
-		}
-
-		result := make([]agentcore.AgentMessage, 0, 1+len(toKeep))
-		result = append(result, cs)
-		result = append(result, toKeep...)
-
 		if cfg.OnCompaction != nil {
-			cfg.OnCompaction(CompactionInfo{
-				TokensBefore:   tokens,
-				TokensAfter:    EstimateTotal(result),
-				MessagesBefore: len(msgs),
-				MessagesAfter:  len(result),
-				CompactedCount: len(allCompacted),
-				KeptCount:      len(toKeep),
-				IsSplitTurn:    needTurnPrefix,
-				IsIncremental:  previousSummary != "",
-				SummaryLen:     len([]rune(summary)),
-				Duration:       time.Since(start),
-			})
+			cfg.OnCompaction(*info)
 		}
-
 		return result, nil
 	}
+}
+
+func runSummaryCompaction(ctx context.Context, cfg CompactionConfig, msgs []agentcore.AgentMessage, stripImages bool) ([]agentcore.AgentMessage, *CompactionInfo, error) {
+	cut := findCutPoint(msgs, cfg.KeepRecentTokens)
+	if cut.firstKeptIndex <= 0 {
+		return msgs, nil, nil
+	}
+
+	start := time.Now()
+
+	historyEnd := cut.firstKeptIndex
+	if cut.isSplitTurn && cut.turnStartIndex >= 0 {
+		historyEnd = cut.turnStartIndex
+	}
+
+	toSummarize := msgs[:historyEnd]
+	toKeep := msgs[cut.firstKeptIndex:]
+
+	if stripImages {
+		toSummarize = stripImageBlocks(toSummarize)
+	}
+
+	var previousSummary string
+	for _, m := range toSummarize {
+		if cs, ok := m.(CompactionSummary); ok {
+			previousSummary = cs.Summary
+		}
+	}
+
+	historyOpts := []agentcore.CallOption{
+		agentcore.WithMaxTokens(int(float64(cfg.ReserveTokens) * 0.8)),
+		agentcore.WithThinking(agentcore.ThinkingOff),
+	}
+	prefixOpts := []agentcore.CallOption{
+		agentcore.WithMaxTokens(int(float64(cfg.ReserveTokens) * 0.5)),
+		agentcore.WithThinking(agentcore.ThinkingOff),
+	}
+
+	var summary string
+
+	needTurnPrefix := cut.isSplitTurn && cut.turnStartIndex >= 0
+	var turnPrefix []agentcore.AgentMessage
+	if needTurnPrefix {
+		turnPrefix = msgs[cut.turnStartIndex:cut.firstKeptIndex]
+		if stripImages {
+			turnPrefix = stripImageBlocks(turnPrefix)
+		}
+		needTurnPrefix = len(turnPrefix) > 0
+	}
+
+	if needTurnPrefix {
+		type summaryResult struct {
+			text string
+			err  error
+		}
+		historyCh := make(chan summaryResult, 1)
+		prefixCh := make(chan summaryResult, 1)
+
+		go func() {
+			if len(toSummarize) == 0 {
+				historyCh <- summaryResult{text: "No prior history."}
+				return
+			}
+			s, e := generateSummary(ctx, cfg.Model, toSummarize, previousSummary, historyOpts...)
+			historyCh <- summaryResult{s, e}
+		}()
+		go func() {
+			s, e := generateTurnPrefixSummary(ctx, cfg.Model, turnPrefix, prefixOpts...)
+			prefixCh <- summaryResult{s, e}
+		}()
+
+		hr := <-historyCh
+		pr := <-prefixCh
+
+		if hr.err != nil {
+			return nil, nil, fmt.Errorf("compaction: %w", hr.err)
+		}
+		if pr.err != nil {
+			return nil, nil, fmt.Errorf("compaction turn prefix: %w", pr.err)
+		}
+		summary = hr.text
+		if pr.text != "" {
+			summary += "\n\n---\n\n**Turn Context (split turn):**\n\n" + pr.text
+		}
+	} else {
+		var err error
+		summary, err = generateSummary(ctx, cfg.Model, toSummarize, previousSummary, historyOpts...)
+		if err != nil {
+			return nil, nil, fmt.Errorf("compaction: %w", err)
+		}
+	}
+
+	allCompacted := msgs[:cut.firstKeptIndex]
+	readFiles, modifiedFiles := extractFileOps(allCompacted)
+	summary += formatFileOps(readFiles, modifiedFiles)
+
+	tokensBefore := EstimateTotal(msgs)
+	cs := CompactionSummary{
+		Summary:       summary,
+		TokensBefore:  tokensBefore,
+		ReadFiles:     readFiles,
+		ModifiedFiles: modifiedFiles,
+		Timestamp:     time.Now(),
+	}
+
+	result := make([]agentcore.AgentMessage, 0, 1+len(toKeep))
+	result = append(result, cs)
+	result = append(result, toKeep...)
+
+	info := &CompactionInfo{
+		TokensBefore:   tokensBefore,
+		TokensAfter:    EstimateTotal(result),
+		MessagesBefore: len(msgs),
+		MessagesAfter:  len(result),
+		CompactedCount: len(allCompacted),
+		KeptCount:      len(toKeep),
+		IsSplitTurn:    needTurnPrefix,
+		IsIncremental:  previousSummary != "",
+		SummaryLen:     len([]rune(summary)),
+		Duration:       time.Since(start),
+	}
+	return result, info, nil
 }
 
 // stripImageBlocks returns a copy of msgs with image content blocks removed.

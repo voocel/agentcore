@@ -62,8 +62,14 @@ type LoopConfig struct {
 	ThinkingLevel         ThinkingLevel // reasoning depth
 
 	// Two-stage pipeline: TransformContext -> ConvertToLLM
+	// ContextManager takes precedence when configured.
+	ContextManager   ContextManager
 	TransformContext func(ctx context.Context, msgs []AgentMessage) ([]AgentMessage, error)
 	ConvertToLLM     func(msgs []AgentMessage) []Message
+
+	// CommitContext replaces the runtime message baseline after an explicit
+	// committed compaction or committed overflow recovery.
+	CommitContext func(msgs []AgentMessage, usage *ContextUsage) error
 
 	// PermissionEngine is called after validation/preview and before execution.
 	// Returning nil means no extra approval step was required.

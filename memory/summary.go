@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"math"
 	"strings"
 
 	"github.com/voocel/agentcore"
@@ -11,7 +12,9 @@ import (
 
 const summarySystemPrompt = `You are a context summarization assistant. Your task is to read a conversation between a user and an AI coding assistant, then produce a structured summary following the exact format specified.
 
-Do NOT continue the conversation. Do NOT respond to any questions in the conversation. ONLY output the structured summary.`
+Do NOT continue the conversation. Do NOT respond to any questions in the conversation.
+
+First think briefly inside <analysis>...</analysis>. Then output the final checkpoint inside <summary>...</summary>.`
 
 const summaryPrompt = `The messages above are a conversation to summarize. Create a structured context checkpoint summary that another LLM will use to continue the work.
 
@@ -114,12 +117,37 @@ func generateTurnPrefixSummary(ctx context.Context, model agentcore.ChatModel, m
 	if err != nil {
 		return "", fmt.Errorf("turn prefix summarization failed: %w", err)
 	}
-	return strings.TrimSpace(resp.Message.TextContent()), nil
+	return extractStoredSummary(resp.Message.TextContent()), nil
 }
 
 // generateSummary calls the ChatModel to produce a conversation summary.
 // If previousSummary is non-empty, uses incremental update prompt.
 func generateSummary(ctx context.Context, model agentcore.ChatModel, msgs []agentcore.AgentMessage, previousSummary string, opts ...agentcore.CallOption) (string, error) {
+	const maxRetries = 3
+	current := append([]agentcore.AgentMessage(nil), msgs...)
+	var lastErr error
+	for attempt := 0; attempt < maxRetries; attempt++ {
+		summary, err := generateSummaryOnce(ctx, model, current, previousSummary, opts...)
+		if err == nil {
+			return summary, nil
+		}
+		lastErr = err
+		if !agentcore.IsContextOverflow(err) {
+			return "", err
+		}
+		next := truncateOldestUserGroups(current, 0.2)
+		if len(next) == 0 || len(next) == len(current) {
+			break
+		}
+		current = next
+	}
+	if lastErr != nil {
+		return "", lastErr
+	}
+	return "", fmt.Errorf("summarization failed")
+}
+
+func generateSummaryOnce(ctx context.Context, model agentcore.ChatModel, msgs []agentcore.AgentMessage, previousSummary string, opts ...agentcore.CallOption) (string, error) {
 	conversation := serializeConversation(msgs)
 	if conversation == "" {
 		return "", fmt.Errorf("no conversation content to summarize")
@@ -143,11 +171,69 @@ func generateSummary(ctx context.Context, model agentcore.ChatModel, msgs []agen
 		return "", fmt.Errorf("summarization failed: %w", err)
 	}
 
-	summary := strings.TrimSpace(resp.Message.TextContent())
+	summary := extractStoredSummary(resp.Message.TextContent())
 	if summary == "" {
 		return "", fmt.Errorf("summarization returned empty content")
 	}
 	return summary, nil
+}
+
+func extractStoredSummary(text string) string {
+	text = stripAnalysisBlock(strings.TrimSpace(text))
+	if summary := extractTaggedBlock(text, "summary"); summary != "" {
+		return strings.TrimSpace(summary)
+	}
+	return strings.TrimSpace(text)
+}
+
+func stripAnalysisBlock(text string) string {
+	start := strings.Index(text, "<analysis>")
+	end := strings.Index(text, "</analysis>")
+	if start < 0 || end < 0 || end < start {
+		return text
+	}
+	return strings.TrimSpace(text[:start] + text[end+len("</analysis>"):])
+}
+
+func extractTaggedBlock(text, tag string) string {
+	startTag := "<" + tag + ">"
+	endTag := "</" + tag + ">"
+	start := strings.Index(text, startTag)
+	end := strings.Index(text, endTag)
+	if start < 0 || end < 0 || end < start {
+		return ""
+	}
+	start += len(startTag)
+	return strings.TrimSpace(text[start:end])
+}
+
+func truncateOldestUserGroups(msgs []agentcore.AgentMessage, fraction float64) []agentcore.AgentMessage {
+	if len(msgs) == 0 {
+		return nil
+	}
+	var starts []int
+	for i, msg := range msgs {
+		m, ok := msg.(agentcore.Message)
+		if ok && m.Role == agentcore.RoleUser {
+			starts = append(starts, i)
+		}
+	}
+	if len(starts) <= 1 {
+		drop := int(math.Ceil(float64(len(msgs)) * fraction))
+		if drop <= 0 || drop >= len(msgs) {
+			return msgs
+		}
+		return append([]agentcore.AgentMessage(nil), msgs[drop:]...)
+	}
+	dropGroups := int(math.Ceil(float64(len(starts)) * fraction))
+	if dropGroups <= 0 {
+		dropGroups = 1
+	}
+	if dropGroups >= len(starts) {
+		dropGroups = len(starts) - 1
+	}
+	cut := starts[dropGroups]
+	return append([]agentcore.AgentMessage(nil), msgs[cut:]...)
 }
 
 // formatArgsKeyValue formats JSON tool args as key=value pairs.

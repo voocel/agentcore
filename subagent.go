@@ -30,10 +30,11 @@ type SubAgentConfig struct {
 	StreamFn     StreamFn
 	MaxTurns     int
 
-	// Optional two-stage context pipeline (same as Agent-level).
-	// When set, enables automatic context compaction for long-running sub-agents.
-	TransformContext func(ctx context.Context, msgs []AgentMessage) ([]AgentMessage, error)
-	ConvertToLLM     func(msgs []AgentMessage) []Message
+	// Optional context lifecycle hooks for long-running sub-agents.
+	ContextManager        ContextManager
+	ContextManagerFactory func(model ChatModel) ContextManager
+	TransformContext      func(ctx context.Context, msgs []AgentMessage) ([]AgentMessage, error)
+	ConvertToLLM          func(msgs []AgentMessage) []Message
 }
 
 // subagentParams is the JSON schema input for the subagent tool.
@@ -438,15 +439,22 @@ func (t *SubAgentTool) runAgent(ctx context.Context, agentName, task string, mod
 		Tools:        cfg.Tools,
 	}
 
+	runModel := cfg.Model
+	if modelOverride != nil {
+		runModel = modelOverride
+	}
+	contextManager := cfg.ContextManager
+	if cfg.ContextManagerFactory != nil {
+		contextManager = cfg.ContextManagerFactory(runModel)
+	}
+
 	loopCfg := LoopConfig{
-		Model:            cfg.Model,
+		Model:            runModel,
 		StreamFn:         cfg.StreamFn,
 		MaxTurns:         cfg.MaxTurns,
+		ContextManager:   contextManager,
 		TransformContext: cfg.TransformContext,
 		ConvertToLLM:     cfg.ConvertToLLM,
-	}
-	if modelOverride != nil {
-		loopCfg.Model = modelOverride
 	}
 	if loopCfg.MaxTurns <= 0 {
 		loopCfg.MaxTurns = defaultMaxTurns
