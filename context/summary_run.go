@@ -1,4 +1,4 @@
-package memory
+package context
 
 import (
 	"context"
@@ -12,13 +12,12 @@ import (
 )
 
 const (
-	defaultReserveTokens          = 16384
-	defaultKeepRecentTokens       = 20000
-	defaultMaxConsecutiveFailures = 3
+	defaultReserveTokens    = 16384
+	defaultKeepRecentTokens = 20000
 )
 
-// CompactionInfo holds details about a completed compaction for observability.
-type CompactionInfo struct {
+// SummaryInfo holds details about a completed compaction for observability.
+type SummaryInfo struct {
 	TokensBefore   int
 	TokensAfter    int
 	MessagesBefore int
@@ -33,108 +32,15 @@ type CompactionInfo struct {
 	ModifiedFiles  []string      // files modified during compacted conversation
 }
 
-// CompactionConfig configures automatic context compaction.
-type CompactionConfig struct {
-	// Model is the ChatModel used for generating summaries.
-	// Typically the same model the agent uses.
-	Model agentcore.ChatModel
-
-	// ContextWindow is the model's context window size in tokens.
-	// Required — there is no default.
-	ContextWindow int
-
-	// ReserveTokens is the token headroom reserved for the LLM response.
-	// Default: 16384.
-	ReserveTokens int
-
-	// KeepRecentTokens is the minimum number of recent tokens to always keep.
-	// Default: 20000.
+// summaryRunConfig configures one summary compaction execution.
+type summaryRunConfig struct {
+	Model            agentcore.ChatModel
+	ContextWindow    int
+	ReserveTokens    int
 	KeepRecentTokens int
-
-	// MaxConsecutiveFailures is the circuit breaker threshold.
-	// After this many consecutive compaction failures, compaction is disabled
-	// for the rest of the session. Default: 3. 0 means no limit.
-	MaxConsecutiveFailures int
-
-	// StripImages controls whether image content blocks are removed before
-	// summarization. Images consume large amounts of tokens but cannot be
-	// meaningfully summarized by text. Default: true.
-	StripImages *bool
-
-	// OnCompaction is called after a successful compaction with details.
-	// Optional — nil means no callback.
-	OnCompaction func(CompactionInfo)
 }
 
-// NewCompaction returns a TransformContext function that automatically compacts
-// the message history when context tokens approach the window limit.
-//
-// Usage:
-//
-//	agent := agentcore.NewAgent(
-//	    agentcore.WithTransformContext(memory.NewCompaction(memory.CompactionConfig{
-//	        Model:         model,
-//	        ContextWindow: 128000,
-//	    })),
-//	    agentcore.WithConvertToLLM(memory.CompactionConvertToLLM),
-//	)
-func NewCompaction(cfg CompactionConfig) func(context.Context, []agentcore.AgentMessage) ([]agentcore.AgentMessage, error) {
-	if cfg.ReserveTokens <= 0 {
-		cfg.ReserveTokens = defaultReserveTokens
-	}
-	if cfg.KeepRecentTokens <= 0 {
-		cfg.KeepRecentTokens = defaultKeepRecentTokens
-	}
-	if cfg.MaxConsecutiveFailures < 0 {
-		cfg.MaxConsecutiveFailures = defaultMaxConsecutiveFailures
-	}
-	stripImages := true
-	if cfg.StripImages != nil {
-		stripImages = *cfg.StripImages
-	}
-
-	// Circuit breaker state (closed over, survives across calls).
-	consecutiveFailures := 0
-	tripped := false
-
-	return func(ctx context.Context, msgs []agentcore.AgentMessage) ([]agentcore.AgentMessage, error) {
-		if len(msgs) == 0 || cfg.Model == nil {
-			return msgs, nil
-		}
-
-		// Circuit breaker: skip compaction if tripped.
-		if tripped {
-			return msgs, nil
-		}
-
-		tokens := EstimateTotal(msgs)
-		threshold := cfg.ContextWindow - cfg.ReserveTokens
-		if threshold <= 0 || tokens <= threshold {
-			return msgs, nil
-		}
-
-		result, info, err := runSummaryCompaction(ctx, cfg, msgs, stripImages)
-		if err != nil {
-			consecutiveFailures++
-			if cfg.MaxConsecutiveFailures > 0 && consecutiveFailures >= cfg.MaxConsecutiveFailures {
-				tripped = true
-			}
-			return nil, err
-		}
-		if info == nil {
-			return msgs, nil
-		}
-
-		// Success — reset circuit breaker.
-		consecutiveFailures = 0
-		if cfg.OnCompaction != nil {
-			cfg.OnCompaction(*info)
-		}
-		return result, nil
-	}
-}
-
-func runSummaryCompaction(ctx context.Context, cfg CompactionConfig, msgs []agentcore.AgentMessage, stripImages bool) ([]agentcore.AgentMessage, *CompactionInfo, error) {
+func runSummaryCompaction(ctx context.Context, cfg summaryRunConfig, msgs []agentcore.AgentMessage, stripImages bool) ([]agentcore.AgentMessage, *SummaryInfo, error) {
 	cut := findCutPoint(msgs, cfg.KeepRecentTokens)
 	if cut.firstKeptIndex <= 0 {
 		return msgs, nil, nil
@@ -156,7 +62,7 @@ func runSummaryCompaction(ctx context.Context, cfg CompactionConfig, msgs []agen
 
 	var previousSummary string
 	for _, m := range toSummarize {
-		if cs, ok := m.(CompactionSummary); ok {
+		if cs, ok := m.(ContextSummary); ok {
 			previousSummary = cs.Summary
 		}
 	}
@@ -183,38 +89,25 @@ func runSummaryCompaction(ctx context.Context, cfg CompactionConfig, msgs []agen
 	}
 
 	if needTurnPrefix {
-		type summaryResult struct {
-			text string
-			err  error
-		}
-		historyCh := make(chan summaryResult, 1)
-		prefixCh := make(chan summaryResult, 1)
-
-		go func() {
-			if len(toSummarize) == 0 {
-				historyCh <- summaryResult{text: "No prior history."}
-				return
+		// Run sequentially. ChatModel does not promise concurrent Generate safety,
+		// so split-turn summarization must not assume shared model instances are
+		// goroutine-safe.
+		if len(toSummarize) == 0 {
+			summary = "No prior history."
+		} else {
+			var err error
+			summary, err = generateSummary(ctx, cfg.Model, toSummarize, previousSummary, historyOpts...)
+			if err != nil {
+				return nil, nil, fmt.Errorf("compaction: %w", err)
 			}
-			s, e := generateSummary(ctx, cfg.Model, toSummarize, previousSummary, historyOpts...)
-			historyCh <- summaryResult{s, e}
-		}()
-		go func() {
-			s, e := generateTurnPrefixSummary(ctx, cfg.Model, turnPrefix, prefixOpts...)
-			prefixCh <- summaryResult{s, e}
-		}()
-
-		hr := <-historyCh
-		pr := <-prefixCh
-
-		if hr.err != nil {
-			return nil, nil, fmt.Errorf("compaction: %w", hr.err)
 		}
-		if pr.err != nil {
-			return nil, nil, fmt.Errorf("compaction turn prefix: %w", pr.err)
+
+		prefixSummary, err := generateTurnPrefixSummary(ctx, cfg.Model, turnPrefix, prefixOpts...)
+		if err != nil {
+			return nil, nil, fmt.Errorf("compaction turn prefix: %w", err)
 		}
-		summary = hr.text
-		if pr.text != "" {
-			summary += "\n\n---\n\n**Turn Context (split turn):**\n\n" + pr.text
+		if prefixSummary != "" {
+			summary += "\n\n---\n\n**Turn Context (split turn):**\n\n" + prefixSummary
 		}
 	} else {
 		var err error
@@ -229,7 +122,7 @@ func runSummaryCompaction(ctx context.Context, cfg CompactionConfig, msgs []agen
 	summary += formatFileOps(readFiles, modifiedFiles)
 
 	tokensBefore := EstimateTotal(msgs)
-	cs := CompactionSummary{
+	cs := ContextSummary{
 		Summary:       summary,
 		TokensBefore:  tokensBefore,
 		ReadFiles:     readFiles,
@@ -241,7 +134,7 @@ func runSummaryCompaction(ctx context.Context, cfg CompactionConfig, msgs []agen
 	result = append(result, cs)
 	result = append(result, toKeep...)
 
-	info := &CompactionInfo{
+	info := &SummaryInfo{
 		TokensBefore:   tokensBefore,
 		TokensAfter:    EstimateTotal(result),
 		MessagesBefore: len(msgs),
@@ -368,7 +261,7 @@ func findCutPoint(msgs []agentcore.AgentMessage, keepTokens int) cutResult {
 			// Assistant without tool calls — valid cut point
 			break
 		}
-		// CompactionSummary or other custom type — valid cut point
+		// ContextSummary or other custom type — valid cut point
 		break
 	}
 

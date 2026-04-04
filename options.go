@@ -102,7 +102,7 @@ func WithContextWindow(n int) AgentOption {
 }
 
 // WithContextEstimate sets the context token estimation function.
-// Use memory.ContextEstimateAdapter for the default hybrid estimation.
+// Use context.ContextEstimateAdapter for the default hybrid estimation.
 func WithContextEstimate(fn ContextEstimateFn) AgentOption {
 	return func(a *Agent) { a.contextEstimateFn = fn }
 }
@@ -158,12 +158,8 @@ func WithTaskRuntime(rt *TaskRuntime) AgentOption {
 }
 
 // WithContextPipeline sets both TransformContext and ConvertToLLM in one call.
-// This is the recommended way to configure context compaction:
-//
-//	agentcore.WithContextPipeline(
-//	    memory.NewCompaction(cfg),
-//	    memory.CompactionConvertToLLM,
-//	)
+// Prefer WithContextManager for the full context lifecycle; use this helper
+// for simpler transform-based pipelines.
 func WithContextPipeline(
 	transform func(ctx context.Context, msgs []AgentMessage) ([]AgentMessage, error),
 	convert func([]AgentMessage) []Message,

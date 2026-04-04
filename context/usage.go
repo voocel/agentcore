@@ -1,4 +1,4 @@
-package memory
+package context
 
 import "github.com/voocel/agentcore"
 
@@ -23,7 +23,7 @@ func EstimateTokens(msg agentcore.AgentMessage) int {
 				chars += 4800 // ~1200 tokens
 			}
 		}
-	case CompactionSummary:
+	case ContextSummary:
 		chars = len(v.Summary)
 	default:
 		return 0
@@ -46,7 +46,8 @@ func EstimateTotal(msgs []agentcore.AgentMessage) int {
 // ---------------------------------------------------------------------------
 
 // ContextUsageEstimate holds the hybrid token estimation result.
-// It combines LLM-reported Usage data with chars/4 estimation for trailing messages.
+// It combines LLM-reported Usage data with chars/4 estimation for trailing
+// messages to approximate current context-window occupancy.
 type ContextUsageEstimate struct {
 	// Tokens is the total estimated context tokens (UsageTokens + TrailingTokens).
 	Tokens int
@@ -117,7 +118,8 @@ func EstimateContextTokens(msgs []agentcore.AgentMessage) ContextUsageEstimate {
 	}
 }
 
-// ContextEstimateAdapter adapts EstimateContextTokens to the agentcore.ContextEstimateFn signature.
+// ContextEstimateAdapter adapts EstimateContextTokens to the
+// agentcore.ContextEstimateFn signature used by agent runtime options.
 func ContextEstimateAdapter(msgs []agentcore.AgentMessage) (tokens, usageTokens, trailingTokens int) {
 	e := EstimateContextTokens(msgs)
 	return e.Tokens, e.UsageTokens, e.TrailingTokens

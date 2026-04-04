@@ -1,4 +1,4 @@
-package memory
+package context
 
 import (
 	"context"
@@ -74,6 +74,7 @@ func (s *LightTrimStrategy) Apply(_ context.Context, _ []agentcore.AgentMessage,
 func trimLongTextBlocks(msg agentcore.Message, threshold, preserveHead, preserveTail int) (agentcore.Message, bool) {
 	newContent := make([]agentcore.ContentBlock, len(msg.Content))
 	changed := false
+	trimmedBlocks := 0
 	for i, block := range msg.Content {
 		if block.Type != agentcore.ContentText {
 			newContent[i] = block
@@ -94,11 +95,17 @@ func trimLongTextBlocks(msg agentcore.Message, threshold, preserveHead, preserve
 			Text: fmt.Sprintf("%s\n%s\n%s", head, formatTrimmedPlaceholder(trimmed), tail),
 		}
 		changed = true
+		trimmedBlocks++
 	}
 	if !changed {
 		return msg, false
 	}
 	next := msg
 	next.Content = newContent
+	next.Metadata = cloneMetadata(msg.Metadata)
+	if next.Metadata == nil {
+		next.Metadata = map[string]any{}
+	}
+	next.Metadata["trimmed_text_blocks"] = trimmedBlocks
 	return next, true
 }

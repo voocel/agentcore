@@ -1,4 +1,4 @@
-package memory
+package context
 
 import (
 	"time"
@@ -6,10 +6,10 @@ import (
 	"github.com/voocel/agentcore"
 )
 
-// CompactionSummary is a compacted context summary message.
+// ContextSummary is a compacted context summary message.
 // It implements AgentMessage but is NOT a Message, so DefaultConvertToLLM
-// will filter it out. Use CompactionConvertToLLM to handle it.
-type CompactionSummary struct {
+// will filter it out. Use ContextConvertToLLM to handle it.
+type ContextSummary struct {
 	Summary       string
 	TokensBefore  int
 	ReadFiles     []string
@@ -17,25 +17,25 @@ type CompactionSummary struct {
 	Timestamp     time.Time
 }
 
-func (c CompactionSummary) GetRole() agentcore.Role      { return agentcore.RoleUser }
-func (c CompactionSummary) GetTimestamp() time.Time     { return c.Timestamp }
-func (c CompactionSummary) TextContent() string         { return c.Summary }
-func (c CompactionSummary) ThinkingContent() string     { return "" }
-func (c CompactionSummary) HasToolCalls() bool          { return false }
+func (c ContextSummary) GetRole() agentcore.Role { return agentcore.RoleUser }
+func (c ContextSummary) GetTimestamp() time.Time { return c.Timestamp }
+func (c ContextSummary) TextContent() string     { return c.Summary }
+func (c ContextSummary) ThinkingContent() string { return "" }
+func (c ContextSummary) HasToolCalls() bool      { return false }
 
-// CompactionConvertToLLM converts AgentMessages to LLM Messages,
-// handling CompactionSummary by wrapping it as a user message with XML tags.
+// ContextConvertToLLM converts AgentMessages to LLM Messages,
+// handling ContextSummary by wrapping it as a user message with XML tags.
 // For all other message types, it delegates to DefaultConvertToLLM behavior.
-func CompactionConvertToLLM(msgs []agentcore.AgentMessage) []agentcore.Message {
+func ContextConvertToLLM(msgs []agentcore.AgentMessage) []agentcore.Message {
 	out := make([]agentcore.Message, 0, len(msgs))
 	for _, m := range msgs {
 		switch v := m.(type) {
-		case CompactionSummary:
+		case ContextSummary:
 			out = append(out, agentcore.Message{
 				Role:    agentcore.RoleUser,
 				Content: []agentcore.ContentBlock{agentcore.TextBlock("<context-summary>\n" + v.Summary + "\n</context-summary>")},
 				Metadata: map[string]any{
-					"type":           "compaction_summary",
+					"type":           "context_summary",
 					"tokens_before":  v.TokensBefore,
 					"read_files":     v.ReadFiles,
 					"modified_files": v.ModifiedFiles,

@@ -1,4 +1,4 @@
-package memory
+package context
 
 import (
 	"context"
@@ -7,17 +7,29 @@ import (
 	"github.com/voocel/agentcore"
 )
 
+// FullSummaryConfig controls ContextSummary checkpoint generation.
+// KeepRecentTokens reserves a recent suffix of messages to keep verbatim.
+// PostSummaryHooks may inject lightweight reminder messages after the summary.
 type FullSummaryConfig struct {
-	Model            agentcore.ChatModel
-	StripImages      *bool
+	// Model performs the actual summary generation.
+	Model agentcore.ChatModel
+	// StripImages controls whether images are removed before summarization.
+	// Nil defaults to true.
+	StripImages *bool
+	// KeepRecentTokens reserves a recent suffix to keep verbatim.
 	KeepRecentTokens int
-	PostCompactHooks []PostCompactHook
+	// PostSummaryHooks inject lightweight reminder messages after the summary.
+	PostSummaryHooks []PostSummaryHook
 }
 
+// FullSummaryStrategy rewrites older context into a ContextSummary checkpoint
+// while keeping a recent suffix of messages verbatim.
 type FullSummaryStrategy struct {
 	cfg FullSummaryConfig
 }
 
+// NewFullSummary constructs the terminal summary strategy used when lighter
+// rewrites are insufficient. Model is required for actual summarization.
 func NewFullSummary(cfg FullSummaryConfig) *FullSummaryStrategy {
 	if cfg.KeepRecentTokens <= 0 {
 		cfg.KeepRecentTokens = defaultKeepRecentTokens
@@ -38,8 +50,10 @@ func (s *FullSummaryStrategy) ForceApply(ctx context.Context, _ []agentcore.Agen
 	return s.apply(ctx, view, budget, true)
 }
 
-func (s *FullSummaryStrategy) SetPostCompactHooks(hooks ...PostCompactHook) {
-	s.cfg.PostCompactHooks = hooks
+// SetPostSummaryHooks replaces the hook list used to inject lightweight
+// reminder messages after a summary checkpoint is produced.
+func (s *FullSummaryStrategy) SetPostSummaryHooks(hooks ...PostSummaryHook) {
+	s.cfg.PostSummaryHooks = hooks
 }
 
 func (s *FullSummaryStrategy) apply(ctx context.Context, view []agentcore.AgentMessage, budget Budget, force bool) ([]agentcore.AgentMessage, StrategyResult, error) {
@@ -57,13 +71,11 @@ func (s *FullSummaryStrategy) apply(ctx context.Context, view []agentcore.AgentM
 		reserve = 1
 	}
 
-	cfg := CompactionConfig{
-		Model:                  s.cfg.Model,
-		ContextWindow:          ctxWindow,
-		ReserveTokens:          reserve,
-		KeepRecentTokens:       s.cfg.KeepRecentTokens,
-		MaxConsecutiveFailures: 0,
-		StripImages:            s.cfg.StripImages,
+	cfg := summaryRunConfig{
+		Model:            s.cfg.Model,
+		ContextWindow:    ctxWindow,
+		ReserveTokens:    reserve,
+		KeepRecentTokens: s.cfg.KeepRecentTokens,
 	}
 	stripImages := true
 	if s.cfg.StripImages != nil {
@@ -74,7 +86,7 @@ func (s *FullSummaryStrategy) apply(ctx context.Context, view []agentcore.AgentM
 	if err != nil {
 		return nil, StrategyResult{Name: s.Name()}, err
 	}
-	if info == nil || !containsCompactionSummary(next) {
+	if info == nil || !containsContextSummary(next) {
 		return view, StrategyResult{Name: s.Name()}, nil
 	}
 
@@ -96,14 +108,14 @@ func (s *FullSummaryStrategy) apply(ctx context.Context, view []agentcore.AgentM
 	}, nil
 }
 
-func (s *FullSummaryStrategy) applyHooks(ctx context.Context, msgs []agentcore.AgentMessage, info CompactionInfo) ([]agentcore.AgentMessage, error) {
-	if len(s.cfg.PostCompactHooks) == 0 || len(msgs) == 0 {
+func (s *FullSummaryStrategy) applyHooks(ctx context.Context, msgs []agentcore.AgentMessage, info SummaryInfo) ([]agentcore.AgentMessage, error) {
+	if len(s.cfg.PostSummaryHooks) == 0 || len(msgs) == 0 {
 		return msgs, nil
 	}
 	kept := append([]agentcore.AgentMessage(nil), msgs[1:]...)
 	var injected []agentcore.AgentMessage
 	var err error
-	for _, hook := range s.cfg.PostCompactHooks {
+	for _, hook := range s.cfg.PostSummaryHooks {
 		var extra []agentcore.AgentMessage
 		extra, err = hook(ctx, info, kept)
 		if err != nil {
@@ -121,9 +133,9 @@ func (s *FullSummaryStrategy) applyHooks(ctx context.Context, msgs []agentcore.A
 	return out, nil
 }
 
-func containsCompactionSummary(msgs []agentcore.AgentMessage) bool {
+func containsContextSummary(msgs []agentcore.AgentMessage) bool {
 	for _, msg := range msgs {
-		if _, ok := msg.(CompactionSummary); ok {
+		if _, ok := msg.(ContextSummary); ok {
 			return true
 		}
 	}

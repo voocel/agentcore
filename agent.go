@@ -76,6 +76,11 @@ type Agent struct {
 }
 
 // NewAgent creates a new Agent with the given options.
+//
+// When a ContextManager is set, the agent automatically wires ConvertToLLM and
+// ContextEstimate from the manager if the manager implements the optional
+// ContextLLMConverter and/or ContextEstimator interfaces — no need to set them
+// manually.
 func NewAgent(opts ...AgentOption) *Agent {
 	a := &Agent{
 		maxTurns:         defaultMaxTurns,
@@ -88,6 +93,25 @@ func NewAgent(opts ...AgentOption) *Agent {
 	}
 	for _, opt := range opts {
 		opt(a)
+	}
+	// Auto-wire ConvertToLLM and ContextEstimate from ContextManager if
+	// the manager provides them and the user hasn't set them explicitly.
+	if a.contextManager != nil {
+		if a.convertToLLM == nil {
+			if c, ok := a.contextManager.(ContextLLMConverter); ok {
+				a.convertToLLM = c.ConvertToLLM
+			}
+		}
+		if a.contextEstimateFn == nil {
+			if e, ok := a.contextManager.(ContextEstimator); ok {
+				a.contextEstimateFn = e.EstimateContext
+			}
+		}
+		if a.contextWindow <= 0 {
+			if w, ok := a.contextManager.(ContextWindower); ok {
+				a.contextWindow = w.ContextWindow()
+			}
+		}
 	}
 	return a
 }

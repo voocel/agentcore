@@ -1,4 +1,4 @@
-package memory
+package context
 
 import (
 	"context"
@@ -307,7 +307,7 @@ func serializeConversation(msgs []agentcore.AgentMessage) string {
 					parts = append(parts, "[Tool result]: "+content)
 				}
 			}
-		case CompactionSummary:
+		case ContextSummary:
 			parts = append(parts, "[Previous summary]: "+v.Summary)
 		}
 	}

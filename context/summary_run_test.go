@@ -1,4 +1,4 @@
-package memory
+package context
 
 import (
 	"context"
@@ -85,29 +85,63 @@ func TestExtractFileOps_DeduplicatesAndSeparates(t *testing.T) {
 	}
 }
 
-func TestCompactionConvertToLLM_WrapsSummary(t *testing.T) {
-	msgs := []agentcore.AgentMessage{
-		CompactionSummary{
-			Summary:       "summary body",
-			TokensBefore:  42,
-			ReadFiles:     []string{"a.go"},
-			ModifiedFiles: []string{"b.go"},
+func TestRunSummaryCompaction_CompactsAndPreservesRecentMessages(t *testing.T) {
+	model := stubModel{
+		generate: func(ctx context.Context, messages []agentcore.Message, tools []agentcore.ToolSpec, opts ...agentcore.CallOption) (*agentcore.LLMResponse, error) {
+			return &agentcore.LLMResponse{
+				Message: agentcore.Message{
+					Role:    agentcore.RoleAssistant,
+					Content: []agentcore.ContentBlock{agentcore.TextBlock("摘要内容")},
+				},
+			}, nil
 		},
-		agentcore.UserMsg("keep me"),
 	}
 
-	out := CompactionConvertToLLM(msgs)
+	cfg := summaryRunConfig{
+		Model:            model,
+		ContextWindow:    16,
+		ReserveTokens:    4,
+		KeepRecentTokens: 1,
+	}
+
+	msgs := []agentcore.AgentMessage{
+		agentcore.UserMsg(strings.Repeat("a", 80)),
+		agentcore.Message{
+			Role: agentcore.RoleAssistant,
+			Content: []agentcore.ContentBlock{
+				agentcore.ToolCallBlock(agentcore.ToolCall{ID: "1", Name: "read", Args: []byte(`{"path":"old.go"}`)}),
+				agentcore.ToolCallBlock(agentcore.ToolCall{ID: "2", Name: "edit", Args: []byte(`{"path":"new.go"}`)}),
+			},
+		},
+		agentcore.UserMsg("keep"),
+	}
+
+	out, info, err := runSummaryCompaction(context.Background(), cfg, msgs, true)
+	if err != nil {
+		t.Fatalf("unexpected compaction error: %v", err)
+	}
+	if info == nil {
+		t.Fatal("expected compaction info")
+	}
 	if len(out) != 2 {
-		t.Fatalf("expected 2 messages, got %d", len(out))
+		t.Fatalf("expected compacted summary + recent message, got %d entries", len(out))
 	}
-	if out[0].Role != agentcore.RoleUser {
-		t.Fatalf("expected wrapped summary role=user, got %s", out[0].Role)
+
+	summary, ok := out[0].(ContextSummary)
+	if !ok {
+		t.Fatalf("expected first message to be ContextSummary, got %T", out[0])
 	}
-	if got := out[0].TextContent(); !strings.Contains(got, "<context-summary>\nsummary body\n</context-summary>") {
-		t.Fatalf("unexpected wrapped summary: %q", got)
+	if !strings.Contains(summary.Summary, "摘要内容") {
+		t.Fatalf("expected generated summary content, got %q", summary.Summary)
 	}
-	if got := out[0].Metadata["type"]; got != "compaction_summary" {
-		t.Fatalf("expected compaction metadata marker, got %v", got)
+	if !strings.Contains(summary.Summary, "<read-files>\nold.go\n</read-files>") {
+		t.Fatalf("expected read file section, got %q", summary.Summary)
+	}
+	if !strings.Contains(summary.Summary, "<modified-files>\nnew.go\n</modified-files>") {
+		t.Fatalf("expected modified file section, got %q", summary.Summary)
+	}
+	if out[1].TextContent() != "keep" {
+		t.Fatalf("expected recent message to be preserved, got %q", out[1].TextContent())
 	}
 }
 
@@ -133,62 +167,5 @@ func TestEstimateContextTokens_UsesLastAssistantUsage(t *testing.T) {
 	}
 	if estimate.Tokens != estimate.UsageTokens+estimate.TrailingTokens {
 		t.Fatalf("unexpected total tokens: %+v", estimate)
-	}
-}
-
-func TestNewCompaction_CompactsAndPreservesRecentMessages(t *testing.T) {
-	model := stubModel{
-		generate: func(ctx context.Context, messages []agentcore.Message, tools []agentcore.ToolSpec, opts ...agentcore.CallOption) (*agentcore.LLMResponse, error) {
-			return &agentcore.LLMResponse{
-				Message: agentcore.Message{
-					Role:    agentcore.RoleAssistant,
-					Content: []agentcore.ContentBlock{agentcore.TextBlock("摘要内容")},
-				},
-			}, nil
-		},
-	}
-
-	transform := NewCompaction(CompactionConfig{
-		Model:            model,
-		ContextWindow:    16,
-		ReserveTokens:    4,
-		KeepRecentTokens: 1,
-	})
-
-	msgs := []agentcore.AgentMessage{
-		agentcore.UserMsg(strings.Repeat("a", 80)),
-		agentcore.Message{
-			Role: agentcore.RoleAssistant,
-			Content: []agentcore.ContentBlock{
-				agentcore.ToolCallBlock(agentcore.ToolCall{ID: "1", Name: "read", Args: []byte(`{"path":"old.go"}`)}),
-				agentcore.ToolCallBlock(agentcore.ToolCall{ID: "2", Name: "edit", Args: []byte(`{"path":"new.go"}`)}),
-			},
-		},
-		agentcore.UserMsg("keep"),
-	}
-
-	out, err := transform(context.Background(), msgs)
-	if err != nil {
-		t.Fatalf("unexpected compaction error: %v", err)
-	}
-	if len(out) != 2 {
-		t.Fatalf("expected compacted summary + recent message, got %d entries", len(out))
-	}
-
-	summary, ok := out[0].(CompactionSummary)
-	if !ok {
-		t.Fatalf("expected first message to be CompactionSummary, got %T", out[0])
-	}
-	if !strings.Contains(summary.Summary, "摘要内容") {
-		t.Fatalf("expected generated summary content, got %q", summary.Summary)
-	}
-	if !strings.Contains(summary.Summary, "<read-files>\nold.go\n</read-files>") {
-		t.Fatalf("expected read file section, got %q", summary.Summary)
-	}
-	if !strings.Contains(summary.Summary, "<modified-files>\nnew.go\n</modified-files>") {
-		t.Fatalf("expected modified file section, got %q", summary.Summary)
-	}
-	if out[1].TextContent() != "keep" {
-		t.Fatalf("expected recent message to be preserved, got %q", out[1].TextContent())
 	}
 }

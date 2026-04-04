@@ -1,4 +1,4 @@
-package memory
+package context
 
 import (
 	"context"
@@ -73,6 +73,7 @@ func (s *ToolResultMicrocompactStrategy) Apply(_ context.Context, _ []agentcore.
 		}
 		next := msg
 		next.Content = []agentcore.ContentBlock{agentcore.TextBlock(s.cfg.ClearedMessage)}
+		next.Metadata = cloneMetadata(msg.Metadata)
 		if next.Metadata == nil {
 			next.Metadata = map[string]any{}
 		}
