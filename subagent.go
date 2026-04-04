@@ -521,6 +521,9 @@ func (t *SubAgentTool) runAgent(ctx context.Context, agentName, task string, mod
 					IsError: true,
 				})
 			}
+			if bg == nil {
+				reportSubagentContext(ctx, agentName, contextManager)
+			}
 		case EventMessageEnd:
 			if ev.Message == nil {
 				continue
@@ -559,6 +562,9 @@ func (t *SubAgentTool) runAgent(ctx context.Context, agentName, task string, mod
 						})
 					}
 				}
+				if bg == nil {
+					reportSubagentContext(ctx, agentName, contextManager)
+				}
 			}
 		case EventRetry:
 			if bg == nil && ev.RetryInfo != nil {
@@ -584,6 +590,53 @@ func (t *SubAgentTool) runAgent(ctx context.Context, agentName, task string, mod
 		return "(no output)", su, nil
 	}
 	return lastAssistantContent, su, nil
+}
+
+func reportSubagentContext(ctx context.Context, agentName string, mgr ContextManager) {
+	if mgr == nil {
+		return
+	}
+
+	var payload struct {
+		Tokens          int     `json:"tokens,omitempty"`
+		ContextWindow   int     `json:"context_window,omitempty"`
+		Percent         float64 `json:"percent,omitempty"`
+		Scope           string  `json:"scope,omitempty"`
+		Strategy        string  `json:"strategy,omitempty"`
+		ActiveMessages  int     `json:"active_messages,omitempty"`
+		SummaryMessages int     `json:"summary_messages,omitempty"`
+		CompactedCount  int     `json:"compacted_count,omitempty"`
+		KeptCount       int     `json:"kept_count,omitempty"`
+	}
+
+	if usage := mgr.Usage(); usage != nil {
+		payload.Tokens = usage.Tokens
+		payload.ContextWindow = usage.ContextWindow
+		payload.Percent = usage.Percent
+	}
+	if snap := mgr.Snapshot(); snap != nil {
+		payload.Scope = snap.Scope
+		payload.Strategy = snap.LastStrategy
+		payload.ActiveMessages = snap.ActiveMessages
+		payload.SummaryMessages = snap.SummaryMessages
+		payload.CompactedCount = snap.LastCompactedCount
+		payload.KeptCount = snap.LastKeptCount
+		if payload.Tokens == 0 && snap.Usage != nil {
+			payload.Tokens = snap.Usage.Tokens
+			payload.ContextWindow = snap.Usage.ContextWindow
+			payload.Percent = snap.Usage.Percent
+		}
+	}
+
+	meta, err := json.Marshal(payload)
+	if err != nil {
+		return
+	}
+	ReportToolProgress(ctx, ProgressPayload{
+		Kind:  ProgressContext,
+		Agent: agentName,
+		Meta:  meta,
+	})
 }
 
 func boolToInt(b bool) int {

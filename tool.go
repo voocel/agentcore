@@ -25,6 +25,7 @@ const (
 	ProgressToolError   ProgressPayloadKind = "tool_error"
 	ProgressTurnCounter ProgressPayloadKind = "turn_counter"
 	ProgressRetry       ProgressPayloadKind = "retry"
+	ProgressContext     ProgressPayloadKind = "context"
 )
 
 // ProgressPayload is the structured progress envelope emitted by tools.

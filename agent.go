@@ -368,6 +368,28 @@ func (a *Agent) ContextUsage() *ContextUsage {
 	}
 }
 
+// ContextSnapshot returns the latest context-manager snapshot for observability.
+// Returns nil when no ContextManager is configured or no snapshot is available.
+func (a *Agent) ContextSnapshot() *ContextSnapshot {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+
+	if a.contextManager == nil {
+		return nil
+	}
+	snap := a.contextManager.Snapshot()
+	if snap == nil {
+		return nil
+	}
+
+	out := *snap
+	if snap.Usage != nil {
+		usage := *snap.Usage
+		out.Usage = &usage
+	}
+	return &out
+}
+
 // TotalUsage returns the cumulative token usage across all turns.
 func (a *Agent) TotalUsage() Usage {
 	a.mu.Lock()
