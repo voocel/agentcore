@@ -49,6 +49,49 @@ func TestContextEngineProjectUpdatesUsageFromProjectedView(t *testing.T) {
 	if usage.Tokens != want {
 		t.Fatalf("expected usage tokens=%d, got %d", want, usage.Tokens)
 	}
+
+	snapshot := engine.Snapshot()
+	if snapshot == nil || snapshot.BaselineUsage == nil {
+		t.Fatal("expected baseline usage snapshot")
+	}
+	baselineWant := EstimateContextTokens(msgs).Tokens
+	if snapshot.BaselineUsage.Tokens != baselineWant {
+		t.Fatalf("expected baseline usage tokens=%d, got %d", baselineWant, snapshot.BaselineUsage.Tokens)
+	}
+}
+
+func TestContextEngineProjectCanRequestCommittedRewrite(t *testing.T) {
+	engine := NewEngine(EngineConfig{
+		ContextWindow:   1024,
+		CommitOnProject: true,
+		Strategies: []Strategy{
+			NewLightTrim(LightTrimConfig{
+				KeepRecent:    1,
+				TextThreshold: 100,
+				PreserveHead:  20,
+				PreserveTail:  10,
+			}),
+		},
+	})
+
+	msgs := []agentcore.AgentMessage{
+		agentcore.UserMsg(strings.Repeat("a", 800)),
+		agentcore.UserMsg("recent"),
+	}
+
+	proj, err := engine.Project(context.Background(), msgs)
+	if err != nil {
+		t.Fatalf("project failed: %v", err)
+	}
+	if !proj.ShouldCommit {
+		t.Fatal("expected project to request commit")
+	}
+	if len(proj.CommitMessages) != len(proj.Messages) {
+		t.Fatalf("expected commit messages to mirror projected view, got %d vs %d", len(proj.CommitMessages), len(proj.Messages))
+	}
+	if proj.CommitMessages[0].TextContent() == msgs[0].TextContent() {
+		t.Fatal("expected committed projection to be trimmed")
+	}
 }
 
 func TestContextEngineCompactProducesCommittedSummaryWithHooks(t *testing.T) {

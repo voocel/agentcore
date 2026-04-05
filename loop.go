@@ -449,6 +449,15 @@ func callLLM(ctx context.Context, agentCtx *AgentContext, config LoopConfig, ch 
 		if err != nil {
 			return Message{}, llmCallInfo{}, fmt.Errorf("project context: %w", err)
 		}
+		if projection.ShouldCommit && len(projection.CommitMessages) > 0 {
+			if config.CommitContext != nil {
+				if err := config.CommitContext(projection.CommitMessages, projection.Usage); err != nil {
+					return Message{}, llmCallInfo{}, fmt.Errorf("project context commit failed: %w", err)
+				}
+			}
+			agentCtx.Messages = copyMessages(projection.CommitMessages)
+			messages = copyMessages(projection.CommitMessages)
+		}
 		if projection.Messages != nil {
 			messages = projection.Messages
 		}

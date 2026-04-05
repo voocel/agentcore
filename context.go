@@ -14,20 +14,27 @@ const (
 )
 
 // ContextProjection is the prompt view projected for a single LLM call.
-// The projection does not modify the runtime message baseline by itself.
+// By default the projection does not modify the runtime message baseline.
+// When ShouldCommit is true, CommitMessages should replace the runtime
+// baseline before continuing the current call.
 type ContextProjection struct {
-	Messages []AgentMessage
-	Usage    *ContextUsage
+	Messages       []AgentMessage
+	Usage          *ContextUsage
+	CommitMessages []AgentMessage
+	ShouldCommit   bool
 }
 
-// ContextSnapshot describes the current active context view plus the most
-// recent rewrite details remembered by the manager.
+// ContextSnapshot describes both the runtime baseline and the current active
+// context view, plus the most recent rewrite details remembered by the
+// manager.
 //
 // Snapshot is meant for debugging, observability, and UI surfaces such as
-// /context. It reports the active view currently remembered by the manager,
+// /context. BaselineUsage always reflects the caller's current runtime message
+// baseline. Usage reports the active view currently remembered by the manager,
 // which may be the baseline runtime messages, a projected prompt view, or a
 // recovered/committed view depending on the most recent operation.
 type ContextSnapshot struct {
+	BaselineUsage      *ContextUsage
 	Usage              *ContextUsage
 	Scope              string
 	TranscriptMessages int

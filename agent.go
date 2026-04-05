@@ -368,6 +368,35 @@ func (a *Agent) ContextUsage() *ContextUsage {
 	}
 }
 
+// BaselineContextUsage returns the current runtime baseline occupancy.
+// Unlike ContextUsage, this never reports a transient projected view.
+func (a *Agent) BaselineContextUsage() *ContextUsage {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+
+	if a.contextManager != nil {
+		if snap := a.contextManager.Snapshot(); snap != nil && snap.BaselineUsage != nil {
+			cp := *snap.BaselineUsage
+			return &cp
+		}
+	}
+
+	if a.contextWindow <= 0 || a.contextEstimateFn == nil {
+		return nil
+	}
+
+	tokens, usageTokens, trailingTokens := a.contextEstimateFn(a.messages)
+	pct := float64(tokens) / float64(a.contextWindow) * 100
+
+	return &ContextUsage{
+		Tokens:         tokens,
+		ContextWindow:  a.contextWindow,
+		Percent:        pct,
+		UsageTokens:    usageTokens,
+		TrailingTokens: trailingTokens,
+	}
+}
+
 // ContextSnapshot returns the latest context-manager snapshot for observability.
 // Returns nil when no ContextManager is configured or no snapshot is available.
 func (a *Agent) ContextSnapshot() *ContextSnapshot {
@@ -383,6 +412,10 @@ func (a *Agent) ContextSnapshot() *ContextSnapshot {
 	}
 
 	out := *snap
+	if snap.BaselineUsage != nil {
+		usage := *snap.BaselineUsage
+		out.BaselineUsage = &usage
+	}
 	if snap.Usage != nil {
 		usage := *snap.Usage
 		out.Usage = &usage

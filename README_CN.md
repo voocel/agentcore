@@ -25,7 +25,7 @@ go get github.com/voocel/agentcore
 agentcore/            Agent 核心（类型、循环、Agent、事件、SubAgent）
 agentcore/llm/        LLM 适配层（OpenAI, Anthropic, Gemini，基于 litellm）
 agentcore/tools/      内置工具：read, write, edit, bash
-agentcore/memory/     上下文压缩 —— 自动摘要长对话
+agentcore/context/    上下文运行时 —— 投影、重写、溢出恢复
 ```
 
 核心设计：
@@ -35,7 +35,7 @@ agentcore/memory/     上下文压缩 —— 自动摘要长对话
 - **事件流** —— 单一 `<-chan Event` 输出，驱动任何 UI（TUI、Web、Slack、日志）
 - **两阶段管道** —— `TransformContext`（裁剪/注入）→ `ConvertToLLM`（过滤为 LLM 消息）
 - **SubAgent 工具**（`subagent.go`）—— 通过工具调用实现多 Agent，四种模式：single、parallel、chain、background
-- **上下文压缩**（`memory/`）—— 接近上下文窗口上限时自动摘要压缩
+- **上下文运行时**（`context/`）—— 接近上下文窗口上限时执行投影、正式重写与溢出恢复
 
 ## 快速开始
 
@@ -229,22 +229,27 @@ agent := agentcore.NewAgent(
 
 ### 上下文压缩
 
-对话历史接近上下文窗口上限时自动摘要压缩。通过 `TransformContext` 钩子接入，零侵入核心代码：
+对话历史接近上下文窗口上限时自动摘要压缩。现在推荐直接使用内置 `ContextManager`：
 
 ```go
-import "github.com/voocel/agentcore/memory"
+import (
+    "github.com/voocel/agentcore"
+    agentctx "github.com/voocel/agentcore/context"
+)
+
+engine := agentctx.NewDefaultEngine(model, 128000)
 
 agent := agentcore.NewAgent(
     agentcore.WithModel(model),
-    agentcore.WithTransformContext(memory.NewCompaction(memory.CompactionConfig{
-        Model:         model,
-        ContextWindow: 128000,
-    })),
-    agentcore.WithConvertToLLM(memory.CompactionConvertToLLM),
+    agentcore.WithContextManager(engine),
 )
 ```
 
-每次 LLM 调用前，compaction 检查总 token 数。当超出 `ContextWindow - ReserveTokens`（默认 16384）时：
+当 `ContextManager` 实现了相关可选能力接口时，`NewAgent` 会自动接入消息转换、token 估算和 context window，无需再手动配置。
+
+每次 LLM 调用前，`ContextManager` 会先构造下一次请求要看的投影视图。如果某次重写应该正式成为新的运行时基线，它可以返回 `ShouldCommit=true` 和 `CommitMessages`，循环会先替换内存里的基线消息，再继续运行。
+
+当使用量超出 `ContextWindow - ReserveTokens`（默认 16384）时，压缩会：
 
 1. 保留最近消息（默认 20000 tokens）
 2. 通过 LLM 将旧消息摘要为结构化检查点（Goal / Progress / Key Decisions / Next Steps）
@@ -252,6 +257,8 @@ agent := agentcore.NewAgent(
 4. 支持增量更新 —— 后续压缩基于已有摘要更新，而非重新总结
 
 ### 上下文管道
+
+如果只是简单的 transform-only 管道，`WithContextPipeline` / `WithTransformContext` 仍然可用：
 
 ```go
 agent := agentcore.NewAgent(

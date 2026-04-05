@@ -68,7 +68,8 @@ type LoopConfig struct {
 	ConvertToLLM     func(msgs []AgentMessage) []Message
 
 	// CommitContext replaces the runtime message baseline after an explicit
-	// committed compaction or committed overflow recovery.
+	// committed compaction, a committed projection rewrite, or committed
+	// overflow recovery.
 	CommitContext func(msgs []AgentMessage, usage *ContextUsage) error
 
 	// PermissionEngine is called after validation/preview and before execution.

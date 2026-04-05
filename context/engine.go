@@ -28,6 +28,9 @@ type EngineConfig struct {
 	ReserveTokens int
 	// Strategies are applied in order until the projected view fits.
 	Strategies []Strategy
+	// CommitOnProject makes threshold-triggered Project rewrites replace the
+	// runtime baseline before the current call continues.
+	CommitOnProject bool
 	// OnProject is called when Project rewrites the prompt view.
 	OnProject func(RewriteEvent)
 	// OnRecover is called when RecoverOverflow rewrites the prompt view.
@@ -41,6 +44,7 @@ type RewriteEvent struct {
 	Reason       string
 	Strategy     string
 	Changed      bool
+	Committed    bool
 	TokensBefore int
 	TokensAfter  int
 	Info         *SummaryInfo
@@ -53,6 +57,7 @@ type ContextEngine struct {
 
 	mu         sync.Mutex
 	transcript []agentcore.AgentMessage
+	baseline   *agentcore.ContextUsage
 	lastUsage  *agentcore.ContextUsage
 	lastView   []agentcore.AgentMessage
 	lastScope  string
@@ -119,6 +124,7 @@ func (e *ContextEngine) Sync(msgs []agentcore.AgentMessage) {
 	e.lastView = copyMessages(msgs)
 	e.lastScope = "baseline"
 	cp := usage
+	e.baseline = &cp
 	e.lastUsage = &cp
 }
 
@@ -141,6 +147,11 @@ func (e *ContextEngine) Snapshot() *agentcore.ContextSnapshot {
 		return nil
 	}
 
+	var baseline *agentcore.ContextUsage
+	if e.baseline != nil {
+		cp := *e.baseline
+		baseline = &cp
+	}
 	var usage *agentcore.ContextUsage
 	if e.lastUsage != nil {
 		cp := *e.lastUsage
@@ -148,6 +159,7 @@ func (e *ContextEngine) Snapshot() *agentcore.ContextSnapshot {
 	}
 	counts := summarizeContextView(e.lastView)
 	return &agentcore.ContextSnapshot{
+		BaselineUsage:      baseline,
 		Usage:              usage,
 		Scope:              e.lastScope,
 		TranscriptMessages: len(e.transcript),
@@ -177,15 +189,21 @@ func (e *ContextEngine) Project(ctx context.Context, msgs []agentcore.AgentMessa
 			Reason:       "threshold",
 			Strategy:     strategy,
 			Changed:      true,
+			Committed:    changed && e.cfg.CommitOnProject,
 			TokensBefore: EstimateTotal(msgs),
 			TokensAfter:  EstimateTotal(view),
 			Info:         info,
 		})
 	}
-	return agentcore.ContextProjection{
+	proj := agentcore.ContextProjection{
 		Messages: view,
 		Usage:    usage,
-	}, nil
+	}
+	if changed && e.cfg.CommitOnProject {
+		proj.CommitMessages = copyMessages(view)
+		proj.ShouldCommit = true
+	}
+	return proj, nil
 }
 
 // Compact performs a forced rewrite suitable for explicit committed actions
@@ -223,6 +241,7 @@ func (e *ContextEngine) RecoverOverflow(ctx context.Context, msgs []agentcore.Ag
 			Reason:       "overflow",
 			Strategy:     strategy,
 			Changed:      true,
+			Committed:    changed,
 			TokensBefore: EstimateTotal(msgs),
 			TokensAfter:  EstimateTotal(view),
 			Info:         info,

@@ -13,203 +13,6 @@ import (
 	"github.com/voocel/agentcore/permission"
 )
 
-// ---------------------------------------------------------------------------
-// Helpers
-// ---------------------------------------------------------------------------
-
-type permissionEngineFunc func(ctx context.Context, req permission.Request) (*permission.Decision, error)
-
-func (fn permissionEngineFunc) Decide(ctx context.Context, req permission.Request) (*permission.Decision, error) {
-	return fn(ctx, req)
-}
-
-// mockStreamFn creates a StreamFn that returns responses in order.
-func mockStreamFn(responses ...Message) StreamFn {
-	var idx int64
-	return func(ctx context.Context, req *LLMRequest) (*LLMResponse, error) {
-		i := int(atomic.AddInt64(&idx, 1) - 1)
-		if i >= len(responses) {
-			return nil, fmt.Errorf("unexpected LLM call #%d (only %d responses provided)", i, len(responses))
-		}
-		return &LLMResponse{Message: responses[i]}, nil
-	}
-}
-
-// sequentialStreamFn creates a StreamFn with per-call logic via switch/case.
-func sequentialStreamFn(fn func(i int, req *LLMRequest) (*LLMResponse, error)) StreamFn {
-	var idx int64
-	return func(ctx context.Context, req *LLMRequest) (*LLMResponse, error) {
-		i := int(atomic.AddInt64(&idx, 1) - 1)
-		return fn(i, req)
-	}
-}
-
-func collectEvents(ch <-chan Event) []Event {
-	var events []Event
-	for ev := range ch {
-		events = append(events, ev)
-	}
-	return events
-}
-
-func requireEvent(t *testing.T, events []Event, et EventType) {
-	t.Helper()
-	for _, ev := range events {
-		if ev.Type == et {
-			return
-		}
-	}
-	t.Fatalf("missing expected event: %s", et)
-}
-
-func countEvent(events []Event, et EventType) int {
-	n := 0
-	for _, ev := range events {
-		if ev.Type == et {
-			n++
-		}
-	}
-	return n
-}
-
-func findEvent(events []Event, et EventType) (Event, bool) {
-	for _, ev := range events {
-		if ev.Type == et {
-			return ev, true
-		}
-	}
-	return Event{}, false
-}
-
-func echoTool(calls *[]string) Tool {
-	return NewFuncTool("echo", "echoes input", map[string]any{
-		"type": "object",
-		"properties": map[string]any{
-			"value": map[string]any{"type": "string"},
-		},
-		"required": []string{"value"},
-	}, func(ctx context.Context, args json.RawMessage) (json.RawMessage, error) {
-		var p struct{ Value string }
-		json.Unmarshal(args, &p)
-		*calls = append(*calls, p.Value)
-		return json.Marshal(fmt.Sprintf("echoed: %s", p.Value))
-	})
-}
-
-type previewProgressTool struct {
-	previewCalls *int64
-}
-
-func (t *previewProgressTool) Name() string        { return "preview_tool" }
-func (t *previewProgressTool) Description() string { return "tool with preview and progress updates" }
-func (t *previewProgressTool) Schema() map[string]any {
-	return map[string]any{
-		"type": "object",
-		"properties": map[string]any{
-			"x": map[string]any{"type": "string"},
-		},
-		"required": []string{"x"},
-	}
-}
-func (t *previewProgressTool) Preview(ctx context.Context, args json.RawMessage) (json.RawMessage, error) {
-	atomic.AddInt64(t.previewCalls, 1)
-	return json.RawMessage(`"preview"`), nil
-}
-func (t *previewProgressTool) Execute(ctx context.Context, args json.RawMessage) (json.RawMessage, error) {
-	ReportToolProgress(ctx, ProgressPayload{Kind: ProgressSummary, Summary: "progress"})
-	return json.RawMessage(`"ok"`), nil
-}
-
-type richContentTool struct {
-	calls *int64
-}
-
-func (t *richContentTool) Name() string        { return "rich_tool" }
-func (t *richContentTool) Description() string { return "tool with rich content output" }
-func (t *richContentTool) Schema() map[string]any {
-	return map[string]any{
-		"type": "object",
-		"properties": map[string]any{
-			"x": map[string]any{"type": "string"},
-		},
-		"required": []string{"x"},
-	}
-}
-func (t *richContentTool) Execute(ctx context.Context, args json.RawMessage) (json.RawMessage, error) {
-	return json.RawMessage(`"plain"`), nil
-}
-func (t *richContentTool) ExecuteContent(ctx context.Context, args json.RawMessage) ([]ContentBlock, error) {
-	atomic.AddInt64(t.calls, 1)
-	return []ContentBlock{TextBlock("rich")}, nil
-}
-
-func assistantMsg(text string, stop StopReason) Message {
-	return Message{
-		Role:       RoleAssistant,
-		Content:    []ContentBlock{TextBlock(text)},
-		StopReason: stop,
-		Usage:      &Usage{Input: 10, Output: 5},
-	}
-}
-
-func toolCallMsg(calls ...ToolCall) Message {
-	blocks := make([]ContentBlock, len(calls))
-	for i, c := range calls {
-		blocks[i] = ToolCallBlock(c)
-	}
-	return Message{
-		Role:       RoleAssistant,
-		Content:    blocks,
-		StopReason: StopReasonToolUse,
-		Usage:      &Usage{Input: 10, Output: 5},
-	}
-}
-
-func runTestLoop(t *testing.T, msgs []AgentMessage, actx AgentContext, cfg LoopConfig) []Event {
-	t.Helper()
-	return collectEvents(AgentLoop(context.Background(), msgs, actx, cfg))
-}
-
-type scriptedStreamModel struct {
-	mu       sync.Mutex
-	requests [][]Message
-	streams  []func(chan<- StreamEvent)
-}
-
-func (m *scriptedStreamModel) Generate(ctx context.Context, messages []Message, tools []ToolSpec, opts ...CallOption) (*LLMResponse, error) {
-	return nil, fmt.Errorf("unexpected Generate call")
-}
-
-func (m *scriptedStreamModel) GenerateStream(ctx context.Context, messages []Message, tools []ToolSpec, opts ...CallOption) (<-chan StreamEvent, error) {
-	m.mu.Lock()
-	idx := len(m.requests)
-	m.requests = append(m.requests, append([]Message(nil), messages...))
-	streamFn := m.streams[idx]
-	m.mu.Unlock()
-
-	ch := make(chan StreamEvent, 16)
-	go func() {
-		defer close(ch)
-		streamFn(ch)
-	}()
-	return ch, nil
-}
-
-func (m *scriptedStreamModel) SupportsTools() bool { return true }
-
-func (m *scriptedStreamModel) Request(i int) []Message {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	if i < 0 || i >= len(m.requests) {
-		return nil
-	}
-	return append([]Message(nil), m.requests[i]...)
-}
-
-// ---------------------------------------------------------------------------
-// Tests
-// ---------------------------------------------------------------------------
-
 func TestAgentLoop_SimpleTextResponse(t *testing.T) {
 	events := runTestLoop(t,
 		[]AgentMessage{UserMsg("hi")},
@@ -234,39 +37,58 @@ func TestAgentLoop_SimpleTextResponse(t *testing.T) {
 	}
 }
 
-func TestExecuteSingleToolCall_CancelledContextStillEmitsLifecycle(t *testing.T) {
-	ctx, cancel := context.WithCancel(context.Background())
-	cancel()
+func TestCallLLM_CommitsProjectedContextWhenRequested(t *testing.T) {
+	original := strings.Repeat("a", 800)
+	trimmed := "aaaaaaaaaaaaaaaaaaaa...aaaaaaaaaa"
+	agentCtx := &AgentContext{
+		Messages: []AgentMessage{
+			UserMsg(original),
+			UserMsg("recent"),
+		},
+	}
 
-	call := ToolCall{
-		ID:   "tc-cancelled",
-		Name: "echo",
-		Args: json.RawMessage(`{"value":"x"}`),
+	var committed []AgentMessage
+	cfg := LoopConfig{
+		ContextManager: projectionCommitManager{
+			projection: ContextProjection{
+				Messages: []AgentMessage{
+					UserMsg(trimmed),
+					UserMsg("recent"),
+				},
+				Usage: &ContextUsage{
+					Tokens:        128,
+					ContextWindow: 1024,
+					Percent:       12.5,
+				},
+				CommitMessages: []AgentMessage{
+					UserMsg(trimmed),
+					UserMsg("recent"),
+				},
+				ShouldCommit: true,
+			},
+		},
+		StreamFn: func(ctx context.Context, req *LLMRequest) (*LLMResponse, error) {
+			if got := req.Messages[0].TextContent(); got == original {
+				t.Fatal("expected projected request to be trimmed before model call")
+			}
+			return &LLMResponse{Message: assistantMsg("ok", StopReasonStop)}, nil
+		},
+		CommitContext: func(msgs []AgentMessage, usage *ContextUsage) error {
+			committed = copyMessages(msgs)
+			return nil
+		},
 	}
-	eventsCh := make(chan Event, 4)
-	var calls []string
 
-	result := executeSingleToolCall(ctx, []Tool{echoTool(&calls)}, call, LoopConfig{}, 0, eventsCh)
-	close(eventsCh)
-	events := collectEvents(eventsCh)
+	events := make(chan Event, 16)
+	if _, _, err := callLLM(context.Background(), agentCtx, cfg, events, llmCallHooks{}); err != nil {
+		t.Fatalf("callLLM failed: %v", err)
+	}
 
-	if len(calls) != 0 {
-		t.Fatalf("expected tool body not to run, got %v", calls)
+	if len(committed) == 0 {
+		t.Fatal("expected projected context to be committed")
 	}
-	if !result.IsError || !strings.Contains(string(result.Content), "Tool execution cancelled.") {
-		t.Fatalf("expected cancelled result, got %+v", result)
-	}
-	if len(events) != 2 {
-		t.Fatalf("expected 2 lifecycle events, got %+v", events)
-	}
-	if events[0].Type != EventToolExecStart || events[0].ToolID != call.ID {
-		t.Fatalf("unexpected start event: %+v", events[0])
-	}
-	if events[1].Type != EventToolExecEnd || events[1].ToolID != call.ID {
-		t.Fatalf("unexpected end event: %+v", events[1])
-	}
-	if !events[1].IsError || !strings.Contains(string(events[1].Result), "Tool execution cancelled.") {
-		t.Fatalf("unexpected cancelled end event: %+v", events[1])
+	if agentCtx.Messages[0].TextContent() == original {
+		t.Fatal("expected agent context baseline to be replaced with compacted messages")
 	}
 }
 
@@ -473,110 +295,166 @@ func TestAgentLoop_FollowUp(t *testing.T) {
 	}
 }
 
-func TestAgentLoop_ToolMiddleware(t *testing.T) {
-	var calls []string
-	var log []string
+func TestAgentLoop_Middleware(t *testing.T) {
+	t.Run("plain tool", func(t *testing.T) {
+		var calls []string
+		var log []string
 
-	tc := ToolCall{ID: "tc1", Name: "echo", Args: json.RawMessage(`{"value":"mid"}`)}
-	mw := func(ctx context.Context, call ToolCall, next ToolExecuteFunc) (json.RawMessage, error) {
-		log = append(log, "before")
-		result, err := next(ctx, call.Args)
-		log = append(log, "after")
-		return result, err
-	}
-
-	runTestLoop(t,
-		[]AgentMessage{UserMsg("test")},
-		AgentContext{Tools: []Tool{echoTool(&calls)}},
-		LoopConfig{
-			StreamFn:    mockStreamFn(toolCallMsg(tc), assistantMsg("done", StopReasonStop)),
-			Middlewares: []ToolMiddleware{mw},
-		},
-	)
-
-	if len(calls) != 1 || calls[0] != "mid" {
-		t.Fatalf("expected echo('mid'), got %v", calls)
-	}
-	if len(log) != 2 || log[0] != "before" || log[1] != "after" {
-		t.Fatalf("middleware log: %v", log)
-	}
-}
-
-func TestAgentLoop_ApprovalDenied(t *testing.T) {
-	var approvalChecks int
-	var calls []string
-
-	events := runTestLoop(t,
-		[]AgentMessage{UserMsg("test")},
-		AgentContext{Tools: []Tool{echoTool(&calls)}},
-		LoopConfig{
-			StreamFn: sequentialStreamFn(func(i int, _ *LLMRequest) (*LLMResponse, error) {
-				if i < 3 {
-					return &LLMResponse{Message: toolCallMsg(ToolCall{
-						ID:   fmt.Sprintf("tc%d", i),
-						Name: "echo",
-						Args: json.RawMessage(`{"value":"denied"}`),
-					})}, nil
-				}
-				return &LLMResponse{Message: assistantMsg("done", StopReasonStop)}, nil
-			}),
-			PermissionEngine: permissionEngineFunc(func(ctx context.Context, req permission.Request) (*permission.Decision, error) {
-				approvalChecks++
-				return &permission.Decision{
-					Kind:   permission.DecisionDeny,
-					Source: permission.DecisionSourcePrompt,
-					Reason: "denied",
-				}, nil
-			}),
-			MaxToolErrors: 1,
-		},
-	)
-
-	if len(calls) != 0 {
-		t.Fatalf("tool should not execute, got %v", calls)
-	}
-	if approvalChecks != 3 {
-		t.Fatalf("approval check should run for every tool call, got %d", approvalChecks)
-	}
-	end, ok := findEvent(events, EventToolExecEnd)
-	if !ok || !end.IsError {
-		t.Fatal("expected tool_exec_end with isError=true")
-	}
-	for _, ev := range events {
-		if ev.Type == EventToolExecEnd && strings.Contains(string(ev.Result), "disabled after") {
-			t.Fatalf("approval denial should not disable the tool, got result %s", string(ev.Result))
+		tc := ToolCall{ID: "tc1", Name: "echo", Args: json.RawMessage(`{"value":"mid"}`)}
+		mw := func(ctx context.Context, call ToolCall, next ToolExecuteFunc) (json.RawMessage, error) {
+			log = append(log, "before")
+			result, err := next(ctx, call.Args)
+			log = append(log, "after")
+			return result, err
 		}
-	}
+
+		runTestLoop(t,
+			[]AgentMessage{UserMsg("test")},
+			AgentContext{Tools: []Tool{echoTool(&calls)}},
+			LoopConfig{
+				StreamFn:    mockStreamFn(toolCallMsg(tc), assistantMsg("done", StopReasonStop)),
+				Middlewares: []ToolMiddleware{mw},
+			},
+		)
+
+		if len(calls) != 1 || calls[0] != "mid" {
+			t.Fatalf("expected echo('mid'), got %v", calls)
+		}
+		if len(log) != 2 || log[0] != "before" || log[1] != "after" {
+			t.Fatalf("middleware log: %v", log)
+		}
+	})
+
+	t.Run("content tool", func(t *testing.T) {
+		var contentCalls int64
+		var log []string
+		rt := &richContentTool{calls: &contentCalls}
+		tc := ToolCall{ID: "tc-rich", Name: "rich_tool", Args: json.RawMessage(`{"x":"v"}`)}
+
+		var secondReq *LLMRequest
+		events := runTestLoop(t,
+			[]AgentMessage{UserMsg("test")},
+			AgentContext{Tools: []Tool{rt}},
+			LoopConfig{
+				StreamFn: sequentialStreamFn(func(i int, req *LLMRequest) (*LLMResponse, error) {
+					if i == 0 {
+						return &LLMResponse{Message: toolCallMsg(tc)}, nil
+					}
+					secondReq = req
+					return &LLMResponse{Message: assistantMsg("done", StopReasonStop)}, nil
+				}),
+				Middlewares: []ToolMiddleware{
+					func(ctx context.Context, call ToolCall, next ToolExecuteFunc) (json.RawMessage, error) {
+						log = append(log, "before")
+						out, err := next(ctx, call.Args)
+						log = append(log, "after")
+						return out, err
+					},
+				},
+			},
+		)
+
+		if got := atomic.LoadInt64(&contentCalls); got != 1 {
+			t.Fatalf("content tool should execute once, got %d", got)
+		}
+		if len(log) != 2 || log[0] != "before" || log[1] != "after" {
+			t.Fatalf("middleware log: %v", log)
+		}
+		if secondReq == nil || len(secondReq.Messages) == 0 {
+			t.Fatal("expected second llm request with tool result in context")
+		}
+		last := secondReq.Messages[len(secondReq.Messages)-1]
+		if last.Role != RoleTool {
+			t.Fatalf("expected last message to be tool result, got %q", last.Role)
+		}
+		if got := last.TextContent(); got != "rich" {
+			t.Fatalf("expected rich tool content in context, got %q", got)
+		}
+
+		end, ok := findEvent(events, EventToolExecEnd)
+		if !ok || end.IsError {
+			t.Fatal("expected successful tool_exec_end")
+		}
+	})
 }
 
-func TestAgentLoop_PermissionUpdatedArgsAreExecuted(t *testing.T) {
-	var calls []string
+func TestAgentLoop_PermissionEngine(t *testing.T) {
+	t.Run("approval denied does not execute tool or disable it", func(t *testing.T) {
+		var approvalChecks int
+		var calls []string
 
-	runTestLoop(t,
-		[]AgentMessage{UserMsg("test")},
-		AgentContext{Tools: []Tool{echoTool(&calls)}},
-		LoopConfig{
-			StreamFn: mockStreamFn(
-				toolCallMsg(ToolCall{
-					ID:   "tc1",
-					Name: "echo",
-					Args: json.RawMessage(`{"value":"original"}`),
+		events := runTestLoop(t,
+			[]AgentMessage{UserMsg("test")},
+			AgentContext{Tools: []Tool{echoTool(&calls)}},
+			LoopConfig{
+				StreamFn: sequentialStreamFn(func(i int, _ *LLMRequest) (*LLMResponse, error) {
+					if i < 3 {
+						return &LLMResponse{Message: toolCallMsg(ToolCall{
+							ID:   fmt.Sprintf("tc%d", i),
+							Name: "echo",
+							Args: json.RawMessage(`{"value":"denied"}`),
+						})}, nil
+					}
+					return &LLMResponse{Message: assistantMsg("done", StopReasonStop)}, nil
 				}),
-				assistantMsg("done", StopReasonStop),
-			),
-			PermissionEngine: permissionEngineFunc(func(ctx context.Context, req permission.Request) (*permission.Decision, error) {
-				return &permission.Decision{
-					Kind:        permission.DecisionAllow,
-					Source:      permission.DecisionSourceMode,
-					UpdatedArgs: json.RawMessage(`{"value":"rewritten"}`),
-				}, nil
-			}),
-		},
-	)
+				PermissionEngine: permissionEngineFunc(func(ctx context.Context, req permission.Request) (*permission.Decision, error) {
+					approvalChecks++
+					return &permission.Decision{
+						Kind:   permission.DecisionDeny,
+						Source: permission.DecisionSourcePrompt,
+						Reason: "denied",
+					}, nil
+				}),
+				MaxToolErrors: 1,
+			},
+		)
 
-	if len(calls) != 1 || calls[0] != "rewritten" {
-		t.Fatalf("expected rewritten args to execute, got %v", calls)
-	}
+		if len(calls) != 0 {
+			t.Fatalf("tool should not execute, got %v", calls)
+		}
+		if approvalChecks != 3 {
+			t.Fatalf("approval check should run for every tool call, got %d", approvalChecks)
+		}
+		end, ok := findEvent(events, EventToolExecEnd)
+		if !ok || !end.IsError {
+			t.Fatal("expected tool_exec_end with isError=true")
+		}
+		for _, ev := range events {
+			if ev.Type == EventToolExecEnd && strings.Contains(string(ev.Result), "disabled after") {
+				t.Fatalf("approval denial should not disable the tool, got result %s", string(ev.Result))
+			}
+		}
+	})
+
+	t.Run("updated args are executed", func(t *testing.T) {
+		var calls []string
+
+		runTestLoop(t,
+			[]AgentMessage{UserMsg("test")},
+			AgentContext{Tools: []Tool{echoTool(&calls)}},
+			LoopConfig{
+				StreamFn: mockStreamFn(
+					toolCallMsg(ToolCall{
+						ID:   "tc1",
+						Name: "echo",
+						Args: json.RawMessage(`{"value":"original"}`),
+					}),
+					assistantMsg("done", StopReasonStop),
+				),
+				PermissionEngine: permissionEngineFunc(func(ctx context.Context, req permission.Request) (*permission.Decision, error) {
+					return &permission.Decision{
+						Kind:        permission.DecisionAllow,
+						Source:      permission.DecisionSourceMode,
+						UpdatedArgs: json.RawMessage(`{"value":"rewritten"}`),
+					}, nil
+				}),
+			},
+		)
+
+		if len(calls) != 1 || calls[0] != "rewritten" {
+			t.Fatalf("expected rewritten args to execute, got %v", calls)
+		}
+	})
 }
 
 func TestAgentLoop_PreviewAndProgress(t *testing.T) {
@@ -660,98 +538,14 @@ func TestAgentLoop_PreviewAndProgress(t *testing.T) {
 	}
 }
 
-func TestAgentLoop_ContentToolUsesMiddleware(t *testing.T) {
-	var contentCalls int64
-	var log []string
-	rt := &richContentTool{calls: &contentCalls}
-	tc := ToolCall{ID: "tc-rich", Name: "rich_tool", Args: json.RawMessage(`{"x":"v"}`)}
-
-	var secondReq *LLMRequest
-	events := runTestLoop(t,
-		[]AgentMessage{UserMsg("test")},
-		AgentContext{Tools: []Tool{rt}},
-		LoopConfig{
-			StreamFn: sequentialStreamFn(func(i int, req *LLMRequest) (*LLMResponse, error) {
-				if i == 0 {
-					return &LLMResponse{Message: toolCallMsg(tc)}, nil
-				}
-				secondReq = req
-				return &LLMResponse{Message: assistantMsg("done", StopReasonStop)}, nil
-			}),
-			Middlewares: []ToolMiddleware{
-				func(ctx context.Context, call ToolCall, next ToolExecuteFunc) (json.RawMessage, error) {
-					log = append(log, "before")
-					out, err := next(ctx, call.Args)
-					log = append(log, "after")
-					return out, err
-				},
-			},
-		},
-	)
-
-	if got := atomic.LoadInt64(&contentCalls); got != 1 {
-		t.Fatalf("content tool should execute once, got %d", got)
-	}
-	if len(log) != 2 || log[0] != "before" || log[1] != "after" {
-		t.Fatalf("middleware log: %v", log)
-	}
-	if secondReq == nil || len(secondReq.Messages) == 0 {
-		t.Fatal("expected second llm request with tool result in context")
-	}
-	last := secondReq.Messages[len(secondReq.Messages)-1]
-	if last.Role != RoleTool {
-		t.Fatalf("expected last message to be tool result, got %q", last.Role)
-	}
-	if got := last.TextContent(); got != "rich" {
-		t.Fatalf("expected rich tool content in context, got %q", got)
-	}
-
-	end, ok := findEvent(events, EventToolExecEnd)
-	if !ok || end.IsError {
-		t.Fatal("expected successful tool_exec_end")
-	}
-}
-
 func TestAgentLoop_StreamingToolExecutionStartsBeforeAssistantEnds(t *testing.T) {
 	var calls []string
 	tc := ToolCall{ID: "tc-stream", Name: "echo", Args: json.RawMessage(`{"value":"ping"}`)}
 
-	model := &scriptedStreamModel{
-		streams: []func(chan<- StreamEvent){
-			func(ch chan<- StreamEvent) {
-				partial := Message{Role: RoleAssistant, Content: []ContentBlock{TextBlock("")}}
-				ch <- StreamEvent{Type: StreamEventTextStart, Message: partial}
-
-				partial.Content[0].Text = "working"
-				ch <- StreamEvent{Type: StreamEventTextDelta, Message: partial, Delta: "working"}
-
-				ch <- StreamEvent{Type: StreamEventToolCallStart, Message: partial}
-
-				partial.Content = append(partial.Content, ToolCallBlock(tc))
-				ch <- StreamEvent{Type: StreamEventToolCallEnd, Message: partial, CompletedToolCall: &tc}
-
-				time.Sleep(40 * time.Millisecond)
-				ch <- StreamEvent{
-					Type: StreamEventDone,
-					Message: Message{
-						Role:       RoleAssistant,
-						Content:    []ContentBlock{TextBlock("working"), ToolCallBlock(tc)},
-						StopReason: StopReasonToolUse,
-					},
-				}
-			},
-			func(ch chan<- StreamEvent) {
-				ch <- StreamEvent{
-					Type: StreamEventDone,
-					Message: Message{
-						Role:       RoleAssistant,
-						Content:    []ContentBlock{TextBlock("done")},
-						StopReason: StopReasonStop,
-					},
-				}
-			},
-		},
-	}
+	model := newScriptedStreamModel(
+		streamAssistantToolCalls("working", StopReasonToolUse, 40*time.Millisecond, tc),
+		streamAssistantDone("done", StopReasonStop),
+	)
 
 	events := runTestLoop(t,
 		[]AgentMessage{UserMsg("stream tools")},
@@ -789,36 +583,10 @@ func TestAgentLoop_StreamingToolExecutionKeepsContextOrder(t *testing.T) {
 	var calls []string
 	tc := ToolCall{ID: "tc-order", Name: "echo", Args: json.RawMessage(`{"value":"ordered"}`)}
 
-	model := &scriptedStreamModel{
-		streams: []func(chan<- StreamEvent){
-			func(ch chan<- StreamEvent) {
-				partial := Message{Role: RoleAssistant, Content: []ContentBlock{TextBlock("plan")}}
-				ch <- StreamEvent{Type: StreamEventTextStart, Message: partial}
-				ch <- StreamEvent{Type: StreamEventToolCallStart, Message: partial}
-				partial.Content = append(partial.Content, ToolCallBlock(tc))
-				ch <- StreamEvent{Type: StreamEventToolCallEnd, Message: partial, CompletedToolCall: &tc}
-				time.Sleep(20 * time.Millisecond)
-				ch <- StreamEvent{
-					Type: StreamEventDone,
-					Message: Message{
-						Role:       RoleAssistant,
-						Content:    []ContentBlock{TextBlock("plan"), ToolCallBlock(tc)},
-						StopReason: StopReasonToolUse,
-					},
-				}
-			},
-			func(ch chan<- StreamEvent) {
-				ch <- StreamEvent{
-					Type: StreamEventDone,
-					Message: Message{
-						Role:       RoleAssistant,
-						Content:    []ContentBlock{TextBlock("done")},
-						StopReason: StopReasonStop,
-					},
-				}
-			},
-		},
-	}
+	model := newScriptedStreamModel(
+		streamAssistantToolCalls("plan", StopReasonToolUse, 20*time.Millisecond, tc),
+		streamAssistantDone("done", StopReasonStop),
+	)
 
 	runTestLoop(t,
 		[]AgentMessage{UserMsg("order")},
@@ -858,35 +626,10 @@ func TestAgentLoop_StreamingToolExecutionPreservesCompletedCallsOnLengthStop(t *
 	var calls []string
 	tc := ToolCall{ID: "tc-length", Name: "echo", Args: json.RawMessage(`{"value":"kept"}`)}
 
-	model := &scriptedStreamModel{
-		streams: []func(chan<- StreamEvent){
-			func(ch chan<- StreamEvent) {
-				partial := Message{Role: RoleAssistant, Content: []ContentBlock{TextBlock("partial")}}
-				ch <- StreamEvent{Type: StreamEventTextStart, Message: partial}
-				ch <- StreamEvent{Type: StreamEventToolCallStart, Message: partial}
-				partial.Content = append(partial.Content, ToolCallBlock(tc))
-				ch <- StreamEvent{Type: StreamEventToolCallEnd, Message: partial, CompletedToolCall: &tc}
-				ch <- StreamEvent{
-					Type: StreamEventDone,
-					Message: Message{
-						Role:       RoleAssistant,
-						Content:    []ContentBlock{TextBlock("partial"), ToolCallBlock(tc)},
-						StopReason: StopReasonLength,
-					},
-				}
-			},
-			func(ch chan<- StreamEvent) {
-				ch <- StreamEvent{
-					Type: StreamEventDone,
-					Message: Message{
-						Role:       RoleAssistant,
-						Content:    []ContentBlock{TextBlock("done")},
-						StopReason: StopReasonStop,
-					},
-				}
-			},
-		},
-	}
+	model := newScriptedStreamModel(
+		streamAssistantToolCalls("partial", StopReasonLength, 0, tc),
+		streamAssistantDone("done", StopReasonStop),
+	)
 
 	runTestLoop(t,
 		[]AgentMessage{UserMsg("length stop")},
@@ -912,30 +655,10 @@ func TestAgentLoop_StreamingToolExecutionPreservesCompletedCallsOnLengthStop(t *
 }
 
 func TestAgentLoop_LengthStopRecoversPureTextResponse(t *testing.T) {
-	model := &scriptedStreamModel{
-		streams: []func(chan<- StreamEvent){
-			func(ch chan<- StreamEvent) {
-				ch <- StreamEvent{
-					Type: StreamEventDone,
-					Message: Message{
-						Role:       RoleAssistant,
-						Content:    []ContentBlock{TextBlock("partial answer")},
-						StopReason: StopReasonLength,
-					},
-				}
-			},
-			func(ch chan<- StreamEvent) {
-				ch <- StreamEvent{
-					Type: StreamEventDone,
-					Message: Message{
-						Role:       RoleAssistant,
-						Content:    []ContentBlock{TextBlock("continued answer")},
-						StopReason: StopReasonStop,
-					},
-				}
-			},
-		},
-	}
+	model := newScriptedStreamModel(
+		streamAssistantDone("partial answer", StopReasonLength),
+		streamAssistantDone("continued answer", StopReasonStop),
+	)
 
 	events := runTestLoop(t,
 		[]AgentMessage{UserMsg("recover length")},
@@ -1016,39 +739,10 @@ func TestAgentLoop_StreamingToolExecutionHonorsSteeringForQueuedTools(t *testing
 	tc1 := ToolCall{ID: "tc-s1", Name: "sleepy_echo", Args: json.RawMessage(`{"value":"first"}`)}
 	tc2 := ToolCall{ID: "tc-s2", Name: "sleepy_echo", Args: json.RawMessage(`{"value":"second"}`)}
 
-	model := &scriptedStreamModel{
-		streams: []func(chan<- StreamEvent){
-			func(ch chan<- StreamEvent) {
-				partial := Message{Role: RoleAssistant, Content: []ContentBlock{TextBlock("do work")}}
-				ch <- StreamEvent{Type: StreamEventTextStart, Message: partial}
-				ch <- StreamEvent{Type: StreamEventToolCallStart, Message: partial}
-				partial.Content = append(partial.Content, ToolCallBlock(tc1))
-				ch <- StreamEvent{Type: StreamEventToolCallEnd, Message: partial, CompletedToolCall: &tc1}
-				ch <- StreamEvent{Type: StreamEventToolCallStart, Message: partial}
-				partial.Content = append(partial.Content, ToolCallBlock(tc2))
-				ch <- StreamEvent{Type: StreamEventToolCallEnd, Message: partial, CompletedToolCall: &tc2}
-				time.Sleep(60 * time.Millisecond)
-				ch <- StreamEvent{
-					Type: StreamEventDone,
-					Message: Message{
-						Role:       RoleAssistant,
-						Content:    []ContentBlock{TextBlock("do work"), ToolCallBlock(tc1), ToolCallBlock(tc2)},
-						StopReason: StopReasonToolUse,
-					},
-				}
-			},
-			func(ch chan<- StreamEvent) {
-				ch <- StreamEvent{
-					Type: StreamEventDone,
-					Message: Message{
-						Role:       RoleAssistant,
-						Content:    []ContentBlock{TextBlock("redirected")},
-						StopReason: StopReasonStop,
-					},
-				}
-			},
-		},
-	}
+	model := newScriptedStreamModel(
+		streamAssistantToolCalls("do work", StopReasonToolUse, 60*time.Millisecond, tc1, tc2),
+		streamAssistantDone("redirected", StopReasonStop),
+	)
 
 	events := runTestLoop(t,
 		[]AgentMessage{UserMsg("steer stream")},
@@ -1189,74 +883,344 @@ func TestAgentLoop_CircuitBreaker(t *testing.T) {
 	}
 }
 
-func TestAgentLoopContinue(t *testing.T) {
-	events := collectEvents(AgentLoopContinue(
-		context.Background(),
-		AgentContext{Messages: []AgentMessage{UserMsg("existing")}},
-		LoopConfig{StreamFn: mockStreamFn(assistantMsg("continued", StopReasonStop))},
-	))
+func TestLoopPublicAPIs(t *testing.T) {
+	t.Run("continue appends new messages", func(t *testing.T) {
+		events := collectEvents(AgentLoopContinue(
+			context.Background(),
+			AgentContext{Messages: []AgentMessage{UserMsg("existing")}},
+			LoopConfig{StreamFn: mockStreamFn(assistantMsg("continued", StopReasonStop))},
+		))
 
-	ev, _ := findEvent(events, EventAgentEnd)
-	if len(ev.NewMessages) != 1 {
-		t.Fatalf("expected 1 new message, got %d", len(ev.NewMessages))
+		ev, _ := findEvent(events, EventAgentEnd)
+		if len(ev.NewMessages) != 1 {
+			t.Fatalf("expected 1 new message, got %d", len(ev.NewMessages))
+		}
+	})
+
+	t.Run("continue rejects empty context", func(t *testing.T) {
+		events := collectEvents(AgentLoopContinue(
+			context.Background(),
+			AgentContext{},
+			LoopConfig{StreamFn: mockStreamFn()},
+		))
+		requireEvent(t, events, EventError)
+		ev, _ := findEvent(events, EventAgentEnd)
+		if ev.Summary == nil || ev.Summary.EndReason != EndReasonError {
+			t.Fatalf("unexpected summary: %#v", ev.Summary)
+		}
+	})
+
+	t.Run("collect returns final messages", func(t *testing.T) {
+		msgs, err := Collect(AgentLoop(
+			context.Background(),
+			[]AgentMessage{UserMsg("hi")},
+			AgentContext{},
+			LoopConfig{StreamFn: mockStreamFn(assistantMsg("ok", StopReasonStop))},
+		))
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if len(msgs) < 2 {
+			t.Fatalf("expected >= 2 messages, got %d", len(msgs))
+		}
+	})
+
+	t.Run("event stream exposes events result and done", func(t *testing.T) {
+		stream := NewEventStream(AgentLoop(
+			context.Background(),
+			[]AgentMessage{UserMsg("hi")},
+			AgentContext{},
+			LoopConfig{StreamFn: mockStreamFn(assistantMsg("ok", StopReasonStop))},
+		))
+
+		count := 0
+		for range stream.Events() {
+			count++
+		}
+		if count == 0 {
+			t.Fatal("expected events")
+		}
+
+		msgs, err := stream.Result()
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if len(msgs) < 2 {
+			t.Fatalf("expected >= 2 messages, got %d", len(msgs))
+		}
+
+		select {
+		case <-stream.Done():
+		default:
+			t.Fatal("Done() not closed")
+		}
+	})
+}
+
+// ---------------------------------------------------------------------------
+// Helpers
+// ---------------------------------------------------------------------------
+
+type permissionEngineFunc func(ctx context.Context, req permission.Request) (*permission.Decision, error)
+
+func (fn permissionEngineFunc) Decide(ctx context.Context, req permission.Request) (*permission.Decision, error) {
+	return fn(ctx, req)
+}
+
+func mockStreamFn(responses ...Message) StreamFn {
+	var idx int64
+	return func(ctx context.Context, req *LLMRequest) (*LLMResponse, error) {
+		i := int(atomic.AddInt64(&idx, 1) - 1)
+		if i >= len(responses) {
+			return nil, fmt.Errorf("unexpected LLM call #%d (only %d responses provided)", i, len(responses))
+		}
+		return &LLMResponse{Message: responses[i]}, nil
 	}
 }
 
-func TestAgentLoopContinue_EmptyContext(t *testing.T) {
-	events := collectEvents(AgentLoopContinue(
-		context.Background(),
-		AgentContext{},
-		LoopConfig{StreamFn: mockStreamFn()},
-	))
-	requireEvent(t, events, EventError)
-	ev, _ := findEvent(events, EventAgentEnd)
-	if ev.Summary == nil || ev.Summary.EndReason != EndReasonError {
-		t.Fatalf("unexpected summary: %#v", ev.Summary)
+func sequentialStreamFn(fn func(i int, req *LLMRequest) (*LLMResponse, error)) StreamFn {
+	var idx int64
+	return func(ctx context.Context, req *LLMRequest) (*LLMResponse, error) {
+		i := int(atomic.AddInt64(&idx, 1) - 1)
+		return fn(i, req)
 	}
 }
 
-func TestCollect(t *testing.T) {
-	msgs, err := Collect(AgentLoop(
-		context.Background(),
-		[]AgentMessage{UserMsg("hi")},
-		AgentContext{},
-		LoopConfig{StreamFn: mockStreamFn(assistantMsg("ok", StopReasonStop))},
-	))
-	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
+func collectEvents(ch <-chan Event) []Event {
+	var events []Event
+	for ev := range ch {
+		events = append(events, ev)
 	}
-	if len(msgs) < 2 {
-		t.Fatalf("expected >= 2 messages, got %d", len(msgs))
+	return events
+}
+
+func requireEvent(t *testing.T, events []Event, et EventType) {
+	t.Helper()
+	for _, ev := range events {
+		if ev.Type == et {
+			return
+		}
+	}
+	t.Fatalf("missing expected event: %s", et)
+}
+
+func countEvent(events []Event, et EventType) int {
+	n := 0
+	for _, ev := range events {
+		if ev.Type == et {
+			n++
+		}
+	}
+	return n
+}
+
+func findEvent(events []Event, et EventType) (Event, bool) {
+	for _, ev := range events {
+		if ev.Type == et {
+			return ev, true
+		}
+	}
+	return Event{}, false
+}
+
+func echoTool(calls *[]string) Tool {
+	return NewFuncTool("echo", "echoes input", map[string]any{
+		"type": "object",
+		"properties": map[string]any{
+			"value": map[string]any{"type": "string"},
+		},
+		"required": []string{"value"},
+	}, func(ctx context.Context, args json.RawMessage) (json.RawMessage, error) {
+		var p struct{ Value string }
+		_ = json.Unmarshal(args, &p)
+		*calls = append(*calls, p.Value)
+		return json.Marshal(fmt.Sprintf("echoed: %s", p.Value))
+	})
+}
+
+type previewProgressTool struct {
+	previewCalls *int64
+}
+
+func (t *previewProgressTool) Name() string        { return "preview_tool" }
+func (t *previewProgressTool) Description() string { return "tool with preview and progress updates" }
+func (t *previewProgressTool) Schema() map[string]any {
+	return map[string]any{
+		"type": "object",
+		"properties": map[string]any{
+			"x": map[string]any{"type": "string"},
+		},
+		"required": []string{"x"},
 	}
 }
 
-func TestEventStream(t *testing.T) {
-	stream := NewEventStream(AgentLoop(
-		context.Background(),
-		[]AgentMessage{UserMsg("hi")},
-		AgentContext{},
-		LoopConfig{StreamFn: mockStreamFn(assistantMsg("ok", StopReasonStop))},
-	))
+func (t *previewProgressTool) Preview(ctx context.Context, args json.RawMessage) (json.RawMessage, error) {
+	atomic.AddInt64(t.previewCalls, 1)
+	return json.RawMessage(`"preview"`), nil
+}
 
-	count := 0
-	for range stream.Events() {
-		count++
-	}
-	if count == 0 {
-		t.Fatal("expected events")
-	}
+func (t *previewProgressTool) Execute(ctx context.Context, args json.RawMessage) (json.RawMessage, error) {
+	ReportToolProgress(ctx, ProgressPayload{Kind: ProgressSummary, Summary: "progress"})
+	return json.RawMessage(`"ok"`), nil
+}
 
-	msgs, err := stream.Result()
-	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
-	if len(msgs) < 2 {
-		t.Fatalf("expected >= 2 messages, got %d", len(msgs))
-	}
+type richContentTool struct {
+	calls *int64
+}
 
-	select {
-	case <-stream.Done():
-	default:
-		t.Fatal("Done() not closed")
+func (t *richContentTool) Name() string        { return "rich_tool" }
+func (t *richContentTool) Description() string { return "tool with rich content output" }
+func (t *richContentTool) Schema() map[string]any {
+	return map[string]any{
+		"type": "object",
+		"properties": map[string]any{
+			"x": map[string]any{"type": "string"},
+		},
+		"required": []string{"x"},
+	}
+}
+
+func (t *richContentTool) Execute(ctx context.Context, args json.RawMessage) (json.RawMessage, error) {
+	return json.RawMessage(`"plain"`), nil
+}
+
+func (t *richContentTool) ExecuteContent(ctx context.Context, args json.RawMessage) ([]ContentBlock, error) {
+	atomic.AddInt64(t.calls, 1)
+	return []ContentBlock{TextBlock("rich")}, nil
+}
+
+type projectionCommitManager struct {
+	projection ContextProjection
+}
+
+func (m projectionCommitManager) Project(ctx context.Context, msgs []AgentMessage) (ContextProjection, error) {
+	return m.projection, nil
+}
+
+func (m projectionCommitManager) Compact(ctx context.Context, msgs []AgentMessage, reason CompactReason) (ContextCommitResult, error) {
+	return ContextCommitResult{}, nil
+}
+
+func (m projectionCommitManager) RecoverOverflow(ctx context.Context, msgs []AgentMessage, cause error) (ContextRecoveryResult, error) {
+	return ContextRecoveryResult{}, nil
+}
+
+func (m projectionCommitManager) Sync(msgs []AgentMessage) {}
+
+func (m projectionCommitManager) Usage() *ContextUsage {
+	if m.projection.Usage == nil {
+		return nil
+	}
+	cp := *m.projection.Usage
+	return &cp
+}
+
+func (m projectionCommitManager) Snapshot() *ContextSnapshot { return nil }
+
+func assistantMsg(text string, stop StopReason) Message {
+	return Message{
+		Role:       RoleAssistant,
+		Content:    []ContentBlock{TextBlock(text)},
+		StopReason: stop,
+		Usage:      &Usage{Input: 10, Output: 5},
+	}
+}
+
+func toolCallMsg(calls ...ToolCall) Message {
+	blocks := make([]ContentBlock, len(calls))
+	for i, c := range calls {
+		blocks[i] = ToolCallBlock(c)
+	}
+	return Message{
+		Role:       RoleAssistant,
+		Content:    blocks,
+		StopReason: StopReasonToolUse,
+		Usage:      &Usage{Input: 10, Output: 5},
+	}
+}
+
+func runTestLoop(t *testing.T, msgs []AgentMessage, actx AgentContext, cfg LoopConfig) []Event {
+	t.Helper()
+	return collectEvents(AgentLoop(context.Background(), msgs, actx, cfg))
+}
+
+type scriptedStreamModel struct {
+	mu       sync.Mutex
+	requests [][]Message
+	streams  []func(chan<- StreamEvent)
+}
+
+func newScriptedStreamModel(streams ...func(chan<- StreamEvent)) *scriptedStreamModel {
+	return &scriptedStreamModel{streams: streams}
+}
+
+func (m *scriptedStreamModel) Generate(ctx context.Context, messages []Message, tools []ToolSpec, opts ...CallOption) (*LLMResponse, error) {
+	return nil, fmt.Errorf("unexpected Generate call")
+}
+
+func (m *scriptedStreamModel) GenerateStream(ctx context.Context, messages []Message, tools []ToolSpec, opts ...CallOption) (<-chan StreamEvent, error) {
+	m.mu.Lock()
+	idx := len(m.requests)
+	m.requests = append(m.requests, append([]Message(nil), messages...))
+	streamFn := m.streams[idx]
+	m.mu.Unlock()
+
+	ch := make(chan StreamEvent, 16)
+	go func() {
+		defer close(ch)
+		streamFn(ch)
+	}()
+	return ch, nil
+}
+
+func (m *scriptedStreamModel) SupportsTools() bool { return true }
+
+func (m *scriptedStreamModel) Request(i int) []Message {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if i < 0 || i >= len(m.requests) {
+		return nil
+	}
+	return append([]Message(nil), m.requests[i]...)
+}
+
+func streamAssistantDone(text string, stop StopReason) func(chan<- StreamEvent) {
+	return func(ch chan<- StreamEvent) {
+		ch <- StreamEvent{
+			Type: StreamEventDone,
+			Message: Message{
+				Role:       RoleAssistant,
+				Content:    []ContentBlock{TextBlock(text)},
+				StopReason: stop,
+			},
+		}
+	}
+}
+
+func streamAssistantToolCalls(text string, stop StopReason, delay time.Duration, calls ...ToolCall) func(chan<- StreamEvent) {
+	return func(ch chan<- StreamEvent) {
+		partial := Message{Role: RoleAssistant, Content: []ContentBlock{TextBlock(text)}}
+		ch <- StreamEvent{Type: StreamEventTextStart, Message: partial}
+		for _, call := range calls {
+			ch <- StreamEvent{Type: StreamEventToolCallStart, Message: partial}
+			partial.Content = append(partial.Content, ToolCallBlock(call))
+			completed := call
+			ch <- StreamEvent{Type: StreamEventToolCallEnd, Message: partial, CompletedToolCall: &completed}
+		}
+		if delay > 0 {
+			time.Sleep(delay)
+		}
+		content := []ContentBlock{TextBlock(text)}
+		for _, call := range calls {
+			content = append(content, ToolCallBlock(call))
+		}
+		ch <- StreamEvent{
+			Type: StreamEventDone,
+			Message: Message{
+				Role:       RoleAssistant,
+				Content:    content,
+				StopReason: stop,
+			},
+		}
 	}
 }

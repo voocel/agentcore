@@ -25,7 +25,7 @@ A restrained core with open extensibility tends to be more reliable than a compl
 agentcore/            Agent core (types, loop, agent, events, subagent)
 agentcore/llm/        LLM adapters (OpenAI, Anthropic, Gemini via litellm)
 agentcore/tools/      Built-in tools: read, write, edit, bash
-agentcore/memory/     Context compaction — auto-summarize long conversations
+agentcore/context/    Context runtime — projection, rewrite, overflow recovery
 ```
 
 Core design:
@@ -35,7 +35,7 @@ Core design:
 - **Event stream** — single `<-chan Event` output drives any UI (TUI, Web, Slack, logging)
 - **Two-stage pipeline** — `TransformContext` (prune/inject) → `ConvertToLLM` (filter to LLM messages)
 - **SubAgent tool** (`subagent.go`) — multi-agent via tool invocation, four modes: single, parallel, chain, background
-- **Context compaction** (`memory/`) — automatic summarization when context approaches window limit
+- **Context runtime** (`context/`) — projection, committed rewrite, and overflow recovery near the context window limit
 
 ## Quick Start
 
@@ -229,22 +229,27 @@ agent := agentcore.NewAgent(
 
 ### Context Compaction
 
-Auto-summarize conversation history when approaching the context window limit. Hooks in via `TransformContext` — zero changes to core:
+Auto-summarize conversation history when approaching the context window limit. Use the built-in context manager:
 
 ```go
-import "github.com/voocel/agentcore/memory"
+import (
+    "github.com/voocel/agentcore"
+    agentctx "github.com/voocel/agentcore/context"
+)
+
+engine := agentctx.NewDefaultEngine(model, 128000)
 
 agent := agentcore.NewAgent(
     agentcore.WithModel(model),
-    agentcore.WithTransformContext(memory.NewCompaction(memory.CompactionConfig{
-        Model:         model,
-        ContextWindow: 128000,
-    })),
-    agentcore.WithConvertToLLM(memory.CompactionConvertToLLM),
+    agentcore.WithContextManager(engine),
 )
 ```
 
-On each LLM call, compaction checks total tokens. When they exceed `ContextWindow - ReserveTokens` (default 16384), it:
+`NewAgent` auto-wires `ConvertToLLM`, token estimation, and context window from the context manager when available.
+
+On each LLM call, the context manager first builds a projected prompt view for the next model request. When a rewrite should become the new runtime baseline, it can return `ShouldCommit=true` with `CommitMessages`, and the loop will replace the in-memory baseline before continuing.
+
+When usage exceeds `ContextWindow - ReserveTokens` (default 16384), compaction:
 
 1. Keeps recent messages (default 20000 tokens)
 2. Summarizes older messages via LLM into a structured checkpoint (Goal / Progress / Key Decisions / Next Steps)
@@ -252,6 +257,8 @@ On each LLM call, compaction checks total tokens. When they exceed `ContextWindo
 4. Supports incremental updates — subsequent compactions update the existing summary rather than re-summarizing
 
 ### Context Pipeline
+
+For simpler transform-only pipelines, `WithContextPipeline` / `WithTransformContext` still work:
 
 ```go
 agent := agentcore.NewAgent(
