@@ -94,6 +94,51 @@ func TestContextEngineProjectCanRequestCommittedRewrite(t *testing.T) {
 	}
 }
 
+func TestContextEngineProjectReportsSteps(t *testing.T) {
+	var captured RewriteEvent
+	engine := NewEngine(EngineConfig{
+		ContextWindow: 1024,
+		Strategies: []Strategy{
+			NewToolResultMicrocompact(ToolResultMicrocompactConfig{KeepRecent: 0}),
+			NewLightTrim(LightTrimConfig{
+				KeepRecent:    1,
+				TextThreshold: 100,
+				PreserveHead:  20,
+				PreserveTail:  10,
+			}),
+		},
+		OnProject: func(ev RewriteEvent) { captured = ev },
+	})
+
+	msgs := []agentcore.AgentMessage{
+		agentcore.UserMsg(strings.Repeat("a", 800)),
+		agentcore.UserMsg("recent"),
+	}
+
+	if _, err := engine.Project(context.Background(), msgs); err != nil {
+		t.Fatalf("project failed: %v", err)
+	}
+	if len(captured.Steps) == 0 {
+		t.Fatal("expected steps to be populated in RewriteEvent")
+	}
+	// LightTrim should have applied (large text block), microcompact should not (no tool results)
+	var trimStep *RewriteStep
+	for i := range captured.Steps {
+		if captured.Steps[i].Name == "light_trim" {
+			trimStep = &captured.Steps[i]
+		}
+	}
+	if trimStep == nil {
+		t.Fatal("expected light_trim step in Steps")
+	}
+	if !trimStep.Applied {
+		t.Fatal("expected light_trim step to be applied")
+	}
+	if trimStep.TokensAfter >= trimStep.TokensBefore {
+		t.Fatalf("expected tokens to decrease after trim, got %d → %d", trimStep.TokensBefore, trimStep.TokensAfter)
+	}
+}
+
 func TestContextEngineCompactProducesCommittedSummaryWithHooks(t *testing.T) {
 	model := stubModel{
 		generate: func(ctx context.Context, messages []agentcore.Message, tools []agentcore.ToolSpec, opts ...agentcore.CallOption) (*agentcore.LLMResponse, error) {

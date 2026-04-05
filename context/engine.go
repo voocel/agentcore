@@ -37,9 +37,17 @@ type EngineConfig struct {
 	OnRecover func(RewriteEvent)
 }
 
+// RewriteStep records a single strategy execution within the apply pipeline.
+type RewriteStep struct {
+	Name         string
+	Applied      bool
+	TokensBefore int
+	TokensAfter  int
+}
+
 // RewriteEvent reports a projection or recovery rewrite that actually changed
 // the active view. Info is populated when the rewrite produced a summary
-// checkpoint.
+// checkpoint. Steps records every strategy attempted during the pipeline run.
 type RewriteEvent struct {
 	Reason       string
 	Strategy     string
@@ -48,6 +56,7 @@ type RewriteEvent struct {
 	TokensBefore int
 	TokensAfter  int
 	Info         *SummaryInfo
+	Steps        []RewriteStep
 }
 
 // ContextEngine implements agentcore.ContextManager with a strategy-driven
@@ -180,27 +189,28 @@ func (e *ContextEngine) Snapshot() *agentcore.ContextSnapshot {
 // runtime baseline.
 func (e *ContextEngine) Project(ctx context.Context, msgs []agentcore.AgentMessage) (agentcore.ContextProjection, error) {
 	e.Sync(msgs)
-	view, usage, changed, info, strategy, err := e.apply(ctx, msgs, false)
+	r, err := e.apply(ctx, msgs, false)
 	if err != nil {
 		return agentcore.ContextProjection{}, err
 	}
-	if changed && e.cfg.OnProject != nil {
+	if r.Changed && e.cfg.OnProject != nil {
 		e.cfg.OnProject(RewriteEvent{
 			Reason:       "threshold",
-			Strategy:     strategy,
+			Strategy:     r.Strategy,
 			Changed:      true,
-			Committed:    changed && e.cfg.CommitOnProject,
+			Committed:    r.Changed && e.cfg.CommitOnProject,
 			TokensBefore: EstimateTotal(msgs),
-			TokensAfter:  EstimateTotal(view),
-			Info:         info,
+			TokensAfter:  EstimateTotal(r.View),
+			Info:         r.Info,
+			Steps:        r.Steps,
 		})
 	}
 	proj := agentcore.ContextProjection{
-		Messages: view,
-		Usage:    usage,
+		Messages: r.View,
+		Usage:    r.Usage,
 	}
-	if changed && e.cfg.CommitOnProject {
-		proj.CommitMessages = copyMessages(view)
+	if r.Changed && e.cfg.CommitOnProject {
+		proj.CommitMessages = copyMessages(r.View)
 		proj.ShouldCommit = true
 	}
 	return proj, nil
@@ -211,18 +221,18 @@ func (e *ContextEngine) Project(ctx context.Context, msgs []agentcore.AgentMessa
 // returned Messages when Changed is true.
 func (e *ContextEngine) Compact(ctx context.Context, msgs []agentcore.AgentMessage, _ agentcore.CompactReason) (agentcore.ContextCommitResult, error) {
 	e.Sync(msgs)
-	view, usage, changed, info, strategy, err := e.apply(ctx, msgs, true)
+	r, err := e.apply(ctx, msgs, true)
 	if err != nil {
 		return agentcore.ContextCommitResult{}, err
 	}
 	return agentcore.ContextCommitResult{
-		Messages:       view,
-		Usage:          usage,
-		Changed:        changed,
-		Strategy:       strategy,
-		CompactedCount: infoValueInt(info, func(i *SummaryInfo) int { return i.CompactedCount }),
-		KeptCount:      infoValueInt(info, func(i *SummaryInfo) int { return i.KeptCount }),
-		SplitTurn:      infoValueBool(info, func(i *SummaryInfo) bool { return i.IsSplitTurn }),
+		Messages:       r.View,
+		Usage:          r.Usage,
+		Changed:        r.Changed,
+		Strategy:       r.Strategy,
+		CompactedCount: infoValueInt(r.Info, func(i *SummaryInfo) int { return i.CompactedCount }),
+		KeptCount:      infoValueInt(r.Info, func(i *SummaryInfo) int { return i.KeptCount }),
+		SplitTurn:      infoValueBool(r.Info, func(i *SummaryInfo) bool { return i.IsSplitTurn }),
 	}, nil
 }
 
@@ -231,47 +241,55 @@ func (e *ContextEngine) Compact(ctx context.Context, msgs []agentcore.AgentMessa
 // runtime baseline before retrying.
 func (e *ContextEngine) RecoverOverflow(ctx context.Context, msgs []agentcore.AgentMessage, _ error) (agentcore.ContextRecoveryResult, error) {
 	e.Sync(msgs)
-	view, usage, changed, info, strategy, err := e.apply(ctx, msgs, true)
+	r, err := e.apply(ctx, msgs, true)
 	if err != nil {
 		return agentcore.ContextRecoveryResult{}, err
 	}
-	e.setLastState(view, usage, "recovered", strategy, changed, info)
-	if changed && e.cfg.OnRecover != nil {
+	e.setLastState(r.View, r.Usage, "recovered", r.Strategy, r.Changed, r.Info)
+	if r.Changed && e.cfg.OnRecover != nil {
 		e.cfg.OnRecover(RewriteEvent{
 			Reason:       "overflow",
-			Strategy:     strategy,
+			Strategy:     r.Strategy,
 			Changed:      true,
-			Committed:    changed,
+			Committed:    r.Changed,
 			TokensBefore: EstimateTotal(msgs),
-			TokensAfter:  EstimateTotal(view),
-			Info:         info,
+			TokensAfter:  EstimateTotal(r.View),
+			Info:         r.Info,
+			Steps:        r.Steps,
 		})
 	}
 	return agentcore.ContextRecoveryResult{
-		View:           view,
-		CommitMessages: view,
-		Usage:          usage,
-		Changed:        changed,
-		ShouldCommit:   changed,
-		Strategy:       strategy,
-		CompactedCount: infoValueInt(info, func(i *SummaryInfo) int { return i.CompactedCount }),
-		KeptCount:      infoValueInt(info, func(i *SummaryInfo) int { return i.KeptCount }),
-		SplitTurn:      infoValueBool(info, func(i *SummaryInfo) bool { return i.IsSplitTurn }),
+		View:           r.View,
+		CommitMessages: r.View,
+		Usage:          r.Usage,
+		Changed:        r.Changed,
+		ShouldCommit:   r.Changed,
+		Strategy:       r.Strategy,
+		CompactedCount: infoValueInt(r.Info, func(i *SummaryInfo) int { return i.CompactedCount }),
+		KeptCount:      infoValueInt(r.Info, func(i *SummaryInfo) int { return i.KeptCount }),
+		SplitTurn:      infoValueBool(r.Info, func(i *SummaryInfo) bool { return i.IsSplitTurn }),
 	}, nil
 }
 
-func (e *ContextEngine) apply(ctx context.Context, msgs []agentcore.AgentMessage, force bool) ([]agentcore.AgentMessage, *agentcore.ContextUsage, bool, *SummaryInfo, string, error) {
+type applyResult struct {
+	View     []agentcore.AgentMessage
+	Usage    *agentcore.ContextUsage
+	Changed  bool
+	Info     *SummaryInfo
+	Strategy string
+	Steps    []RewriteStep
+}
+
+func (e *ContextEngine) apply(ctx context.Context, msgs []agentcore.AgentMessage, force bool) (applyResult, error) {
 	view := copyMessages(msgs)
 	budget := e.computeBudget(view)
 	if len(e.cfg.Strategies) == 0 {
 		usage := ptrUsage(e.estimateUsage(view))
 		e.setLastState(view, usage, scopeFor(force), "", false, nil)
-		return view, usage, false, nil, "", nil
+		return applyResult{View: view, Usage: usage}, nil
 	}
 
-	changed := false
-	var lastInfo *SummaryInfo
-	lastStrategy := ""
+	var r applyResult
 
 	if !force {
 		for _, strategy := range e.cfg.Strategies {
@@ -279,21 +297,33 @@ func (e *ContextEngine) apply(ctx context.Context, msgs []agentcore.AgentMessage
 				break
 			}
 
+			tokensBefore := budget.Tokens
 			nextView, result, err := strategy.Apply(ctx, e.snapshotTranscript(), view, budget)
 			if err != nil {
-				return nil, nil, false, lastInfo, lastStrategy, err
+				return r, err
 			}
-			if result.Info != nil {
-				lastInfo = result.Info
-			}
+
+			tokensAfter := tokensBefore
 			if result.Applied {
 				view = nextView
-				changed = true
-				lastStrategy = result.Name
+				r.Changed = true
+				r.Strategy = result.Name
 				budget = e.computeBudget(view)
-				if budget.Tokens <= budget.Threshold {
-					break
-				}
+				tokensAfter = budget.Tokens
+			}
+			if result.Info != nil {
+				r.Info = result.Info
+			}
+
+			r.Steps = append(r.Steps, RewriteStep{
+				Name:         result.Name,
+				Applied:      result.Applied,
+				TokensBefore: tokensBefore,
+				TokensAfter:  tokensAfter,
+			})
+
+			if result.Applied && budget.Tokens <= budget.Threshold {
+				break
 			}
 		}
 	} else {
@@ -302,26 +332,41 @@ func (e *ContextEngine) apply(ctx context.Context, msgs []agentcore.AgentMessage
 			if !ok {
 				continue
 			}
+			tokensBefore := budget.Tokens
 			nextView, result, err := forced.ForceApply(ctx, e.snapshotTranscript(), copyMessages(msgs), budget)
 			if err != nil {
-				return nil, nil, false, lastInfo, lastStrategy, err
+				return r, err
 			}
-			if result.Info != nil {
-				lastInfo = result.Info
-			}
+
+			tokensAfter := tokensBefore
 			if result.Applied {
 				view = nextView
-				changed = true
-				lastStrategy = result.Name
+				r.Changed = true
+				r.Strategy = result.Name
 				budget = e.computeBudget(view)
+				tokensAfter = budget.Tokens
+			}
+			if result.Info != nil {
+				r.Info = result.Info
+			}
+
+			r.Steps = append(r.Steps, RewriteStep{
+				Name:         result.Name,
+				Applied:      result.Applied,
+				TokensBefore: tokensBefore,
+				TokensAfter:  tokensAfter,
+			})
+
+			if result.Applied {
 				break
 			}
 		}
 	}
 
-	usage := ptrUsage(e.estimateUsage(view))
-	e.setLastState(view, usage, scopeFor(force), lastStrategy, changed, lastInfo)
-	return view, usage, changed, lastInfo, lastStrategy, nil
+	r.View = view
+	r.Usage = ptrUsage(e.estimateUsage(view))
+	e.setLastState(view, r.Usage, scopeFor(force), r.Strategy, r.Changed, r.Info)
+	return r, nil
 }
 
 func (e *ContextEngine) computeBudget(msgs []agentcore.AgentMessage) Budget {
