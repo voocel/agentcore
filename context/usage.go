@@ -1,35 +1,63 @@
 package context
 
-import "github.com/voocel/agentcore"
+import (
+	"unicode/utf8"
+
+	"github.com/voocel/agentcore"
+)
+
+// estimateTextTokens estimates token count for a text string with CJK awareness.
+// For CJK-dominant text (bytes/runes > 2): uses runes * 1.5 (empirical fit for
+// Chinese/Japanese/Korean tokenizers). For ASCII-dominant text: uses bytes / 4
+// (standard BPE approximation). This matches Claude Code's bytesPerToken approach
+// but auto-detects the dominant script instead of requiring caller configuration.
+func estimateTextTokens(text string) int {
+	bytes := len(text)
+	if bytes == 0 {
+		return 0
+	}
+	runes := utf8.RuneCountInString(text)
+	if runes == 0 {
+		return 0
+	}
+	// Multi-byte dominant (CJK): avg bytes/rune > 2 indicates most chars are 3-byte UTF-8
+	if bytes > runes*2 {
+		return max(int(float64(runes)*1.5+0.5), 1)
+	}
+	// ASCII dominant: standard bytes/4 approximation
+	return max((bytes+3)/4, 1)
+}
 
 // EstimateTokens estimates the token count for a single message.
-// Uses chars/4 approximation (conservative overestimate).
+// Text and thinking blocks use CJK-aware estimation; tool calls and images
+// use byte-based heuristics (JSON args are ASCII-dominant).
 func EstimateTokens(msg agentcore.AgentMessage) int {
-	var chars int
+	var tokens int
 
 	switch v := msg.(type) {
 	case agentcore.Message:
 		for _, b := range v.Content {
 			switch b.Type {
 			case agentcore.ContentText:
-				chars += len(b.Text)
+				tokens += estimateTextTokens(b.Text)
 			case agentcore.ContentThinking:
-				chars += len(b.Thinking)
+				tokens += estimateTextTokens(b.Thinking)
 			case agentcore.ContentToolCall:
 				if b.ToolCall != nil {
-					chars += len(b.ToolCall.Name) + len(b.ToolCall.Args)
+					// Tool call args are JSON (ASCII-dominant), use byte-based estimation
+					tokens += max((len(b.ToolCall.Name)+len(b.ToolCall.Args)+3)/4, 1)
 				}
 			case agentcore.ContentImage:
-				chars += 4800 // ~1200 tokens
+				tokens += 1200
 			}
 		}
 	case ContextSummary:
-		chars = len(v.Summary)
+		tokens = estimateTextTokens(v.Summary)
 	default:
 		return 0
 	}
 
-	return max((chars+3)/4, 1) // ceil(chars/4), at least 1
+	return max(tokens, 1)
 }
 
 // EstimateTotal estimates the total token count for a message list.

@@ -2,11 +2,21 @@ package context
 
 import (
 	"context"
+	"fmt"
 	"strings"
 	"testing"
 
 	"github.com/voocel/agentcore"
 )
+
+// failingStrategy always returns an error, used for circuit breaker testing.
+type failingStrategy struct{ callCount int }
+
+func (s *failingStrategy) Name() string { return "failing" }
+func (s *failingStrategy) Apply(_ context.Context, _, view []agentcore.AgentMessage, _ Budget) ([]agentcore.AgentMessage, StrategyResult, error) {
+	s.callCount++
+	return nil, StrategyResult{Name: s.Name()}, fmt.Errorf("simulated failure")
+}
 
 func TestContextEngineProjectUpdatesUsageFromProjectedView(t *testing.T) {
 	engine := NewEngine(EngineConfig{
@@ -404,5 +414,162 @@ func TestContextConvertToLLM_WrapsSummary(t *testing.T) {
 	}
 	if got := out[0].Metadata["type"]; got != "context_summary" {
 		t.Fatalf("expected context summary metadata marker, got %v", got)
+	}
+}
+
+func TestCircuitBreaker_TripsAfterConsecutiveFailures(t *testing.T) {
+	fs := &failingStrategy{}
+	var gotEvent *RewriteEvent
+	engine := NewEngine(EngineConfig{
+		ContextWindow:          100,
+		ReserveTokens:          1,
+		Strategies:             []Strategy{fs},
+		MaxConsecutiveFailures: 2,
+		OnProject: func(ev RewriteEvent) {
+			gotEvent = &ev
+		},
+	})
+
+	msgs := []agentcore.AgentMessage{agentcore.UserMsg(strings.Repeat("x", 500))}
+
+	for i := 0; i < 2; i++ {
+		_, err := engine.Project(context.Background(), msgs)
+		if err == nil {
+			t.Fatalf("call %d: expected error", i+1)
+		}
+	}
+	if engine.ConsecutiveFailures() != 2 {
+		t.Fatalf("expected 2 consecutive failures, got %d", engine.ConsecutiveFailures())
+	}
+
+	// Third call: circuit breaker trips, returns original msgs, fires event
+	proj, err := engine.Project(context.Background(), msgs)
+	if err != nil {
+		t.Fatalf("expected circuit breaker to skip apply, got error: %v", err)
+	}
+	if len(proj.Messages) != 1 {
+		t.Fatalf("expected original messages returned, got %d", len(proj.Messages))
+	}
+	if fs.callCount != 2 {
+		t.Fatalf("expected strategy called 2 times, got %d", fs.callCount)
+	}
+	// Verify the circuit breaker event was fired
+	if gotEvent == nil {
+		t.Fatal("expected OnProject event when circuit breaker trips")
+	}
+	if gotEvent.Reason != "circuit_breaker" {
+		t.Fatalf("expected reason=circuit_breaker, got %q", gotEvent.Reason)
+	}
+	if gotEvent.Failures != 2 {
+		t.Fatalf("expected failures=2, got %d", gotEvent.Failures)
+	}
+	if gotEvent.Changed {
+		t.Fatal("expected Changed=false for circuit breaker event")
+	}
+	snap := engine.Snapshot()
+	if snap == nil || snap.Scope != "skipped" {
+		t.Fatalf("expected snapshot scope=skipped, got %+v", snap)
+	}
+	if engine.ConsecutiveFailures() != 1 {
+		t.Fatalf("expected breaker to re-arm at 1 failure, got %d", engine.ConsecutiveFailures())
+	}
+}
+
+func TestCircuitBreaker_ResetsOnSuccess(t *testing.T) {
+	fs := &failingStrategy{}
+	engine := NewEngine(EngineConfig{
+		ContextWindow:          100,
+		ReserveTokens:          1,
+		Strategies:             []Strategy{fs},
+		MaxConsecutiveFailures: 3,
+	})
+
+	msgs := []agentcore.AgentMessage{agentcore.UserMsg(strings.Repeat("x", 500))}
+
+	// Fail twice
+	for i := 0; i < 2; i++ {
+		engine.Project(context.Background(), msgs)
+	}
+	if engine.ConsecutiveFailures() != 2 {
+		t.Fatalf("expected 2, got %d", engine.ConsecutiveFailures())
+	}
+
+	// Simulate recovery via RecoverOverflow with a no-op engine (success path)
+	successEngine := NewEngine(EngineConfig{
+		ContextWindow:          100000,
+		ReserveTokens:          1,
+		Strategies:             []Strategy{NewLightTrim(LightTrimConfig{})},
+		MaxConsecutiveFailures: 3,
+	})
+	// Manually set failure count
+	successEngine.mu.Lock()
+	successEngine.consecutiveFailures = 2
+	successEngine.mu.Unlock()
+
+	// RecoverOverflow uses ForceApply, which requires ForceCompactionStrategy.
+	// LightTrim doesn't implement ForceApply, so use a strategy that does.
+	// Instead, directly test the reset mechanism: simulate a successful recovery
+	// by calling RecoverOverflow on an engine with a large text that triggers LightTrim.
+	// LightTrim doesn't implement ForceCompactionStrategy so won't run in force mode.
+	// Use a direct mutation to verify the reset path:
+	successEngine.mu.Lock()
+	successEngine.consecutiveFailures = 2
+	successEngine.mu.Unlock()
+
+	// Successful Project with Changed=true resets the counter
+	// Use small context window to force LightTrim to trigger
+	trimEngine := NewEngine(EngineConfig{
+		ContextWindow: 64,
+		ReserveTokens: 1,
+		Strategies: []Strategy{NewLightTrim(LightTrimConfig{
+			KeepRecent:    1,
+			TextThreshold: 100,
+			PreserveHead:  20,
+			PreserveTail:  10,
+		})},
+		MaxConsecutiveFailures: 3,
+	})
+	trimEngine.mu.Lock()
+	trimEngine.consecutiveFailures = 2
+	trimEngine.mu.Unlock()
+
+	bigMsgs := []agentcore.AgentMessage{agentcore.UserMsg(strings.Repeat("a", 800)), agentcore.UserMsg("recent")}
+	_, err := trimEngine.Project(context.Background(), bigMsgs)
+	if err != nil {
+		t.Fatalf("project failed: %v", err)
+	}
+	if trimEngine.ConsecutiveFailures() != 0 {
+		t.Fatalf("expected reset to 0 after successful compression, got %d", trimEngine.ConsecutiveFailures())
+	}
+}
+
+func TestCircuitBreaker_AllowsRetryAfterSkippedCycle(t *testing.T) {
+	fs := &failingStrategy{}
+	engine := NewEngine(EngineConfig{
+		ContextWindow:          100,
+		ReserveTokens:          1,
+		Strategies:             []Strategy{fs},
+		MaxConsecutiveFailures: 2,
+	})
+
+	msgs := []agentcore.AgentMessage{agentcore.UserMsg(strings.Repeat("x", 500))}
+
+	for i := 0; i < 2; i++ {
+		if _, err := engine.Project(context.Background(), msgs); err == nil {
+			t.Fatalf("call %d: expected error", i+1)
+		}
+	}
+	if _, err := engine.Project(context.Background(), msgs); err != nil {
+		t.Fatalf("expected skipped cycle, got error: %v", err)
+	}
+	if fs.callCount != 2 {
+		t.Fatalf("expected 2 strategy calls after skipped cycle, got %d", fs.callCount)
+	}
+
+	if _, err := engine.Project(context.Background(), msgs); err == nil {
+		t.Fatal("expected retry attempt after skipped cycle to call strategy and fail")
+	}
+	if fs.callCount != 3 {
+		t.Fatalf("expected retry to call strategy again, got %d calls", fs.callCount)
 	}
 }

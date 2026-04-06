@@ -15,7 +15,10 @@ import (
 	"github.com/voocel/agentcore"
 )
 
-const defaultEngineReserveTokens = 16384
+const (
+	defaultEngineReserveTokens      = 16384
+	defaultMaxConsecutiveFailures   = 3
+)
 
 // EngineConfig configures the default strategy-driven ContextEngine.
 // ContextWindow is required. Strategies run in order until the projected view
@@ -35,6 +38,11 @@ type EngineConfig struct {
 	OnProject func(RewriteEvent)
 	// OnRecover is called when RecoverOverflow rewrites the prompt view.
 	OnRecover func(RewriteEvent)
+	// MaxConsecutiveFailures is the circuit breaker threshold. After this many
+	// consecutive Project failures, the engine skips compression and returns
+	// the original messages to avoid wasting API calls. 0 = default (3).
+	// Matches Claude Code's MAX_CONSECUTIVE_AUTOCOMPACT_FAILURES behavior.
+	MaxConsecutiveFailures int
 }
 
 // RewriteStep records a single strategy execution within the apply pipeline.
@@ -57,6 +65,9 @@ type RewriteEvent struct {
 	TokensAfter  int
 	Info         *SummaryInfo
 	Steps        []RewriteStep
+	// Failures is set when Reason == "circuit_breaker": the consecutive failure
+	// count that triggered the bypass.
+	Failures int
 }
 
 // ContextEngine implements agentcore.ContextManager with a strategy-driven
@@ -71,6 +82,10 @@ type ContextEngine struct {
 	lastView   []agentcore.AgentMessage
 	lastScope  string
 	lastChange changeState
+
+	// Circuit breaker: consecutive Project failures. Reset on success.
+	consecutiveFailures int
+	maxFailures         int
 }
 
 type changeState struct {
@@ -84,7 +99,11 @@ func NewEngine(cfg EngineConfig) *ContextEngine {
 	if cfg.ReserveTokens <= 0 {
 		cfg.ReserveTokens = defaultEngineReserveTokens
 	}
-	return &ContextEngine{cfg: cfg}
+	maxFail := cfg.MaxConsecutiveFailures
+	if maxFail <= 0 {
+		maxFail = defaultMaxConsecutiveFailures
+	}
+	return &ContextEngine{cfg: cfg, maxFailures: maxFail}
 }
 
 // NewDefaultEngine creates a ContextEngine with the default rewrite pipeline:
@@ -148,6 +167,13 @@ func (e *ContextEngine) Usage() *agentcore.ContextUsage {
 	return &cp
 }
 
+// ConsecutiveFailures returns the current circuit breaker failure count.
+func (e *ContextEngine) ConsecutiveFailures() int {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	return e.consecutiveFailures
+}
+
 // Snapshot returns the latest active view snapshot remembered by the engine.
 func (e *ContextEngine) Snapshot() *agentcore.ContextSnapshot {
 	e.mu.Lock()
@@ -186,12 +212,57 @@ func (e *ContextEngine) Snapshot() *agentcore.ContextSnapshot {
 }
 
 // Project builds the prompt view for one LLM call without committing a new
-// runtime baseline.
+// runtime baseline. Includes a circuit breaker: after maxFailures consecutive
+// compression errors, Project skips one cycle, reports the skipped state, then
+// re-arms itself in a half-open state so later calls can retry compression.
 func (e *ContextEngine) Project(ctx context.Context, msgs []agentcore.AgentMessage) (agentcore.ContextProjection, error) {
 	e.Sync(msgs)
+
+	// Circuit breaker: skip compression after too many consecutive failures.
+	// Unlike a silent bypass, we still fire OnProject so the host can observe
+	// and display the skipped state (matches Claude Code's circuit breaker
+	// logging at autoCompact.ts:344).
+	e.mu.Lock()
+	tripped := e.consecutiveFailures >= e.maxFailures
+	failures := e.consecutiveFailures
+	e.mu.Unlock()
+	if tripped {
+		usage := ptrUsage(e.estimateUsage(msgs))
+		e.setLastState(msgs, usage, "skipped", "circuit_breaker", false, nil)
+		e.mu.Lock()
+		if e.maxFailures > 1 {
+			e.consecutiveFailures = e.maxFailures - 1
+		} else {
+			e.consecutiveFailures = 0
+		}
+		e.mu.Unlock()
+		if e.cfg.OnProject != nil {
+			e.cfg.OnProject(RewriteEvent{
+				Reason:       "circuit_breaker",
+				Strategy:     "circuit_breaker",
+				Changed:      false,
+				Committed:    false,
+				TokensBefore: EstimateTotal(msgs),
+				TokensAfter:  EstimateTotal(msgs),
+				Failures:     failures,
+			})
+		}
+		return agentcore.ContextProjection{Messages: msgs, Usage: usage}, nil
+	}
+
 	r, err := e.apply(ctx, msgs, false)
 	if err != nil {
+		e.mu.Lock()
+		e.consecutiveFailures++
+		e.mu.Unlock()
 		return agentcore.ContextProjection{}, err
+	}
+
+	// Reset on successful compression.
+	if r.Changed {
+		e.mu.Lock()
+		e.consecutiveFailures = 0
+		e.mu.Unlock()
 	}
 	if r.Changed && e.cfg.OnProject != nil {
 		e.cfg.OnProject(RewriteEvent{
@@ -246,6 +317,12 @@ func (e *ContextEngine) RecoverOverflow(ctx context.Context, msgs []agentcore.Ag
 		return agentcore.ContextRecoveryResult{}, err
 	}
 	e.setLastState(r.View, r.Usage, "recovered", r.Strategy, r.Changed, r.Info)
+	// Successful recovery proves the LLM is reachable — reset circuit breaker.
+	if r.Changed {
+		e.mu.Lock()
+		e.consecutiveFailures = 0
+		e.mu.Unlock()
+	}
 	if r.Changed && e.cfg.OnRecover != nil {
 		e.cfg.OnRecover(RewriteEvent{
 			Reason:       "overflow",
