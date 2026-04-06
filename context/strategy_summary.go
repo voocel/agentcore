@@ -20,6 +20,14 @@ type FullSummaryConfig struct {
 	KeepRecentTokens int
 	// PostSummaryHooks inject lightweight reminder messages after the summary.
 	PostSummaryHooks []PostSummaryHook
+
+	// Custom summary prompts. Empty strings fall back to the built-in defaults
+	// (code-assistant oriented). Set these to override with domain-specific
+	// prompts — e.g., novel-writing prompts that preserve narrative continuity.
+	SystemPrompt      string
+	SummaryPrompt     string
+	UpdateSummaryPrompt string
+	TurnPrefixPrompt  string
 }
 
 // FullSummaryStrategy rewrites older context into a ContextSummary checkpoint
@@ -72,10 +80,14 @@ func (s *FullSummaryStrategy) apply(ctx context.Context, view []agentcore.AgentM
 	}
 
 	cfg := summaryRunConfig{
-		Model:            s.cfg.Model,
-		ContextWindow:    ctxWindow,
-		ReserveTokens:    reserve,
-		KeepRecentTokens: s.cfg.KeepRecentTokens,
+		Model:               s.cfg.Model,
+		ContextWindow:       ctxWindow,
+		ReserveTokens:       reserve,
+		KeepRecentTokens:    s.cfg.KeepRecentTokens,
+		SystemPrompt:        s.cfg.SystemPrompt,
+		SummaryPrompt:       s.cfg.SummaryPrompt,
+		UpdateSummaryPrompt: s.cfg.UpdateSummaryPrompt,
+		TurnPrefixPrompt:    s.cfg.TurnPrefixPrompt,
 	}
 	stripImages := true
 	if s.cfg.StripImages != nil {

@@ -101,17 +101,51 @@ Summarize the prefix to provide context for the retained suffix:
 
 Be concise. Focus on what's needed to understand the kept suffix.`
 
+// summaryPrompts holds the resolved prompt texts for a summarization call.
+// Zero-value fields fall back to the package-level defaults.
+type summaryPrompts struct {
+	System     string
+	Summary    string
+	Update     string
+	TurnPrefix string
+}
+
+func (p summaryPrompts) system() string {
+	if p.System != "" {
+		return p.System
+	}
+	return summarySystemPrompt
+}
+func (p summaryPrompts) summary() string {
+	if p.Summary != "" {
+		return p.Summary
+	}
+	return summaryPrompt
+}
+func (p summaryPrompts) update() string {
+	if p.Update != "" {
+		return p.Update
+	}
+	return updateSummaryPrompt
+}
+func (p summaryPrompts) turnPrefix() string {
+	if p.TurnPrefix != "" {
+		return p.TurnPrefix
+	}
+	return turnPrefixPrompt
+}
+
 // generateTurnPrefixSummary generates a summary for the prefix portion of a split turn.
-func generateTurnPrefixSummary(ctx context.Context, model agentcore.ChatModel, msgs []agentcore.AgentMessage, opts ...agentcore.CallOption) (string, error) {
+func generateTurnPrefixSummary(ctx context.Context, model agentcore.ChatModel, prompts summaryPrompts, msgs []agentcore.AgentMessage, opts ...agentcore.CallOption) (string, error) {
 	conversation := serializeConversation(msgs)
 	if conversation == "" {
 		return "", nil
 	}
 
-	userPrompt := "<conversation>\n" + conversation + "\n</conversation>\n\n" + turnPrefixPrompt
+	userPrompt := "<conversation>\n" + conversation + "\n</conversation>\n\n" + prompts.turnPrefix()
 
 	resp, err := model.Generate(ctx, []agentcore.Message{
-		agentcore.SystemMsg(summarySystemPrompt),
+		agentcore.SystemMsg(prompts.system()),
 		agentcore.UserMsg(userPrompt),
 	}, nil, opts...)
 	if err != nil {
@@ -122,12 +156,12 @@ func generateTurnPrefixSummary(ctx context.Context, model agentcore.ChatModel, m
 
 // generateSummary calls the ChatModel to produce a conversation summary.
 // If previousSummary is non-empty, uses incremental update prompt.
-func generateSummary(ctx context.Context, model agentcore.ChatModel, msgs []agentcore.AgentMessage, previousSummary string, opts ...agentcore.CallOption) (string, error) {
+func generateSummary(ctx context.Context, model agentcore.ChatModel, prompts summaryPrompts, msgs []agentcore.AgentMessage, previousSummary string, opts ...agentcore.CallOption) (string, error) {
 	const maxRetries = 3
 	current := append([]agentcore.AgentMessage(nil), msgs...)
 	var lastErr error
 	for attempt := 0; attempt < maxRetries; attempt++ {
-		summary, err := generateSummaryOnce(ctx, model, current, previousSummary, opts...)
+		summary, err := generateSummaryOnce(ctx, model, prompts, current, previousSummary, opts...)
 		if err == nil {
 			return summary, nil
 		}
@@ -147,7 +181,7 @@ func generateSummary(ctx context.Context, model agentcore.ChatModel, msgs []agen
 	return "", fmt.Errorf("summarization failed")
 }
 
-func generateSummaryOnce(ctx context.Context, model agentcore.ChatModel, msgs []agentcore.AgentMessage, previousSummary string, opts ...agentcore.CallOption) (string, error) {
+func generateSummaryOnce(ctx context.Context, model agentcore.ChatModel, prompts summaryPrompts, msgs []agentcore.AgentMessage, previousSummary string, opts ...agentcore.CallOption) (string, error) {
 	conversation := serializeConversation(msgs)
 	if conversation == "" {
 		return "", fmt.Errorf("no conversation content to summarize")
@@ -157,14 +191,14 @@ func generateSummaryOnce(ctx context.Context, model agentcore.ChatModel, msgs []
 	if previousSummary != "" {
 		userPrompt = "<conversation>\n" + conversation + "\n</conversation>\n\n" +
 			"<previous-summary>\n" + previousSummary + "\n</previous-summary>\n\n" +
-			updateSummaryPrompt
+			prompts.update()
 	} else {
 		userPrompt = "<conversation>\n" + conversation + "\n</conversation>\n\n" +
-			summaryPrompt
+			prompts.summary()
 	}
 
 	resp, err := model.Generate(ctx, []agentcore.Message{
-		agentcore.SystemMsg(summarySystemPrompt),
+		agentcore.SystemMsg(prompts.system()),
 		agentcore.UserMsg(userPrompt),
 	}, nil, opts...)
 	if err != nil {

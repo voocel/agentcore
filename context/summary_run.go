@@ -38,6 +38,11 @@ type summaryRunConfig struct {
 	ContextWindow    int
 	ReserveTokens    int
 	KeepRecentTokens int
+	// Custom prompts — empty means use built-in defaults.
+	SystemPrompt      string
+	SummaryPrompt     string
+	UpdateSummaryPrompt string
+	TurnPrefixPrompt  string
 }
 
 func runSummaryCompaction(ctx context.Context, cfg summaryRunConfig, msgs []agentcore.AgentMessage, stripImages bool) ([]agentcore.AgentMessage, *SummaryInfo, error) {
@@ -88,6 +93,13 @@ func runSummaryCompaction(ctx context.Context, cfg summaryRunConfig, msgs []agen
 		needTurnPrefix = len(turnPrefix) > 0
 	}
 
+	prompts := summaryPrompts{
+		System:     cfg.SystemPrompt,
+		Summary:    cfg.SummaryPrompt,
+		Update:     cfg.UpdateSummaryPrompt,
+		TurnPrefix: cfg.TurnPrefixPrompt,
+	}
+
 	if needTurnPrefix {
 		// Run sequentially. ChatModel does not promise concurrent Generate safety,
 		// so split-turn summarization must not assume shared model instances are
@@ -96,13 +108,13 @@ func runSummaryCompaction(ctx context.Context, cfg summaryRunConfig, msgs []agen
 			summary = "No prior history."
 		} else {
 			var err error
-			summary, err = generateSummary(ctx, cfg.Model, toSummarize, previousSummary, historyOpts...)
+			summary, err = generateSummary(ctx, cfg.Model, prompts, toSummarize, previousSummary, historyOpts...)
 			if err != nil {
 				return nil, nil, fmt.Errorf("compaction: %w", err)
 			}
 		}
 
-		prefixSummary, err := generateTurnPrefixSummary(ctx, cfg.Model, turnPrefix, prefixOpts...)
+		prefixSummary, err := generateTurnPrefixSummary(ctx, cfg.Model, prompts, turnPrefix, prefixOpts...)
 		if err != nil {
 			return nil, nil, fmt.Errorf("compaction turn prefix: %w", err)
 		}
@@ -111,7 +123,7 @@ func runSummaryCompaction(ctx context.Context, cfg summaryRunConfig, msgs []agen
 		}
 	} else {
 		var err error
-		summary, err = generateSummary(ctx, cfg.Model, toSummarize, previousSummary, historyOpts...)
+		summary, err = generateSummary(ctx, cfg.Model, prompts, toSummarize, previousSummary, historyOpts...)
 		if err != nil {
 			return nil, nil, fmt.Errorf("compaction: %w", err)
 		}
