@@ -443,6 +443,11 @@ func applyCallConfig(req *litellm.Request, opts []agentcore.CallOption) {
 	if callCfg.MaxTokens > 0 {
 		req.MaxTokens = &callCfg.MaxTokens
 	}
+
+	// Tool choice: "auto" / "required" / "none"
+	if callCfg.ToolChoice != nil {
+		req.ToolChoice = callCfg.ToolChoice
+	}
 }
 
 func applyToolConfig(request *litellm.Request, tools []agentcore.ToolSpec) {

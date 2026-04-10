@@ -52,6 +52,7 @@ type Agent struct {
 	middlewares           []ToolMiddleware
 	maxRetryDelay         time.Duration
 	maxToolConcurrency    int
+	toolChoice            any // default tool_choice for LLM calls
 	taskRuntime           *TaskRuntime
 
 	// State
@@ -661,6 +662,7 @@ func (a *Agent) buildConfig() LoopConfig {
 		Middlewares:           a.middlewares,
 		MaxToolConcurrency:    a.maxToolConcurrency,
 		ShouldEmitAbortMarker: a.wantAbortMarker.Load,
+		ToolChoice:            a.toolChoice,
 	}
 }
 

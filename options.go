@@ -157,6 +157,13 @@ func WithTaskRuntime(rt *TaskRuntime) AgentOption {
 	return func(a *Agent) { a.taskRuntime = rt }
 }
 
+// WithDefaultToolChoice sets the default tool_choice for every LLM call in this agent's loop.
+// Accepted values: "auto" (default), "required" (must call a tool), "none" (no tools).
+// "required" is useful for agents that should never produce plain-text responses.
+func WithDefaultToolChoice(choice any) AgentOption {
+	return func(a *Agent) { a.toolChoice = choice }
+}
+
 // WithContextPipeline sets both TransformContext and ConvertToLLM in one call.
 // Prefer WithContextManager for the full context lifecycle; use this helper
 // for simpler transform-based pipelines.

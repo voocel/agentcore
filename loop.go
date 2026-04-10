@@ -553,6 +553,11 @@ func callLLM(ctx context.Context, agentCtx *AgentContext, config LoopConfig, ch 
 		callOpts = append(callOpts, WithCallSessionID(config.SessionID))
 	}
 
+	// Tool choice: "auto" / "required" / "none"
+	if config.ToolChoice != nil {
+		callOpts = append(callOpts, WithToolChoice(config.ToolChoice))
+	}
+
 	// Use streaming for real-time token deltas
 	return callLLMStream(ctx, config.Model, llmMessages, toolSpecs, callOpts, ch, hooks)
 }

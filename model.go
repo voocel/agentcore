@@ -112,6 +112,11 @@ type LoopConfig struct {
 	// emitted when the context is cancelled. When nil or returns false, the
 	// cancellation is silent (legacy behavior). Set by Agent.Abort().
 	ShouldEmitAbortMarker func() bool
+
+	// ToolChoice sets the default tool_choice for every LLM call in this loop.
+	// "auto" (default), "required" (must call a tool), "none" (no tools).
+	// nil means use provider default.
+	ToolChoice any
 }
 
 // ---------------------------------------------------------------------------
@@ -145,6 +150,7 @@ type CallConfig struct {
 	APIKey         string // per-call API key override, empty = use model default
 	SessionID      string // provider session caching identifier
 	MaxTokens      int    // per-call max tokens override, 0 = use model default
+	ToolChoice     any    // "auto" / "required" / "none" / {"type":"tool","name":"xxx"}, nil = provider default
 }
 
 // ResolveCallConfig applies options and returns the resolved config.
@@ -180,6 +186,12 @@ func WithCallSessionID(id string) CallOption {
 // WithMaxTokens overrides the max output tokens for a single LLM call.
 func WithMaxTokens(tokens int) CallOption {
 	return func(c *CallConfig) { c.MaxTokens = tokens }
+}
+
+// WithToolChoice controls whether the model must call a tool.
+// Accepted values: "auto" (default), "required" (must call a tool), "none" (no tools).
+func WithToolChoice(choice any) CallOption {
+	return func(c *CallConfig) { c.ToolChoice = choice }
 }
 
 // ---------------------------------------------------------------------------
