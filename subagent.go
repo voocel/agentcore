@@ -30,6 +30,10 @@ type SubAgentConfig struct {
 	StreamFn     StreamFn
 	MaxTurns     int
 
+	// ToolChoice sets the default tool_choice for every LLM call in this
+	// sub-agent's loop. nil uses the provider default ("auto").
+	ToolChoice any
+
 	// Optional context lifecycle hooks for long-running sub-agents.
 	ContextManager        ContextManager
 	ContextManagerFactory func(model ChatModel) ContextManager
@@ -452,6 +456,7 @@ func (t *SubAgentTool) runAgent(ctx context.Context, agentName, task string, mod
 		Model:            runModel,
 		StreamFn:         cfg.StreamFn,
 		MaxTurns:         cfg.MaxTurns,
+		ToolChoice:       cfg.ToolChoice,
 		ContextManager:   contextManager,
 		TransformContext: cfg.TransformContext,
 		ConvertToLLM:     cfg.ConvertToLLM,
