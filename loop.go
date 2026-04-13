@@ -176,6 +176,9 @@ func runLoop(ctx context.Context, currentCtx *AgentContext, newMessages *[]Agent
 					emit(ch, Event{Type: EventMessageEnd, Message: msg})
 					currentCtx.Messages = append(currentCtx.Messages, msg)
 					*newMessages = append(*newMessages, msg)
+					if config.OnMessage != nil {
+						config.OnMessage(msg)
+					}
 				}
 				pendingMessages = nil
 			}
@@ -233,6 +236,9 @@ func runLoop(ctx context.Context, currentCtx *AgentContext, newMessages *[]Agent
 
 			currentCtx.Messages = append(currentCtx.Messages, assistantMsg)
 			*newMessages = append(*newMessages, assistantMsg)
+			if config.OnMessage != nil {
+				config.OnMessage(assistantMsg)
+			}
 
 			// Check for tool calls
 			toolCalls := assistantMsg.ToolCalls()
@@ -264,6 +270,9 @@ func runLoop(ctx context.Context, currentCtx *AgentContext, newMessages *[]Agent
 					emit(ch, Event{Type: EventMessageEnd, Message: resultMsg})
 					currentCtx.Messages = append(currentCtx.Messages, resultMsg)
 					*newMessages = append(*newMessages, resultMsg)
+					if config.OnMessage != nil {
+						config.OnMessage(resultMsg)
+					}
 				}
 
 				steeringAfterTools = steering
@@ -978,12 +987,20 @@ func toolResultToMessage(tr ToolResult) Message {
 			Content: tr.ContentBlocks,
 			Metadata: map[string]any{
 				"tool_call_id": tr.ToolCallID,
+				"tool_name":    tr.ToolName,
 				"is_error":     tr.IsError,
 			},
 			Timestamp: time.Now(),
 		}
 	}
-	return ToolResultMsg(tr.ToolCallID, tr.Content, tr.IsError)
+	msg := ToolResultMsg(tr.ToolCallID, tr.Content, tr.IsError)
+	if tr.ToolName != "" {
+		if msg.Metadata == nil {
+			msg.Metadata = make(map[string]any)
+		}
+		msg.Metadata["tool_name"] = tr.ToolName
+	}
+	return msg
 }
 
 // stripToolCallBlocks removes ContentToolCall blocks from a content slice.

@@ -53,6 +53,7 @@ type Agent struct {
 	maxRetryDelay         time.Duration
 	maxToolConcurrency    int
 	toolChoice            any // default tool_choice for LLM calls
+	onMessage             func(AgentMessage)
 	taskRuntime           *TaskRuntime
 
 	// State
@@ -663,6 +664,7 @@ func (a *Agent) buildConfig() LoopConfig {
 		MaxToolConcurrency:    a.maxToolConcurrency,
 		ShouldEmitAbortMarker: a.wantAbortMarker.Load,
 		ToolChoice:            a.toolChoice,
+		OnMessage:             a.onMessage,
 	}
 }
 

@@ -39,6 +39,10 @@ type SubAgentConfig struct {
 	// terminal tool (e.g. "commit_chapter") end the loop cleanly.
 	StopAfterTools []string
 
+	// OnMessage, if non-nil, is called after each message is appended to
+	// context. The agentName and task are provided for session routing.
+	OnMessage func(agentName, task string, msg AgentMessage)
+
 	// Optional context lifecycle hooks for long-running sub-agents.
 	ContextManager        ContextManager
 	ContextManagerFactory func(model ChatModel) ContextManager
@@ -475,6 +479,10 @@ func (t *SubAgentTool) runAgent(ctx context.Context, agentName, task string, mod
 			_, ok := stopSet[toolName]
 			return ok
 		}
+	}
+	if cfg.OnMessage != nil {
+		name, t := agentName, task
+		loopCfg.OnMessage = func(msg AgentMessage) { cfg.OnMessage(name, t, msg) }
 	}
 	if loopCfg.MaxTurns <= 0 {
 		loopCfg.MaxTurns = defaultMaxTurns

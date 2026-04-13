@@ -164,6 +164,12 @@ func WithDefaultToolChoice(choice any) AgentOption {
 	return func(a *Agent) { a.toolChoice = choice }
 }
 
+// WithOnMessage registers a callback invoked after each message is appended
+// to the agent's context. Use for session logging / message persistence.
+func WithOnMessage(fn func(AgentMessage)) AgentOption {
+	return func(a *Agent) { a.onMessage = fn }
+}
+
 // WithContextPipeline sets both TransformContext and ConvertToLLM in one call.
 // Prefer WithContextManager for the full context lifecycle; use this helper
 // for simpler transform-based pipelines.
