@@ -30,7 +30,7 @@ agentcore/context/    Context runtime — projection, rewrite, overflow recovery
 
 Core design:
 
-- **Standalone loop** (`loop.go`) — free function, all dependencies injected via parameters. Double loop: inner processes tool calls + steering, outer handles follow-up
+- **Standalone dual-loop core** (`loop.go`) — free function, all dependencies injected via parameters. Double loop: inner processes tool calls + steering, outer handles follow-up
 - **Stateful Agent** (`agent.go`) — sole consumer of loop events, updates internal state then dispatches to external listeners
 - **Event stream** — single `<-chan Event` output drives any UI (TUI, Web, Slack, logging)
 - **Two-stage pipeline** — `TransformContext` (prune/inject) → `ConvertToLLM` (filter to LLM messages)

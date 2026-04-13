@@ -1043,6 +1043,156 @@ func TestLoopPublicAPIs(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
+// OnMessage semantic tests — verify commitMessage fires on all paths
+// ---------------------------------------------------------------------------
+
+func TestOnMessage_AssistantAndToolResult(t *testing.T) {
+	var calls []string
+	tc := ToolCall{ID: "tc1", Name: "echo", Args: json.RawMessage(`{"value":"ping"}`)}
+
+	var logged []Role
+	var mu sync.Mutex
+
+	runTestLoop(t,
+		[]AgentMessage{UserMsg("test")},
+		AgentContext{Tools: []Tool{echoTool(&calls)}},
+		LoopConfig{
+			StreamFn: mockStreamFn(toolCallMsg(tc), assistantMsg("done", StopReasonStop)),
+			OnMessage: func(msg AgentMessage) {
+				mu.Lock()
+				logged = append(logged, msg.GetRole())
+				mu.Unlock()
+			},
+		},
+	)
+
+	// Expect: user (prompt) → assistant (tool call) → tool (result) → assistant (done)
+	mu.Lock()
+	defer mu.Unlock()
+	if len(logged) != 4 {
+		t.Fatalf("expected 4 OnMessage calls, got %d: %v", len(logged), logged)
+	}
+	if logged[0] != RoleUser || logged[1] != RoleAssistant || logged[2] != RoleTool || logged[3] != RoleAssistant {
+		t.Fatalf("unexpected OnMessage roles: %v", logged)
+	}
+}
+
+func TestOnMessage_PendingSteeringMessages(t *testing.T) {
+	var calls []string
+	steeringDelivered := false
+
+	var logged []Role
+	var mu sync.Mutex
+
+	runTestLoop(t,
+		[]AgentMessage{UserMsg("test steering")},
+		AgentContext{Tools: []Tool{echoTool(&calls)}},
+		LoopConfig{
+			StreamFn: sequentialStreamFn(func(i int, _ *LLMRequest) (*LLMResponse, error) {
+				if i == 0 {
+					return &LLMResponse{Message: toolCallMsg(
+						ToolCall{ID: "tc1", Name: "echo", Args: json.RawMessage(`{"value":"first"}`)},
+					)}, nil
+				}
+				return &LLMResponse{Message: assistantMsg("steered", StopReasonStop)}, nil
+			}),
+			GetSteeringMessages: func() []AgentMessage {
+				if len(calls) == 1 && !steeringDelivered {
+					steeringDelivered = true
+					return []AgentMessage{UserMsg("redirect")}
+				}
+				return nil
+			},
+			OnMessage: func(msg AgentMessage) {
+				mu.Lock()
+				logged = append(logged, msg.GetRole())
+				mu.Unlock()
+			},
+		},
+	)
+
+	mu.Lock()
+	defer mu.Unlock()
+
+	// Should include: assistant (tool call), tool (result), user (steering), assistant (steered)
+	var hasUser bool
+	for _, r := range logged {
+		if r == RoleUser {
+			hasUser = true
+		}
+	}
+	if !hasUser {
+		t.Fatalf("expected OnMessage to fire for steering (user) message, got roles: %v", logged)
+	}
+}
+
+func TestOnMessage_ErrorStopReason(t *testing.T) {
+	var logged []Role
+	var mu sync.Mutex
+
+	runTestLoop(t,
+		[]AgentMessage{UserMsg("test error")},
+		AgentContext{},
+		LoopConfig{
+			StreamFn: mockStreamFn(assistantMsg("oops", StopReasonError)),
+			OnMessage: func(msg AgentMessage) {
+				mu.Lock()
+				logged = append(logged, msg.GetRole())
+				mu.Unlock()
+			},
+		},
+	)
+
+	mu.Lock()
+	defer mu.Unlock()
+	if len(logged) != 2 {
+		t.Fatalf("expected 2 OnMessage calls (prompt + error assistant), got %d: %v", len(logged), logged)
+	}
+	if logged[0] != RoleUser || logged[1] != RoleAssistant {
+		t.Fatalf("expected OnMessage roles [user assistant], got %v", logged)
+	}
+}
+
+func TestOnMessage_OrderMatchesNewMessages(t *testing.T) {
+	var calls []string
+	tc := ToolCall{ID: "tc1", Name: "echo", Args: json.RawMessage(`{"value":"x"}`)}
+
+	var loggedTexts []string
+	var mu sync.Mutex
+
+	events := runTestLoop(t,
+		[]AgentMessage{UserMsg("test order")},
+		AgentContext{Tools: []Tool{echoTool(&calls)}},
+		LoopConfig{
+			StreamFn: mockStreamFn(toolCallMsg(tc), assistantMsg("done", StopReasonStop)),
+			OnMessage: func(msg AgentMessage) {
+				mu.Lock()
+				loggedTexts = append(loggedTexts, msg.TextContent())
+				mu.Unlock()
+			},
+		},
+	)
+
+	// Verify order matches NewMessages exactly, including the initial prompt.
+	ev, _ := findEvent(events, EventAgentEnd)
+	newMsgs := ev.NewMessages
+
+	mu.Lock()
+	defer mu.Unlock()
+
+	if len(newMsgs) != len(loggedTexts) {
+		t.Fatalf("newMessages (%d) does not match OnMessage calls (%d)", len(newMsgs), len(loggedTexts))
+	}
+
+	for i, text := range loggedTexts {
+		expected := newMsgs[i].TextContent()
+		if text != expected {
+			t.Fatalf("OnMessage[%d] text=%q, newMessages[%d] text=%q", i, text, i, expected)
+		}
+	}
+}
+
+// ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
 

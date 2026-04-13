@@ -30,13 +30,12 @@ func AgentLoop(ctx context.Context, prompts []AgentMessage, agentCtx AgentContex
 	go func() {
 		defer close(ch)
 
-		newMessages := make([]AgentMessage, len(prompts))
-		copy(newMessages, prompts)
+		var newMessages []AgentMessage
 
 		currentCtx := AgentContext{
 			SystemPrompt: agentCtx.SystemPrompt,
 			SystemBlocks: agentCtx.SystemBlocks,
-			Messages:     append(copyMessages(agentCtx.Messages), prompts...),
+			Messages:     copyMessages(agentCtx.Messages),
 			Tools:        agentCtx.Tools,
 		}
 
@@ -46,6 +45,7 @@ func AgentLoop(ctx context.Context, prompts []AgentMessage, agentCtx AgentContex
 		for _, p := range prompts {
 			emit(ch, Event{Type: EventMessageStart, Message: p})
 			emit(ch, Event{Type: EventMessageEnd, Message: p})
+			commitMessage(&currentCtx, &newMessages, config, p)
 		}
 
 		runLoop(ctx, &currentCtx, &newMessages, config, ch)
@@ -87,6 +87,17 @@ func AgentLoopContinue(ctx context.Context, agentCtx AgentContext, config LoopCo
 	}()
 
 	return ch
+}
+
+// commitMessage is the single entry point for "message enters agent context".
+// It appends the message to both the runtime context and the new-messages list,
+// and fires the OnMessage hook if configured.
+func commitMessage(currentCtx *AgentContext, newMessages *[]AgentMessage, config LoopConfig, msg AgentMessage) {
+	currentCtx.Messages = append(currentCtx.Messages, msg)
+	*newMessages = append(*newMessages, msg)
+	if config.OnMessage != nil {
+		config.OnMessage(msg)
+	}
 }
 
 // runLoop is the main double-loop logic shared by AgentLoop and AgentLoopContinue.
@@ -174,11 +185,7 @@ func runLoop(ctx context.Context, currentCtx *AgentContext, newMessages *[]Agent
 				for _, msg := range pendingMessages {
 					emit(ch, Event{Type: EventMessageStart, Message: msg})
 					emit(ch, Event{Type: EventMessageEnd, Message: msg})
-					currentCtx.Messages = append(currentCtx.Messages, msg)
-					*newMessages = append(*newMessages, msg)
-					if config.OnMessage != nil {
-						config.OnMessage(msg)
-					}
+					commitMessage(currentCtx, newMessages, config, msg)
 				}
 				pendingMessages = nil
 			}
@@ -215,8 +222,7 @@ func runLoop(ctx context.Context, currentCtx *AgentContext, newMessages *[]Agent
 
 			// Check stop reason — terminate early on error/aborted
 			if assistantMsg.StopReason == StopReasonError || assistantMsg.StopReason == StopReasonAborted {
-				currentCtx.Messages = append(currentCtx.Messages, assistantMsg)
-				*newMessages = append(*newMessages, assistantMsg)
+				commitMessage(currentCtx, newMessages, config, assistantMsg)
 				emit(ch, Event{Type: EventTurnEnd, Message: assistantMsg})
 				turnCount++
 				reason := EndReasonError
@@ -234,11 +240,7 @@ func runLoop(ctx context.Context, currentCtx *AgentContext, newMessages *[]Agent
 				assistantMsg.Content = stripToolCallBlocks(assistantMsg.Content)
 			}
 
-			currentCtx.Messages = append(currentCtx.Messages, assistantMsg)
-			*newMessages = append(*newMessages, assistantMsg)
-			if config.OnMessage != nil {
-				config.OnMessage(assistantMsg)
-			}
+			commitMessage(currentCtx, newMessages, config, assistantMsg)
 
 			// Check for tool calls
 			toolCalls := assistantMsg.ToolCalls()
@@ -268,11 +270,7 @@ func runLoop(ctx context.Context, currentCtx *AgentContext, newMessages *[]Agent
 					resultMsg := toolResultToMessage(tr)
 					emit(ch, Event{Type: EventMessageStart, Message: resultMsg})
 					emit(ch, Event{Type: EventMessageEnd, Message: resultMsg})
-					currentCtx.Messages = append(currentCtx.Messages, resultMsg)
-					*newMessages = append(*newMessages, resultMsg)
-					if config.OnMessage != nil {
-						config.OnMessage(resultMsg)
-					}
+					commitMessage(currentCtx, newMessages, config, resultMsg)
 				}
 
 				steeringAfterTools = steering
@@ -1014,15 +1012,6 @@ func stripToolCallBlocks(blocks []ContentBlock) []ContentBlock {
 		}
 	}
 	return filtered
-}
-
-func hasToolCallBlocks(blocks []ContentBlock) bool {
-	for _, b := range blocks {
-		if b.Type == ContentToolCall {
-			return true
-		}
-	}
-	return false
 }
 
 // toolLabel returns the human-readable label for a tool.
