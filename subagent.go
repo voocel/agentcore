@@ -34,6 +34,11 @@ type SubAgentConfig struct {
 	// sub-agent's loop. nil uses the provider default ("auto").
 	ToolChoice any
 
+	// StopAfterTools lists tool names that trigger early loop exit after
+	// successful execution. Useful with ToolChoice "required" to let a
+	// terminal tool (e.g. "commit_chapter") end the loop cleanly.
+	StopAfterTools []string
+
 	// Optional context lifecycle hooks for long-running sub-agents.
 	ContextManager        ContextManager
 	ContextManagerFactory func(model ChatModel) ContextManager
@@ -461,6 +466,16 @@ func (t *SubAgentTool) runAgent(ctx context.Context, agentName, task string, mod
 		TransformContext: cfg.TransformContext,
 		ConvertToLLM:     cfg.ConvertToLLM,
 	}
+	if len(cfg.StopAfterTools) > 0 {
+		stopSet := make(map[string]struct{}, len(cfg.StopAfterTools))
+		for _, name := range cfg.StopAfterTools {
+			stopSet[name] = struct{}{}
+		}
+		loopCfg.StopAfterTool = func(toolName string) bool {
+			_, ok := stopSet[toolName]
+			return ok
+		}
+	}
 	if loopCfg.MaxTurns <= 0 {
 		loopCfg.MaxTurns = defaultMaxTurns
 	}
@@ -468,6 +483,7 @@ func (t *SubAgentTool) runAgent(ctx context.Context, agentName, task string, mod
 	events := AgentLoop(ctx, []AgentMessage{UserMsg(task)}, agentCtx, loopCfg)
 
 	var lastAssistantContent string
+	var terminalToolResult string // result from StopAfterTool trigger
 	var lastErr error
 	su := &subagentUsage{}
 
@@ -525,6 +541,12 @@ func (t *SubAgentTool) runAgent(ctx context.Context, agentName, task string, mod
 					Message: errMsg,
 					IsError: true,
 				})
+			}
+			// Capture terminal tool result for inclusion in subagent output.
+			// When StopAfterTool fires, this is the last tool result and
+			// contains actionable data (e.g. system_hints) for the caller.
+			if !ev.IsError && loopCfg.StopAfterTool != nil && loopCfg.StopAfterTool(ev.Tool) {
+				terminalToolResult = string(ev.Result)
 			}
 			if bg == nil {
 				reportSubagentContext(ctx, agentName, contextManager)
@@ -591,10 +613,17 @@ func (t *SubAgentTool) runAgent(ctx context.Context, agentName, task string, mod
 	if lastErr != nil && lastAssistantContent == "" {
 		return "", su, lastErr
 	}
-	if lastAssistantContent == "" {
+	output = lastAssistantContent
+	if terminalToolResult != "" {
+		if output != "" {
+			output += "\n\n"
+		}
+		output += terminalToolResult
+	}
+	if output == "" {
 		return "(no output)", su, nil
 	}
-	return lastAssistantContent, su, nil
+	return output, su, nil
 }
 
 func reportSubagentContext(ctx context.Context, agentName string, mgr ContextManager) {

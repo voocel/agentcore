@@ -685,33 +685,118 @@ func TestAgentLoop_LengthStopRecoversPureTextResponse(t *testing.T) {
 	}
 }
 
-func TestAgentLoop_LengthStopDoesNotRecoverToolCallOutput(t *testing.T) {
+func TestAgentLoop_LengthRecoveryForTruncatedToolCalls(t *testing.T) {
+	// When output is truncated (StopReasonLength) and tool call blocks exist
+	// but none completed, the loop should strip incomplete tool calls and
+	// attempt length recovery (prompting the model to break work into smaller
+	// pieces). This prevents silent failure when large tool arguments exceed
+	// the output token limit.
 	callCount := 0
 	streamFn := sequentialStreamFn(func(i int, req *LLMRequest) (*LLMResponse, error) {
 		callCount++
-		if i > 0 {
-			t.Fatalf("unexpected recovery call for truncated tool-call output")
+		if i == 0 {
+			// First call: truncated output with incomplete tool call
+			return &LLMResponse{
+				Message: Message{
+					Role: RoleAssistant,
+					Content: []ContentBlock{
+						TextBlock("partial"),
+						{Type: ContentToolCall},
+					},
+					StopReason: StopReasonLength,
+				},
+			}, nil
 		}
+		// Recovery call: model returns normally
 		return &LLMResponse{
 			Message: Message{
-				Role: RoleAssistant,
-				Content: []ContentBlock{
-					TextBlock("partial"),
-					{Type: ContentToolCall},
-				},
-				StopReason: StopReasonLength,
+				Role:       RoleAssistant,
+				Content:    []ContentBlock{TextBlock("recovered")},
+				StopReason: StopReasonStop,
 			},
 		}, nil
 	})
 
 	runTestLoop(t,
-		[]AgentMessage{UserMsg("do not recover tool call")},
+		[]AgentMessage{UserMsg("recover truncated tool call")},
 		AgentContext{},
 		LoopConfig{StreamFn: streamFn},
 	)
 
+	if callCount != 2 {
+		t.Fatalf("expected 1 recovery attempt (2 total calls), got %d calls", callCount)
+	}
+}
+
+func TestAgentLoop_StopAfterTool(t *testing.T) {
+	// When StopAfterTool returns true for a tool, the loop should exit
+	// immediately after that tool executes, even with tool_choice=required.
+	commitTool := NewFuncTool("commit", "commit work", map[string]any{
+		"type": "object", "properties": map[string]any{},
+	}, func(ctx context.Context, args json.RawMessage) (json.RawMessage, error) {
+		return json.Marshal(map[string]string{"status": "committed"})
+	})
+	neverTool := NewFuncTool("never_reach", "should not be called", map[string]any{
+		"type": "object", "properties": map[string]any{},
+	}, func(ctx context.Context, args json.RawMessage) (json.RawMessage, error) {
+		t.Fatal("never_reach tool was called — StopAfterTool did not stop the loop")
+		return nil, nil
+	})
+
+	callCount := 0
+	streamFn := sequentialStreamFn(func(i int, req *LLMRequest) (*LLMResponse, error) {
+		callCount++
+		if i == 0 {
+			return &LLMResponse{
+				Message: Message{
+					Role: RoleAssistant,
+					Content: []ContentBlock{
+						TextBlock("committing"),
+						ToolCallBlock(ToolCall{ID: "tc1", Name: "commit", Args: json.RawMessage(`{}`)}),
+					},
+					StopReason: StopReasonToolUse,
+				},
+			}, nil
+		}
+		// If we get here, StopAfterTool didn't work
+		return &LLMResponse{
+			Message: Message{
+				Role: RoleAssistant,
+				Content: []ContentBlock{
+					ToolCallBlock(ToolCall{ID: "tc2", Name: "never_reach", Args: json.RawMessage(`{}`)}),
+				},
+				StopReason: StopReasonToolUse,
+			},
+		}, nil
+	})
+
+	events := runTestLoop(t,
+		[]AgentMessage{UserMsg("do work")},
+		AgentContext{Tools: []Tool{commitTool, neverTool}},
+		LoopConfig{
+			StreamFn:   streamFn,
+			ToolChoice: "required",
+			StopAfterTool: func(name string) bool {
+				return name == "commit"
+			},
+		},
+	)
+
 	if callCount != 1 {
-		t.Fatalf("expected no automatic recovery when truncated output contains tool call blocks, got %d calls", callCount)
+		t.Fatalf("expected loop to stop after commit tool (1 LLM call), got %d", callCount)
+	}
+	// Verify we got EventAgentEnd with EndReasonStop
+	var endEvent *Event
+	for _, ev := range events {
+		if ev.Type == EventAgentEnd {
+			endEvent = &ev
+		}
+	}
+	if endEvent == nil {
+		t.Fatal("no EventAgentEnd emitted")
+	}
+	if endEvent.Summary == nil || endEvent.Summary.EndReason != EndReasonStop {
+		t.Fatalf("expected EndReasonStop, got %v", endEvent.Summary)
 	}
 }
 

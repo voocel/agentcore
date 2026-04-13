@@ -224,8 +224,6 @@ func runLoop(ctx context.Context, currentCtx *AgentContext, newMessages *[]Agent
 				return
 			}
 
-			hadToolCallBlocks := hasToolCallBlocks(assistantMsg.Content)
-
 			// When output was truncated (max_tokens hit), tool calls are likely
 			// incomplete with malformed JSON args. Strip them to avoid validation
 			// errors and API rejections.
@@ -240,9 +238,14 @@ func runLoop(ctx context.Context, currentCtx *AgentContext, newMessages *[]Agent
 			toolCalls := assistantMsg.ToolCalls()
 			summaryState.toolCalls += len(toolCalls)
 			hasMoreToolCalls = len(toolCalls) > 0
+			// Recover when output was truncated and no tool calls completed.
+			// This includes the case where tool call blocks existed but were
+			// stripped due to incomplete JSON — the tool was never executed,
+			// so recovery is safe. The recovery prompt tells the model to
+			// "break remaining work into smaller pieces."
 			shouldRecoverLength := assistantMsg.StopReason == StopReasonLength &&
 				len(toolCalls) == 0 &&
-				!hadToolCallBlocks &&
+				!callInfo.HasCompletedToolCalls &&
 				lengthRecoveryCount < defaultMaxLengthRecoveries
 
 			var turnToolResults []ToolResult
@@ -273,6 +276,16 @@ func runLoop(ctx context.Context, currentCtx *AgentContext, newMessages *[]Agent
 
 			emit(ch, Event{Type: EventTurnEnd, Message: assistantMsg, ToolResults: turnToolResults})
 			turnCount++
+
+			// Early exit: a terminal tool completed successfully.
+			if config.StopAfterTool != nil {
+				for _, tr := range turnToolResults {
+					if !tr.IsError && config.StopAfterTool(tr.ToolName) {
+						emit(ch, Event{Type: EventAgentEnd, NewMessages: *newMessages, Summary: buildSummary(turnCount, EndReasonStop)})
+						return
+					}
+				}
+			}
 
 			if shouldRecoverLength {
 				lengthRecoveryCount++
