@@ -19,6 +19,7 @@ type ProgressPayloadKind string
 
 const (
 	ProgressToolStart   ProgressPayloadKind = "tool_start"
+	ProgressToolEnd     ProgressPayloadKind = "tool_end"
 	ProgressToolDelta   ProgressPayloadKind = "tool_delta"
 	ProgressThinking    ProgressPayloadKind = "thinking"
 	ProgressSummary     ProgressPayloadKind = "summary"

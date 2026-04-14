@@ -519,36 +519,47 @@ func (t *SubAgentTool) runAgent(ctx context.Context, agentName, task string, mod
 			}
 		case EventMessageUpdate:
 			if bg == nil {
-				if ev.Delta != "" {
+				if ev.DeltaKind == DeltaThinking {
+					// Thinking deltas only go through ProgressThinking (cumulative).
+					// Do NOT also send as ProgressToolDelta to avoid duplication.
+					if ev.Message != nil {
+						if thinking := ev.Message.ThinkingContent(); thinking != "" {
+							ReportToolProgress(ctx, ProgressPayload{
+								Kind:     ProgressThinking,
+								Agent:    agentName,
+								Thinking: thinking,
+							})
+						}
+					}
+				} else if ev.Delta != "" {
 					ReportToolProgress(ctx, ProgressPayload{
 						Kind:  ProgressToolDelta,
 						Agent: agentName,
 						Delta: ev.Delta,
 					})
 				}
-				if ev.Message != nil {
-					if thinking := ev.Message.ThinkingContent(); thinking != "" {
-						ReportToolProgress(ctx, ProgressPayload{
-							Kind:     ProgressThinking,
-							Agent:    agentName,
-							Thinking: thinking,
-						})
-					}
-				}
 			}
 		case EventToolExecEnd:
-			if bg == nil && ev.IsError {
-				errMsg := string(ev.Result)
-				if len(errMsg) > 200 {
-					errMsg = errMsg[:200]
+			if bg == nil {
+				if ev.IsError {
+					errMsg := string(ev.Result)
+					if len(errMsg) > 200 {
+						errMsg = errMsg[:200]
+					}
+					ReportToolProgress(ctx, ProgressPayload{
+						Kind:    ProgressToolError,
+						Agent:   agentName,
+						Tool:    ev.Tool,
+						Message: errMsg,
+						IsError: true,
+					})
+				} else {
+					ReportToolProgress(ctx, ProgressPayload{
+						Kind:  ProgressToolEnd,
+						Agent: agentName,
+						Tool:  ev.Tool,
+					})
 				}
-				ReportToolProgress(ctx, ProgressPayload{
-					Kind:    ProgressToolError,
-					Agent:   agentName,
-					Tool:    ev.Tool,
-					Message: errMsg,
-					IsError: true,
-				})
 			}
 			// Capture terminal tool result for inclusion in subagent output.
 			// When StopAfterTool fires, this is the last tool result and

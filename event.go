@@ -58,12 +58,22 @@ type RunSummary struct {
 	EndReason  EndReason
 }
 
+// DeltaKind identifies what kind of content a message_update delta carries.
+type DeltaKind string
+
+const (
+	DeltaText     DeltaKind = ""         // default: regular text
+	DeltaThinking DeltaKind = "thinking" // model reasoning/thinking
+	DeltaToolCall DeltaKind = "toolcall" // tool call argument JSON
+)
+
 // Event is a lifecycle event emitted by the agent loop.
 // This is the single output channel for all lifecycle information.
 type Event struct {
 	Type               EventType
 	Message            AgentMessage    // for message_start/update/end, turn_end
 	Delta              string          // text delta for message_update
+	DeltaKind          DeltaKind       // for message_update: what kind of delta
 	ToolID             string          // for tool_exec_*
 	Tool               string          // tool name for tool_exec_*
 	ToolLabel          string          // human-readable tool label (from ToolLabeler)
