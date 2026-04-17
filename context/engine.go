@@ -604,6 +604,22 @@ func (e *ContextEngine) EstimateContext(msgs []agentcore.AgentMessage) (tokens, 
 	return ContextEstimateAdapter(msgs)
 }
 
+// SetContextWindow updates the context window size used for threshold calculations.
+func (e *ContextEngine) SetContextWindow(n int) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	e.cfg.ContextWindow = n
+}
+
+// SetReserveTokens updates the prompt headroom reserved when computing the
+// compaction threshold. Pass 0 to restore the engine's built-in default on the
+// next threshold calculation.
+func (e *ContextEngine) SetReserveTokens(n int) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	e.cfg.ReserveTokens = n
+}
+
 // ContextWindow implements agentcore.ContextWindower.
 func (e *ContextEngine) ContextWindow() int {
 	return e.cfg.ContextWindow
