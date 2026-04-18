@@ -44,6 +44,10 @@ type ProgressPayload struct {
 	IsError    bool                `json:"is_error,omitempty"`
 	Args       json.RawMessage     `json:"args,omitempty"`
 	Meta       json.RawMessage     `json:"meta,omitempty"`
+	// DeltaKind distinguishes what kind of content Delta carries when Kind is
+	// ProgressToolDelta. Consumers can use this to filter/render text vs
+	// tool-call argument JSON differently.
+	DeltaKind DeltaKind `json:"delta_kind,omitempty"`
 }
 
 // ToolProgressFunc is a callback for reporting tool execution progress.

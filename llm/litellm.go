@@ -142,9 +142,10 @@ func (l *LiteLLMAdapter) GenerateStream(ctx context.Context, messages []agentcor
 		defer stream.Close()
 
 		var (
-			partial  = agentcore.Message{Role: agentcore.RoleAssistant}
-			textIdx  = -1
-			thinkIdx = -1
+			partial      = agentcore.Message{Role: agentcore.RoleAssistant}
+			textIdx      = -1
+			thinkIdx     = -1
+			toolBlockIdx = -1 // index into partial.Content of the tool call currently being streamed
 		)
 
 		resp, err := litellm.CollectStreamWithCallbacks(stream, litellm.StreamCallbacks{
@@ -202,12 +203,36 @@ func (l *LiteLLMAdapter) GenerateStream(ctx context.Context, messages []agentcor
 				}
 			},
 			OnToolCallStart: func(delta *litellm.ToolCallDelta) {
+				// Append a placeholder ToolCall block to partial so downstream stream
+				// consumers can read the active tool name from partial.ToolCalls()
+				// while arguments are still being streamed. Some providers deliver the
+				// function name later via OnToolCall; that's patched in below.
+				// OnToolCallEnd replaces this placeholder in-place with the completed call.
+				var name, id string
+				if delta != nil {
+					name = delta.FunctionName
+					id = delta.ID
+				}
+				partial.Content = append(partial.Content, agentcore.ToolCallBlock(agentcore.ToolCall{
+					ID:   id,
+					Name: name,
+				}))
+				toolBlockIdx = len(partial.Content) - 1
 				eventChan <- agentcore.StreamEvent{
 					Type:    agentcore.StreamEventToolCallStart,
 					Message: partial,
 				}
 			},
 			OnToolCall: func(delta *litellm.ToolCallDelta) {
+				if delta == nil {
+					return
+				}
+				if toolBlockIdx >= 0 && delta.FunctionName != "" {
+					if block := partial.Content[toolBlockIdx]; block.ToolCall != nil && block.ToolCall.Name == "" {
+						block.ToolCall.Name = delta.FunctionName
+						partial.Content[toolBlockIdx] = block
+					}
+				}
 				if delta.ArgumentsDelta != "" {
 					eventChan <- agentcore.StreamEvent{
 						Type:    agentcore.StreamEventToolCallDelta,
@@ -222,12 +247,19 @@ func (l *LiteLLMAdapter) GenerateStream(ctx context.Context, messages []agentcor
 					Name: call.Function.Name,
 					Args: safeArgs(call.Function.Arguments),
 				}
-				partial.Content = append(partial.Content, agentcore.ToolCallBlock(completed))
-				idx := len(partial.Content) - 1
+				var idx int
+				if toolBlockIdx >= 0 {
+					idx = toolBlockIdx
+					partial.Content[idx] = agentcore.ToolCallBlock(completed)
+					toolBlockIdx = -1
+				} else {
+					partial.Content = append(partial.Content, agentcore.ToolCallBlock(completed))
+					idx = len(partial.Content) - 1
+				}
 				eventChan <- agentcore.StreamEvent{
-					Type:         agentcore.StreamEventToolCallEnd,
-					ContentIndex: idx,
-					Message:      partial,
+					Type:              agentcore.StreamEventToolCallEnd,
+					ContentIndex:      idx,
+					Message:           partial,
 					CompletedToolCall: &completed,
 				}
 			},

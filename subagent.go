@@ -532,11 +532,23 @@ func (t *SubAgentTool) runAgent(ctx context.Context, agentName, task string, mod
 						}
 					}
 				} else if ev.Delta != "" {
-					ReportToolProgress(ctx, ProgressPayload{
-						Kind:  ProgressToolDelta,
-						Agent: agentName,
-						Delta: ev.Delta,
-					})
+					payload := ProgressPayload{
+						Kind:      ProgressToolDelta,
+						Agent:     agentName,
+						Delta:     ev.Delta,
+						DeltaKind: ev.DeltaKind,
+					}
+					if ev.DeltaKind == DeltaToolCall {
+						if m, ok := ev.Message.(Message); ok {
+							for _, tc := range m.ToolCalls() {
+								if tc.Name != "" {
+									payload.Tool = tc.Name
+									break
+								}
+							}
+						}
+					}
+					ReportToolProgress(ctx, payload)
 				}
 			}
 		case EventToolExecEnd:
