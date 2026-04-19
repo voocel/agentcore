@@ -80,7 +80,7 @@ func TestCallLLM_CommitsProjectedContextWhenRequested(t *testing.T) {
 	}
 
 	events := make(chan Event, 16)
-	if _, _, err := callLLM(context.Background(), agentCtx, cfg, events, llmCallHooks{}); err != nil {
+	if _, _, err := callLLM(context.Background(), agentCtx, cfg, events, llmCallHooks{}, TurnInfo{}); err != nil {
 		t.Fatalf("callLLM failed: %v", err)
 	}
 

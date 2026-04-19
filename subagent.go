@@ -203,11 +203,16 @@ func (t *SubAgentTool) Execute(ctx context.Context, args json.RawMessage) (json.
 	hasSingle := params.Agent != "" && params.Task != ""
 
 	// Background mode: single task running in a detached goroutine.
+	// If TaskRuntime is not wired, silently degrade to synchronous execution
+	// so callers don't hit a dead-end error when background support is unavailable.
 	if params.Background {
 		if !hasSingle {
 			return json.Marshal("background mode requires agent + task")
 		}
-		return t.executeBackground(params.Agent, params.Task, params.Description, modelOverride)
+		if t.taskRT != nil {
+			return t.executeBackground(params.Agent, params.Task, params.Description, modelOverride)
+		}
+		// Fall through to synchronous single-task execution.
 	}
 
 	modeCount := boolToInt(hasChain) + boolToInt(hasParallel) + boolToInt(hasSingle)

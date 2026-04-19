@@ -142,6 +142,9 @@ func runLoop(ctx context.Context, currentCtx *AgentContext, newMessages *[]Agent
 		pendingMessages = config.GetSteeringMessages()
 	}
 
+	// Track last assistant message so StopGuard can inspect what's stopping us.
+	var lastAssistantMsg Message
+
 	// Outer loop: continues when follow-up messages arrive after agent would stop
 	for {
 		hasMoreToolCalls := true
@@ -169,9 +172,14 @@ func runLoop(ctx context.Context, currentCtx *AgentContext, newMessages *[]Agent
 			}
 
 			if turnCount >= maxTurns {
-				emit(ch, Event{Type: EventError, Err: fmt.Errorf("max turns (%d) reached", maxTurns)})
-				emit(ch, Event{Type: EventAgentEnd, NewMessages: *newMessages, Summary: buildSummary(turnCount, EndReasonMaxTurns)})
-				return
+				if config.OnMaxTurns != MaxTurnsSoftRestart {
+					emit(ch, Event{Type: EventError, Err: fmt.Errorf("max turns (%d) reached", maxTurns)})
+					emit(ch, Event{Type: EventAgentEnd, NewMessages: *newMessages, Summary: buildSummary(turnCount, EndReasonMaxTurns)})
+					return
+				}
+				// Soft restart: reset the counter and keep going.
+				turnCount = 0
+				lengthRecoveryCount = 0
 			}
 
 			if !firstTurn {
@@ -201,7 +209,8 @@ func runLoop(ctx context.Context, currentCtx *AgentContext, newMessages *[]Agent
 			}
 
 			// Call LLM with retry (streaming: events emitted inside callLLM)
-			assistantMsg, callInfo, err := callLLMWithRetry(ctx, currentCtx, config, ch, hooks)
+			turnInfo := TurnInfo{TurnIndex: turnCount}
+			assistantMsg, callInfo, err := callLLMWithRetry(ctx, currentCtx, config, ch, hooks, turnInfo)
 			if err != nil {
 				if streamedTools != nil {
 					streamedTools.AbortAndWait()
@@ -240,6 +249,7 @@ func runLoop(ctx context.Context, currentCtx *AgentContext, newMessages *[]Agent
 				assistantMsg.Content = stripToolCallBlocks(assistantMsg.Content)
 			}
 
+			lastAssistantMsg = assistantMsg
 			commitMessage(currentCtx, newMessages, config, assistantMsg)
 
 			// Check for tool calls
@@ -318,6 +328,23 @@ func runLoop(ctx context.Context, currentCtx *AgentContext, newMessages *[]Agent
 			}
 		}
 
+		// StopGuard veto: give the application a chance to keep the loop alive.
+		if config.StopGuard != nil {
+			decision := config.StopGuard(ctx, StopInfo{
+				TurnIndex: turnCount,
+				Message:   lastAssistantMsg,
+			})
+			if decision.Escalate {
+				emit(ch, Event{Type: EventError, Err: fmt.Errorf("stop guard escalated: run terminated")})
+				emit(ch, Event{Type: EventAgentEnd, NewMessages: *newMessages, Summary: buildSummary(turnCount, EndReasonError)})
+				return
+			}
+			if !decision.Allow && decision.InjectMessage != "" {
+				pendingMessages = []AgentMessage{UserMsg(decision.InjectMessage)}
+				continue
+			}
+		}
+
 		break
 	}
 
@@ -334,12 +361,12 @@ type llmCallInfo struct {
 
 // callLLMWithRetry wraps callLLM with retry logic for retryable errors.
 // Context overflow errors trigger automatic compaction and a single retry.
-func callLLMWithRetry(ctx context.Context, agentCtx *AgentContext, config LoopConfig, ch chan<- Event, hooks llmCallHooks) (Message, llmCallInfo, error) {
+func callLLMWithRetry(ctx context.Context, agentCtx *AgentContext, config LoopConfig, ch chan<- Event, hooks llmCallHooks, turn TurnInfo) (Message, llmCallInfo, error) {
 	maxRetries := config.MaxRetries
 	if maxRetries <= 0 {
-		msg, info, err := callLLM(ctx, agentCtx, config, ch, hooks)
+		msg, info, err := callLLM(ctx, agentCtx, config, ch, hooks, turn)
 		if err != nil && IsContextOverflow(err) {
-			return recoverOverflow(ctx, agentCtx, config, ch, err, hooks)
+			return recoverOverflow(ctx, agentCtx, config, ch, err, hooks, turn)
 		}
 		return msg, info, err
 	}
@@ -347,7 +374,7 @@ func callLLMWithRetry(ctx context.Context, agentCtx *AgentContext, config LoopCo
 	var lastErr error
 	var lastInfo llmCallInfo
 	for attempt := 0; attempt <= maxRetries; attempt++ {
-		msg, info, err := callLLM(ctx, agentCtx, config, ch, hooks)
+		msg, info, err := callLLM(ctx, agentCtx, config, ch, hooks, turn)
 		if err == nil {
 			return msg, info, nil
 		}
@@ -356,7 +383,7 @@ func callLLMWithRetry(ctx context.Context, agentCtx *AgentContext, config LoopCo
 
 		// Context overflow: compact and retry once (not a normal retry)
 		if IsContextOverflow(err) {
-			return recoverOverflow(ctx, agentCtx, config, ch, err, hooks)
+			return recoverOverflow(ctx, agentCtx, config, ch, err, hooks, turn)
 		}
 
 		// Once streamed tool calls have already completed, retrying this turn
@@ -393,7 +420,7 @@ func callLLMWithRetry(ctx context.Context, agentCtx *AgentContext, config LoopCo
 
 // recoverOverflow attempts to compact the context and retry the LLM call.
 // If no TransformContext is configured, the original error is returned.
-func recoverOverflow(ctx context.Context, agentCtx *AgentContext, config LoopConfig, ch chan<- Event, originalErr error, hooks llmCallHooks) (Message, llmCallInfo, error) {
+func recoverOverflow(ctx context.Context, agentCtx *AgentContext, config LoopConfig, ch chan<- Event, originalErr error, hooks llmCallHooks, turn TurnInfo) (Message, llmCallInfo, error) {
 	if config.ContextManager == nil && config.TransformContext == nil {
 		return Message{}, llmCallInfo{}, fmt.Errorf("context overflow (no compaction configured): %w", originalErr)
 	}
@@ -422,7 +449,7 @@ func recoverOverflow(ctx context.Context, agentCtx *AgentContext, config LoopCon
 				return Message{}, llmCallInfo{}, fmt.Errorf("overflow recovery commit failed: %w", err)
 			}
 		}
-		return callLLM(ctx, agentCtx, config, ch, hooks)
+		return callLLM(ctx, agentCtx, config, ch, hooks, turn)
 	}
 
 	compacted, err := config.TransformContext(ctx, agentCtx.Messages)
@@ -430,7 +457,7 @@ func recoverOverflow(ctx context.Context, agentCtx *AgentContext, config LoopCon
 		return Message{}, llmCallInfo{}, fmt.Errorf("overflow recovery compaction failed: %w", err)
 	}
 	agentCtx.Messages = compacted
-	return callLLM(ctx, agentCtx, config, ch, hooks)
+	return callLLM(ctx, agentCtx, config, ch, hooks, turn)
 }
 
 // IsContextOverflow reports whether the error indicates a context window overflow.
@@ -460,7 +487,7 @@ func retryDelay(err error, attempt int, maxDelay time.Duration) time.Duration {
 }
 
 // callLLM applies the two-stage pipeline and calls the model.
-func callLLM(ctx context.Context, agentCtx *AgentContext, config LoopConfig, ch chan<- Event, hooks llmCallHooks) (Message, llmCallInfo, error) {
+func callLLM(ctx context.Context, agentCtx *AgentContext, config LoopConfig, ch chan<- Event, hooks llmCallHooks, turn TurnInfo) (Message, llmCallInfo, error) {
 	messages := agentCtx.Messages
 
 	// Stage 1: ContextManager / TransformContext
@@ -510,18 +537,28 @@ func callLLM(ctx context.Context, agentCtx *AgentContext, config LoopConfig, ch 
 	// Build tool specs
 	toolSpecs := buildToolSpecs(agentCtx.Tools)
 
-	// Prepend system prompt as first message(s)
+	// Prepend system prompt as first message(s), followed by any per-turn
+	// reminders. Reminders are injected AFTER the static system prompt so
+	// providers can still cache the static portion.
+	var prefix []Message
 	if len(agentCtx.SystemBlocks) > 0 {
-		sysMsgs := make([]Message, len(agentCtx.SystemBlocks))
-		for i, b := range agentCtx.SystemBlocks {
-			sysMsgs[i] = SystemMsg(b.Text)
+		for _, b := range agentCtx.SystemBlocks {
+			m := SystemMsg(b.Text)
 			if b.CacheControl != "" {
-				sysMsgs[i].Metadata = map[string]any{"cache_control": b.CacheControl}
+				m.Metadata = map[string]any{"cache_control": b.CacheControl}
 			}
+			prefix = append(prefix, m)
 		}
-		llmMessages = append(sysMsgs, llmMessages...)
 	} else if agentCtx.SystemPrompt != "" {
-		llmMessages = append([]Message{SystemMsg(agentCtx.SystemPrompt)}, llmMessages...)
+		prefix = append(prefix, SystemMsg(agentCtx.SystemPrompt))
+	}
+	if len(config.ReminderGens) > 0 {
+		if rm := reminderSystemMessages(collectReminders(ctx, config.ReminderGens, turn)); len(rm) > 0 {
+			prefix = append(prefix, rm...)
+		}
+	}
+	if len(prefix) > 0 {
+		llmMessages = append(prefix, llmMessages...)
 	}
 
 	// Call via StreamFn (non-streaming shortcut, e.g. mock/proxy)
@@ -1110,6 +1147,12 @@ func validateToolArgs(tool Tool, args json.RawMessage) error {
 	// Check property types
 	if props, ok := schema["properties"].(map[string]any); ok {
 		for key, val := range parsed {
+			// JSON null on an optional field is equivalent to omitting the field.
+			// Some LLMs emit "field": null instead of dropping the key; rejecting
+			// those as type mismatches derails tool use on the very first call.
+			if val == nil {
+				continue
+			}
 			propSchema, exists := props[key]
 			if !exists {
 				continue

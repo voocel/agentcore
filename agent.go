@@ -55,6 +55,9 @@ type Agent struct {
 	toolChoice            any // default tool_choice for LLM calls
 	onMessage             func(AgentMessage)
 	taskRuntime           *TaskRuntime
+	reminderGens          []ReminderGenerator
+	stopGuard             StopGuard
+	onMaxTurns            MaxTurnsAction
 
 	// State
 	messages         []AgentMessage
@@ -665,6 +668,9 @@ func (a *Agent) buildConfig() LoopConfig {
 		ShouldEmitAbortMarker: a.wantAbortMarker.Load,
 		ToolChoice:            a.toolChoice,
 		OnMessage:             a.onMessage,
+		ReminderGens:          a.reminderGens,
+		StopGuard:             a.stopGuard,
+		OnMaxTurns:            a.onMaxTurns,
 	}
 }
 

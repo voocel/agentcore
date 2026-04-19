@@ -202,3 +202,44 @@ func WithTaskRuntime(rt *TaskRuntime) AgentOption {
 func WithOnMessage(fn func(AgentMessage)) AgentOption {
 	return func(a *Agent) { a.onMessage = fn }
 }
+
+// ---------------------------------------------------------------------------
+// Reminder / StopGuard / MaxTurns behavior — long-run stability primitives
+// ---------------------------------------------------------------------------
+
+// WithReminderGenerator registers a per-turn reminder generator. Multiple calls
+// stack: every generator is invoked in registration order before each LLM call,
+// and their combined reminders are injected as one-turn system messages.
+// Reminders do not enter the persistent message history.
+func WithReminderGenerator(gen ReminderGenerator) AgentOption {
+	return func(a *Agent) {
+		if gen == nil {
+			return
+		}
+		a.reminderGens = append(a.reminderGens, gen)
+	}
+}
+
+// WithStopGuard installs a guard that decides whether the agent may stop
+// when the LLM emits end_turn without tool calls. Nil guard (default) means
+// every stop is allowed — legacy behavior.
+func WithStopGuard(guard StopGuard) AgentOption {
+	return func(a *Agent) { a.stopGuard = guard }
+}
+
+// MaxTurnsAction selects the behavior when MaxTurns is reached.
+type MaxTurnsAction int
+
+const (
+	// MaxTurnsTerminate (default) emits an error event and ends the run.
+	MaxTurnsTerminate MaxTurnsAction = iota
+	// MaxTurnsSoftRestart resets the internal turn counter to 0 and continues
+	// the loop. Useful for very long runs where MaxTurns is a soft upper bound.
+	MaxTurnsSoftRestart
+)
+
+// WithOnMaxTurns configures what happens when the MaxTurns safety limit is
+// reached. The default is MaxTurnsTerminate.
+func WithOnMaxTurns(action MaxTurnsAction) AgentOption {
+	return func(a *Agent) { a.onMaxTurns = action }
+}
