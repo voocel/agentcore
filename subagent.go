@@ -48,6 +48,11 @@ type SubAgentConfig struct {
 	ContextManagerFactory func(model ChatModel) ContextManager
 	TransformContext      func(ctx context.Context, msgs []AgentMessage) ([]AgentMessage, error)
 	ConvertToLLM          func(msgs []AgentMessage) []Message
+
+	// StopGuardFactory, if non-nil, creates a fresh StopGuard for each run.
+	// The factory receives the agent name and task, enabling run-scoped state
+	// (e.g. baseline progress captured at dispatch time).
+	StopGuardFactory func(agentName, task string) StopGuard
 }
 
 // subagentParams is the JSON schema input for the subagent tool.
@@ -484,6 +489,9 @@ func (t *SubAgentTool) runAgent(ctx context.Context, agentName, task string, mod
 			_, ok := stopSet[toolName]
 			return ok
 		}
+	}
+	if cfg.StopGuardFactory != nil {
+		loopCfg.StopGuard = cfg.StopGuardFactory(agentName, task)
 	}
 	if cfg.OnMessage != nil {
 		name, t := agentName, task

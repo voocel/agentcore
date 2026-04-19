@@ -537,9 +537,9 @@ func callLLM(ctx context.Context, agentCtx *AgentContext, config LoopConfig, ch 
 	// Build tool specs
 	toolSpecs := buildToolSpecs(agentCtx.Tools)
 
-	// Prepend system prompt as first message(s), followed by any per-turn
-	// reminders. Reminders are injected AFTER the static system prompt so
-	// providers can still cache the static portion.
+	// Prepend the static system prompt as first message(s). Keeping it at the
+	// head and byte-stable across turns lets providers with prefix-based
+	// caching (OpenAI) serve it from cache.
 	var prefix []Message
 	if len(agentCtx.SystemBlocks) > 0 {
 		for _, b := range agentCtx.SystemBlocks {
@@ -552,13 +552,19 @@ func callLLM(ctx context.Context, agentCtx *AgentContext, config LoopConfig, ch 
 	} else if agentCtx.SystemPrompt != "" {
 		prefix = append(prefix, SystemMsg(agentCtx.SystemPrompt))
 	}
-	if len(config.ReminderGens) > 0 {
-		if rm := reminderSystemMessages(collectReminders(ctx, config.ReminderGens, turn)); len(rm) > 0 {
-			prefix = append(prefix, rm...)
-		}
-	}
 	if len(prefix) > 0 {
 		llmMessages = append(prefix, llmMessages...)
+	}
+
+	// Append per-turn reminders at the END of the message list. Reminders
+	// change every turn; placing them at the tail keeps the preceding
+	// constant-prefix chain (system prompt + growing history) intact for
+	// prefix caches. Anthropic adapters extract system messages in order
+	// regardless of position, so block-level cache markers stay correct.
+	if len(config.ReminderGens) > 0 {
+		if rm := reminderSystemMessages(collectReminders(ctx, config.ReminderGens, turn)); len(rm) > 0 {
+			llmMessages = append(llmMessages, rm...)
+		}
 	}
 
 	// Call via StreamFn (non-streaming shortcut, e.g. mock/proxy)
