@@ -142,10 +142,10 @@ func (l *LiteLLMAdapter) GenerateStream(ctx context.Context, messages []agentcor
 		defer stream.Close()
 
 		var (
-			partial      = agentcore.Message{Role: agentcore.RoleAssistant}
-			textIdx      = -1
-			thinkIdx     = -1
-			toolBlockIdx = -1 // index into partial.Content of the tool call currently being streamed
+			partial          = agentcore.Message{Role: agentcore.RoleAssistant}
+			textIdx          = -1
+			thinkIdx         = -1
+			toolBlockIndices = make(map[string]int)
 		)
 
 		resp, err := litellm.CollectStreamWithCallbacks(stream, litellm.StreamCallbacks{
@@ -217,7 +217,9 @@ func (l *LiteLLMAdapter) GenerateStream(ctx context.Context, messages []agentcor
 					ID:   id,
 					Name: name,
 				}))
-				toolBlockIdx = len(partial.Content) - 1
+				if id != "" {
+					toolBlockIndices[id] = len(partial.Content) - 1
+				}
 				eventChan <- agentcore.StreamEvent{
 					Type:    agentcore.StreamEventToolCallStart,
 					Message: partial,
@@ -227,11 +229,19 @@ func (l *LiteLLMAdapter) GenerateStream(ctx context.Context, messages []agentcor
 				if delta == nil {
 					return
 				}
+				toolBlockIdx := findPendingToolCallBlock(partial.Content, toolBlockIndices, delta.ID)
 				if toolBlockIdx >= 0 && delta.FunctionName != "" {
 					if block := partial.Content[toolBlockIdx]; block.ToolCall != nil && block.ToolCall.Name == "" {
 						block.ToolCall.Name = delta.FunctionName
 						partial.Content[toolBlockIdx] = block
 					}
+				}
+				if toolBlockIdx >= 0 && delta.ID != "" {
+					if block := partial.Content[toolBlockIdx]; block.ToolCall != nil && block.ToolCall.ID == "" {
+						block.ToolCall.ID = delta.ID
+						partial.Content[toolBlockIdx] = block
+					}
+					toolBlockIndices[delta.ID] = toolBlockIdx
 				}
 				if delta.ArgumentsDelta != "" {
 					eventChan <- agentcore.StreamEvent{
@@ -247,14 +257,15 @@ func (l *LiteLLMAdapter) GenerateStream(ctx context.Context, messages []agentcor
 					Name: call.Function.Name,
 					Args: safeArgs(call.Function.Arguments),
 				}
-				var idx int
-				if toolBlockIdx >= 0 {
-					idx = toolBlockIdx
+				idx := findPendingToolCallBlock(partial.Content, toolBlockIndices, call.ID)
+				if idx >= 0 {
 					partial.Content[idx] = agentcore.ToolCallBlock(completed)
-					toolBlockIdx = -1
 				} else {
 					partial.Content = append(partial.Content, agentcore.ToolCallBlock(completed))
 					idx = len(partial.Content) - 1
+				}
+				if call.ID != "" {
+					toolBlockIndices[call.ID] = idx
 				}
 				eventChan <- agentcore.StreamEvent{
 					Type:              agentcore.StreamEventToolCallEnd,
@@ -540,4 +551,27 @@ func safeArgs(args string) json.RawMessage {
 		return json.RawMessage("{}")
 	}
 	return json.RawMessage(args)
+}
+
+func findPendingToolCallBlock(content []agentcore.ContentBlock, byID map[string]int, toolCallID string) int {
+	if toolCallID != "" {
+		if idx, ok := byID[toolCallID]; ok && idx >= 0 && idx < len(content) {
+			if block := content[idx]; block.ToolCall != nil {
+				return idx
+			}
+		}
+	}
+	for i := len(content) - 1; i >= 0; i-- {
+		block := content[i]
+		if block.ToolCall == nil {
+			continue
+		}
+		if toolCallID != "" && block.ToolCall.ID == toolCallID {
+			return i
+		}
+		if len(block.ToolCall.Args) == 0 {
+			return i
+		}
+	}
+	return -1
 }
