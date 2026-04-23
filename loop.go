@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"math"
+	"sort"
 	"strings"
 	"time"
 
@@ -1122,35 +1123,36 @@ func buildToolSpecs(tools []Tool) []ToolSpec {
 }
 
 // validateToolArgs validates tool call arguments against the tool's JSON Schema.
-// Checks required fields and basic type matching. Returns nil if valid or schema is unavailable.
-// On failure, returns a formatted error message suitable for sending back to the LLM.
+// Collects every missing-required and type-mismatch issue in one pass so weaker
+// models can self-correct in a single follow-up turn instead of trial-and-error.
+// Error text mirrors Claude Code's formatZodValidationError — natural-language,
+// one line per issue — which empirically recovers faster than terse errors.
 func validateToolArgs(tool Tool, args json.RawMessage) error {
 	schema := tool.Schema()
 	if schema == nil {
 		return nil
 	}
 
-	// Parse arguments (treat nil/empty as empty object)
 	if len(args) == 0 {
 		args = []byte("{}")
 	}
 	var parsed map[string]any
 	if err := json.Unmarshal(args, &parsed); err != nil {
-		return fmt.Errorf("validation failed for tool %q: invalid JSON: %w", tool.Name(), err)
+		return fmt.Errorf("InputValidationError: %s received invalid JSON arguments: %v", tool.Name(), err)
 	}
 
-	// Check required fields
+	var issues []validationIssue
+
 	if reqSlice, ok := schema["required"]; ok {
 		if required, ok := reqSlice.([]string); ok {
 			for _, field := range required {
 				if _, exists := parsed[field]; !exists {
-					return fmt.Errorf("validation failed for tool %q: missing required field %q", tool.Name(), field)
+					issues = append(issues, validationIssue{kind: issueMissing, path: field})
 				}
 			}
 		}
 	}
 
-	// Check property types
 	if props, ok := schema["properties"].(map[string]any); ok {
 		for key, val := range parsed {
 			// JSON null on an optional field is equivalent to omitting the field.
@@ -1171,49 +1173,124 @@ func validateToolArgs(tool Tool, args json.RawMessage) error {
 			if expectedType == "" {
 				continue
 			}
-			if err := checkType(key, val, expectedType); err != nil {
-				return fmt.Errorf("validation failed for tool %q: %w", tool.Name(), err)
+			if received, mismatch := typeMismatch(val, expectedType); mismatch {
+				issues = append(issues, validationIssue{
+					kind:     issueType,
+					path:     key,
+					expected: expectedType,
+					received: received,
+				})
 			}
 		}
 	}
 
-	return nil
+	if len(issues) == 0 {
+		return nil
+	}
+	return fmt.Errorf("%s", formatInputValidationError(tool.Name(), issues))
 }
 
-// checkType validates a single value against an expected JSON Schema type.
-func checkType(field string, val any, expected string) error {
-	switch expected {
-	case "string":
-		if _, ok := val.(string); !ok {
-			return fmt.Errorf("field %q: expected string, got %T", field, val)
+const (
+	issueMissing = "missing"
+	issueType    = "type"
+)
+
+type validationIssue struct {
+	kind     string
+	path     string
+	expected string
+	received string
+}
+
+// formatInputValidationError renders all collected issues as a single multi-line
+// block. Missing params come first (the most fundamental error), then type
+// mismatches; within each group, paths are sorted alphabetically for stable
+// output across map-iteration orders.
+func formatInputValidationError(toolName string, issues []validationIssue) string {
+	sort.SliceStable(issues, func(i, j int) bool {
+		if issues[i].kind != issues[j].kind {
+			return issues[i].kind == issueMissing
 		}
-	case "integer":
-		switch v := val.(type) {
-		case float64:
-			if v != float64(int64(v)) {
-				return fmt.Errorf("field %q: expected integer, got float", field)
-			}
-		default:
-			return fmt.Errorf("field %q: expected integer, got %T", field, val)
-		}
-	case "number":
-		if _, ok := val.(float64); !ok {
-			return fmt.Errorf("field %q: expected number, got %T", field, val)
-		}
-	case "boolean":
-		if _, ok := val.(bool); !ok {
-			return fmt.Errorf("field %q: expected boolean, got %T", field, val)
-		}
-	case "array":
-		if _, ok := val.([]any); !ok {
-			return fmt.Errorf("field %q: expected array, got %T", field, val)
-		}
-	case "object":
-		if _, ok := val.(map[string]any); !ok {
-			return fmt.Errorf("field %q: expected object, got %T", field, val)
+		return issues[i].path < issues[j].path
+	})
+
+	lines := make([]string, 0, len(issues))
+	for _, it := range issues {
+		switch it.kind {
+		case issueMissing:
+			lines = append(lines, fmt.Sprintf("The required parameter `%s` is missing", it.path))
+		case issueType:
+			lines = append(lines, fmt.Sprintf(
+				"The parameter `%s` type is expected as `%s` but provided as `%s`",
+				it.path, it.expected, it.received,
+			))
 		}
 	}
-	return nil
+
+	noun := "issue"
+	if len(lines) > 1 {
+		noun = "issues"
+	}
+	header := fmt.Sprintf("InputValidationError: %s failed due to the following %s:", toolName, noun)
+	return header + "\n" + strings.Join(lines, "\n")
+}
+
+// typeMismatch reports whether val conflicts with the JSON Schema type. When it
+// does, the returned name is the user-facing JSON type name of the actual value
+// ("string" / "integer" / "number" / "boolean" / "array" / "object").
+func typeMismatch(val any, expected string) (string, bool) {
+	switch expected {
+	case "string":
+		if _, ok := val.(string); ok {
+			return "", false
+		}
+	case "integer":
+		if f, ok := val.(float64); ok && f == float64(int64(f)) {
+			return "", false
+		}
+	case "number":
+		if _, ok := val.(float64); ok {
+			return "", false
+		}
+	case "boolean":
+		if _, ok := val.(bool); ok {
+			return "", false
+		}
+	case "array":
+		if _, ok := val.([]any); ok {
+			return "", false
+		}
+	case "object":
+		if _, ok := val.(map[string]any); ok {
+			return "", false
+		}
+	default:
+		return "", false
+	}
+	return jsonTypeName(val), true
+}
+
+// jsonTypeName returns the JSON Schema type name for val.
+func jsonTypeName(val any) string {
+	switch v := val.(type) {
+	case nil:
+		return "null"
+	case bool:
+		return "boolean"
+	case string:
+		return "string"
+	case float64:
+		if v == float64(int64(v)) {
+			return "integer"
+		}
+		return "number"
+	case []any:
+		return "array"
+	case map[string]any:
+		return "object"
+	default:
+		return fmt.Sprintf("%T", val)
+	}
 }
 
 // buildMiddlewareChain wraps a tool execution function with the middleware stack.
