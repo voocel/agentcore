@@ -49,6 +49,10 @@ type ToolSpec struct {
 	Description  string `json:"description"`
 	Parameters   any    `json:"parameters"`
 	DeferLoading bool   `json:"defer_loading,omitempty"`
+	// Strict enables provider-side strict schema enforcement (OpenAI strict
+	// tool calling / Structured Outputs for arguments). nil leaves the
+	// provider default. Set via the optional StrictSchemaTool interface.
+	Strict *bool `json:"strict,omitempty"`
 }
 
 // LoopConfig configures the agent loop.

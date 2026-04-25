@@ -508,6 +508,7 @@ func applyToolConfig(request *litellm.Request, tools []agentcore.ToolSpec) {
 				Name:        t.Name,
 				Description: t.Description,
 				Parameters:  t.Parameters,
+				Strict:      t.Strict,
 			},
 			DeferLoading: t.DeferLoading,
 		})

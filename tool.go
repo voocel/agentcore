@@ -110,6 +110,19 @@ type ToolLabeler interface {
 	Label() string
 }
 
+// StrictSchemaTool is an optional interface for tools that want provider-side
+// strict schema enforcement on their arguments (e.g. OpenAI's strict tool
+// calling). Returning true forwards `strict: true` and triggers schema
+// normalisation in compatible providers; returning false explicitly disables
+// strict on providers that default to it (e.g. OpenAI Responses API).
+//
+// The tool author is responsible for providing a strict-compatible schema:
+// every property listed in `required`, no unsupported keywords. See the
+// litellm provider docs for the exact subset.
+type StrictSchemaTool interface {
+	StrictSchema() bool
+}
+
 // ContentTool is an optional interface for tools that return rich content
 // (e.g., images). When a tool implements ContentTool, the agent loop calls
 // ExecuteContent instead of Execute, enabling multi-block responses with

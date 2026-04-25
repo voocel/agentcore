@@ -1117,6 +1117,10 @@ func buildToolSpecs(tools []Tool) []ToolSpec {
 		if filter != nil && filter.WasDeferred(t.Name()) {
 			spec.DeferLoading = true // activated deferred → send with defer_loading
 		}
+		if s, ok := t.(StrictSchemaTool); ok {
+			strict := s.StrictSchema()
+			spec.Strict = &strict
+		}
 		specs = append(specs, spec)
 	}
 	return specs
