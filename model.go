@@ -146,6 +146,14 @@ type LoopConfig struct {
 	// Default (MaxTurnsTerminate) emits an error and ends the run.
 	// MaxTurnsSoftRestart resets the turn counter and continues the loop.
 	OnMaxTurns MaxTurnsAction
+
+	// ToolsAreIdempotent declares that all registered tools are safe to re-execute
+	// with the same arguments — i.e. running them twice produces the same observable
+	// state as running them once. When true, the retry loop will not bail out just
+	// because a tool_call already completed in the failed turn; instead it aborts
+	// the in-flight tool executions and retries the whole turn. Default false
+	// (conservative: assume tools may have non-idempotent side effects).
+	ToolsAreIdempotent bool
 }
 
 // ---------------------------------------------------------------------------

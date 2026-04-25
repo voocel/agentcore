@@ -52,6 +52,7 @@ type Agent struct {
 	middlewares           []ToolMiddleware
 	maxRetryDelay         time.Duration
 	maxToolConcurrency    int
+	toolsAreIdempotent    bool
 	toolChoice            any // default tool_choice for LLM calls
 	onMessage             func(AgentMessage)
 	taskRuntime           *TaskRuntime
@@ -671,6 +672,7 @@ func (a *Agent) buildConfig() LoopConfig {
 		ReminderGens:          a.reminderGens,
 		StopGuard:             a.stopGuard,
 		OnMaxTurns:            a.onMaxTurns,
+		ToolsAreIdempotent:    a.toolsAreIdempotent,
 	}
 }
 

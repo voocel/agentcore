@@ -30,6 +30,18 @@ type SubAgentConfig struct {
 	StreamFn     StreamFn
 	MaxTurns     int
 
+	// MaxRetries caps the LLM call retry count for retryable errors within this
+	// sub-agent's loop. 0 (default) disables retry entirely — note this is the
+	// agent loop default for direct callers but means sub-agents never retry
+	// transient errors unless explicitly set. Recommended: 3.
+	MaxRetries int
+
+	// ToolsAreIdempotent declares this sub-agent's tools are safe to re-execute.
+	// When true, the retry loop will not bail out merely because a tool_call
+	// already streamed in the failed turn — it will abort in-flight execution
+	// and retry. See WithToolsAreIdempotent on the main Agent for full rationale.
+	ToolsAreIdempotent bool
+
 	// ToolChoice sets the default tool_choice for every LLM call in this
 	// sub-agent's loop. nil uses the provider default ("auto").
 	ToolChoice any
@@ -472,13 +484,15 @@ func (t *SubAgentTool) runAgent(ctx context.Context, agentName, task string, mod
 	}
 
 	loopCfg := LoopConfig{
-		Model:            runModel,
-		StreamFn:         cfg.StreamFn,
-		MaxTurns:         cfg.MaxTurns,
-		ToolChoice:       cfg.ToolChoice,
-		ContextManager:   contextManager,
-		TransformContext: cfg.TransformContext,
-		ConvertToLLM:     cfg.ConvertToLLM,
+		Model:              runModel,
+		StreamFn:           cfg.StreamFn,
+		MaxTurns:           cfg.MaxTurns,
+		MaxRetries:         cfg.MaxRetries,
+		ToolsAreIdempotent: cfg.ToolsAreIdempotent,
+		ToolChoice:         cfg.ToolChoice,
+		ContextManager:     contextManager,
+		TransformContext:   cfg.TransformContext,
+		ConvertToLLM:       cfg.ConvertToLLM,
 	}
 	if len(cfg.StopAfterTools) > 0 {
 		stopSet := make(map[string]struct{}, len(cfg.StopAfterTools))

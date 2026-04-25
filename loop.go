@@ -209,9 +209,21 @@ func runLoop(ctx context.Context, currentCtx *AgentContext, newMessages *[]Agent
 				},
 			}
 
+			// Reset hook for retries: abort any tool executions started by the
+			// failed attempt and clear the executor so the next attempt sees
+			// a fresh slate (the OnToolCallComplete closure above re-creates it).
+			// Only used when ToolsAreIdempotent is set; without it, retries
+			// after a streamed tool_call are skipped entirely.
+			resetTurnState := func() {
+				if streamedTools != nil {
+					streamedTools.AbortAndWait()
+					streamedTools = nil
+				}
+			}
+
 			// Call LLM with retry (streaming: events emitted inside callLLM)
 			turnInfo := TurnInfo{TurnIndex: turnCount}
-			assistantMsg, callInfo, err := callLLMWithRetry(ctx, currentCtx, config, ch, hooks, turnInfo)
+			assistantMsg, callInfo, err := callLLMWithRetry(ctx, currentCtx, config, ch, hooks, turnInfo, resetTurnState)
 			if err != nil {
 				if streamedTools != nil {
 					streamedTools.AbortAndWait()
@@ -362,7 +374,14 @@ type llmCallInfo struct {
 
 // callLLMWithRetry wraps callLLM with retry logic for retryable errors.
 // Context overflow errors trigger automatic compaction and a single retry.
-func callLLMWithRetry(ctx context.Context, agentCtx *AgentContext, config LoopConfig, ch chan<- Event, hooks llmCallHooks, turn TurnInfo) (Message, llmCallInfo, error) {
+//
+// resetTurnState, when non-nil, is invoked after a retryable failure and before
+// the next attempt. Callers use it to abort and discard any tool executions
+// already kicked off via the streaming hook in the failed attempt, so the
+// retried attempt can re-execute the tool calls cleanly. Only invoked when
+// the failure path actually decides to retry (i.e. the error is retryable
+// and the attempt cap has not been reached).
+func callLLMWithRetry(ctx context.Context, agentCtx *AgentContext, config LoopConfig, ch chan<- Event, hooks llmCallHooks, turn TurnInfo, resetTurnState func()) (Message, llmCallInfo, error) {
 	maxRetries := config.MaxRetries
 	if maxRetries <= 0 {
 		msg, info, err := callLLM(ctx, agentCtx, config, ch, hooks, turn)
@@ -388,13 +407,22 @@ func callLLMWithRetry(ctx context.Context, agentCtx *AgentContext, config LoopCo
 		}
 
 		// Once streamed tool calls have already completed, retrying this turn
-		// risks duplicating side effects from tools that already started.
-		if info.HasCompletedToolCalls {
+		// risks duplicating side effects from tools that already started — unless
+		// the caller has declared its tools idempotent, in which case we abort
+		// the in-flight executions and retry the whole turn cleanly.
+		if info.HasCompletedToolCalls && !config.ToolsAreIdempotent {
 			return Message{}, info, err
 		}
 
 		if !litellm.IsRetryableError(err) || attempt == maxRetries {
 			return Message{}, info, err
+		}
+
+		// Discard any tool executions started during the failed attempt before
+		// the next retry — otherwise the streaming hook would Add a second copy
+		// of the same tool_call onto the same executor on the next callLLM.
+		if resetTurnState != nil {
+			resetTurnState()
 		}
 
 		delay := retryDelay(err, attempt, config.MaxRetryDelay)

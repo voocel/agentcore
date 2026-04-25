@@ -92,6 +92,19 @@ func WithMaxRetryDelay(d time.Duration) AgentOption {
 	return func(a *Agent) { a.maxRetryDelay = d }
 }
 
+// WithToolsAreIdempotent declares that all tools registered on this agent are
+// safe to re-execute with the same arguments. When true, an LLM call that
+// fails after a tool_call has already streamed (e.g. stream-idle timeout
+// before stop_reason arrives) will be retried instead of bailing out: the
+// in-flight tool execution is aborted and the turn replays from scratch.
+//
+// Only enable this when every tool's side effect is deduplicated by content
+// (e.g. checkpoint+digest, write-once via tmp+rename). The default (false)
+// preserves the conservative behavior that protects non-idempotent tools.
+func WithToolsAreIdempotent(idempotent bool) AgentOption {
+	return func(a *Agent) { a.toolsAreIdempotent = idempotent }
+}
+
 // ---------------------------------------------------------------------------
 // Context Pipeline — manage context window and message transformation
 // ---------------------------------------------------------------------------
