@@ -161,6 +161,207 @@ func TestMetadataOverrideForCustomTool(t *testing.T) {
 	}
 }
 
+func TestInternalReadablePathSilentlyAllowed(t *testing.T) {
+	workspace := t.TempDir()
+	memDir := t.TempDir()
+	engine := newTestEngine(t, workspace, ModeBalanced, nil)
+	engine.SetFilesystemRoots(FilesystemRoots{
+		InternalReadable: []string{memDir},
+	})
+	engine.SetApprover(func(context.Context, Prompt) (Choice, error) {
+		t.Fatalf("approver must not be called for internal path")
+		return ChoiceDeny, nil
+	})
+
+	target := filepath.Join(memDir, "MEMORY.md")
+	decision, err := engine.Decide(context.Background(), Request{
+		ToolName: "read",
+		Args:     mustJSON(t, map[string]any{"path": target}),
+	})
+	if err != nil {
+		t.Fatalf("Decide: %v", err)
+	}
+	if decision == nil || !decision.Allowed() {
+		t.Fatalf("expected silent allow, got %#v", decision)
+	}
+	if decision.Source != DecisionSourceInternal {
+		t.Fatalf("expected DecisionSourceInternal, got %q", decision.Source)
+	}
+	if decision.Prompted {
+		t.Fatalf("expected no prompt for internal path, got %#v", decision)
+	}
+	if decision.OutsideRoots {
+		t.Fatalf("internal path must not be marked outside roots, got %#v", decision)
+	}
+}
+
+func TestInternalWritablePathSilentlyAllowedInBalancedMode(t *testing.T) {
+	workspace := t.TempDir()
+	memDir := t.TempDir()
+	engine := newTestEngine(t, workspace, ModeBalanced, nil)
+	engine.SetFilesystemRoots(FilesystemRoots{
+		InternalWritable: []string{memDir},
+	})
+	engine.SetApprover(func(context.Context, Prompt) (Choice, error) {
+		t.Fatalf("approver must not be called for internal write path")
+		return ChoiceDeny, nil
+	})
+
+	target := filepath.Join(memDir, "MEMORY.md")
+	decision, err := engine.Decide(context.Background(), Request{
+		ToolName: "write",
+		Args:     mustJSON(t, map[string]any{"path": target}),
+	})
+	if err != nil {
+		t.Fatalf("Decide: %v", err)
+	}
+	if decision == nil || !decision.Allowed() || decision.Source != DecisionSourceInternal {
+		t.Fatalf("expected silent allow via internal path, got %#v", decision)
+	}
+}
+
+func TestInternalWritableImpliesReadable(t *testing.T) {
+	workspace := t.TempDir()
+	memDir := t.TempDir()
+	engine := newTestEngine(t, workspace, ModeBalanced, nil)
+	engine.SetFilesystemRoots(FilesystemRoots{
+		InternalWritable: []string{memDir},
+	})
+	engine.SetApprover(func(context.Context, Prompt) (Choice, error) {
+		t.Fatalf("approver must not be called when write implies read")
+		return ChoiceDeny, nil
+	})
+
+	target := filepath.Join(memDir, "topic.md")
+	decision, err := engine.Decide(context.Background(), Request{
+		ToolName: "read",
+		Args:     mustJSON(t, map[string]any{"path": target}),
+	})
+	if err != nil {
+		t.Fatalf("Decide: %v", err)
+	}
+	if decision == nil || !decision.Allowed() || decision.Source != DecisionSourceInternal {
+		t.Fatalf("expected internal-path read allow, got %#v", decision)
+	}
+}
+
+func TestInternalReadOnlyHardDeniesWrite(t *testing.T) {
+	workspace := t.TempDir()
+	memDir := t.TempDir()
+	engine := newTestEngine(t, workspace, ModeBalanced, nil)
+	engine.SetFilesystemRoots(FilesystemRoots{
+		InternalReadable: []string{memDir},
+	})
+
+	target := filepath.Join(memDir, "MEMORY.md")
+	decision, err := engine.Decide(context.Background(), Request{
+		ToolName: "write",
+		Args:     mustJSON(t, map[string]any{"path": target}),
+	})
+	if err != nil {
+		t.Fatalf("Decide: %v", err)
+	}
+	if decision == nil || decision.Allowed() {
+		t.Fatalf("expected hard deny for write to read-only internal path, got %#v", decision)
+	}
+	if decision.Source != DecisionSourceRoots {
+		t.Fatalf("expected hard deny via roots, got source %q", decision.Source)
+	}
+}
+
+func TestInternalPathRespectsDenyRule(t *testing.T) {
+	workspace := t.TempDir()
+	memDir := t.TempDir()
+	target := filepath.Join(memDir, "secret.md")
+	rules, err := ParseRuleSet(nil, []string{"Read(" + target + ")"})
+	if err != nil {
+		t.Fatalf("ParseRuleSet: %v", err)
+	}
+	engine := newTestEngine(t, workspace, ModeBalanced, rules)
+	engine.SetFilesystemRoots(FilesystemRoots{
+		InternalReadable: []string{memDir},
+	})
+
+	decision, err := engine.Decide(context.Background(), Request{
+		ToolName: "read",
+		Args:     mustJSON(t, map[string]any{"path": target}),
+	})
+	if err != nil {
+		t.Fatalf("Decide: %v", err)
+	}
+	if decision == nil || decision.Allowed() {
+		t.Fatalf("deny rule must override internal-path allow, got %#v", decision)
+	}
+	if decision.Source != DecisionSourceRule {
+		t.Fatalf("expected deny via rule, got source %q", decision.Source)
+	}
+}
+
+func TestUserRootsTakePrecedenceOverInternal(t *testing.T) {
+	// When a path is in BOTH the user's WriteRoots and InternalWritable,
+	// the user-configured root wins: the request runs through the normal
+	// mode-based flow (balanced → ask) instead of the internal silent allow.
+	// This matches CC's working-dir-before-internal-path order and prevents
+	// the harness from silently overriding what the user explicitly opted
+	// into. Lock this in so a future refactor can't quietly invert it.
+	workspace := t.TempDir()
+	memDir := t.TempDir()
+	engine := newTestEngine(t, workspace, ModeBalanced, nil)
+	engine.SetFilesystemRoots(FilesystemRoots{
+		WriteRoots:       []string{memDir},
+		InternalWritable: []string{memDir},
+	})
+
+	var prompted bool
+	engine.SetApprover(func(context.Context, Prompt) (Choice, error) {
+		prompted = true
+		return ChoiceAllowOnce, nil
+	})
+
+	target := filepath.Join(memDir, "MEMORY.md")
+	decision, err := engine.Decide(context.Background(), Request{
+		ToolName: "write",
+		Args:     mustJSON(t, map[string]any{"path": target}),
+	})
+	if err != nil {
+		t.Fatalf("Decide: %v", err)
+	}
+	if !prompted {
+		t.Fatalf("expected approver to be called for user-write-roots path, got %#v", decision)
+	}
+	if decision == nil || !decision.Allowed() {
+		t.Fatalf("expected allow after prompt, got %#v", decision)
+	}
+	if decision.Source == DecisionSourceInternal {
+		t.Fatalf("internal silent allow must not preempt user-roots flow, got %#v", decision)
+	}
+}
+
+func TestInternalPathRespectsPlanMode(t *testing.T) {
+	workspace := t.TempDir()
+	memDir := t.TempDir()
+	engine := newTestEngine(t, workspace, ModeBalanced, nil)
+	engine.SetFilesystemRoots(FilesystemRoots{
+		InternalWritable: []string{memDir},
+	})
+	engine.SetPlanMode(true)
+
+	target := filepath.Join(memDir, "MEMORY.md")
+	decision, err := engine.Decide(context.Background(), Request{
+		ToolName: "write",
+		Args:     mustJSON(t, map[string]any{"path": target}),
+	})
+	if err != nil {
+		t.Fatalf("Decide: %v", err)
+	}
+	if decision == nil || decision.Allowed() {
+		t.Fatalf("plan mode must block write to internal path, got %#v", decision)
+	}
+	if decision.Source != DecisionSourceMode {
+		t.Fatalf("expected plan-mode deny, got source %q", decision.Source)
+	}
+}
+
 func mustJSON(t *testing.T, v any) json.RawMessage {
 	t.Helper()
 	raw, err := json.Marshal(v)

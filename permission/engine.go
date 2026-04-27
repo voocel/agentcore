@@ -71,6 +71,16 @@ func (e *Engine) Decide(ctx context.Context, req Request) (*Decision, error) {
 		}
 	}
 
+	// Harness-declared internal path: silent allow for the requested
+	// capability. Deny rules and plan-mode read-only enforcement above still
+	// apply, so this only bypasses the OutsideRoots prompt and the mode-based
+	// ask that would otherwise interrupt every memory/plan/scratch write.
+	if info.internalPath {
+		decision := allowDecision(DecisionSourceInternal, info, "harness-managed path")
+		e.audit(info, decision)
+		return decision, nil
+	}
+
 	if info.outsideRoots {
 		decision, err := e.ask(ctx, info, mode, planMode)
 		if err != nil {
@@ -384,6 +394,7 @@ type toolInfo struct {
 	preview      string
 	hardDeny     string
 	outsideRoots bool
+	internalPath bool
 	workspace    string
 	roots        []string
 }
@@ -450,8 +461,15 @@ func inspectRequest(workspace string, roots FilesystemRoots, req Request) toolIn
 			info.summary = path
 		}
 		if deny != "" {
-			info.outsideRoots = true
-			info.reason = deny
+			// Harness-declared internal paths bypass the user-roots check.
+			// InternalWritable implies readability — populating only the
+			// writable list is the common case for fully-managed dirs.
+			if pathInRoots(path, roots.InternalReadable) || pathInRoots(path, roots.InternalWritable) {
+				info.internalPath = true
+			} else {
+				info.outsideRoots = true
+				info.reason = deny
+			}
 		}
 	case "write", "edit":
 		info.capability = CapabilityWrite
@@ -463,12 +481,19 @@ func inspectRequest(workspace string, roots FilesystemRoots, req Request) toolIn
 			info.reason = "file modification requires approval"
 		}
 		if deny != "" {
-			_, notInReadRoots := checkedPath(workspace, roots.ReadRoots, payload, "readable")
-			if notInReadRoots == "" {
-				info.hardDeny = fmt.Sprintf("path in read-only root, not writable: %s", path)
-			} else {
-				info.outsideRoots = true
-				info.reason = deny
+			switch {
+			case pathInRoots(path, roots.InternalWritable):
+				info.internalPath = true
+			case pathInRoots(path, roots.InternalReadable):
+				info.hardDeny = fmt.Sprintf("path in read-only internal root, not writable: %s", path)
+			default:
+				_, notInReadRoots := checkedPath(workspace, roots.ReadRoots, payload, "readable")
+				if notInReadRoots == "" {
+					info.hardDeny = fmt.Sprintf("path in read-only root, not writable: %s", path)
+				} else {
+					info.outsideRoots = true
+					info.reason = deny
+				}
 			}
 		}
 	case "bash":
@@ -574,14 +599,30 @@ func checkedPath(workspace string, roots []string, payload map[string]any, rootL
 		}
 		roots = []string{workspace}
 	}
+	if pathInRoots(path, roots) {
+		return path, ""
+	}
+	return path, fmt.Sprintf("path outside %s roots denied: %s", rootLabel, path)
+}
+
+// pathInRoots reports whether path resolves under any of the given roots.
+// Both sides are passed through resolveSymlinks so a symlink inside or below
+// a root resolves consistently with the canonical comparison checkedPath
+// performs. A miss returns false without producing a deny message — callers
+// such as inspectRequest's InternalReadable/InternalWritable check fall
+// through to the next decision step on miss.
+func pathInRoots(path string, roots []string) bool {
+	if path == "" || len(roots) == 0 {
+		return false
+	}
 	target := resolveSymlinks(path)
 	for _, root := range roots {
 		base := resolveSymlinks(filepath.Clean(root))
 		if isSubPath(base, target) {
-			return path, ""
+			return true
 		}
 	}
-	return path, fmt.Sprintf("path outside %s roots denied: %s", rootLabel, path)
+	return false
 }
 
 func resolveSymlinks(path string) string {
@@ -641,8 +682,10 @@ func normalizeFilesystemRoots(workspace string, roots FilesystemRoots) Filesyste
 		writeRoots = []string{filepath.Clean(workspace)}
 	}
 	return FilesystemRoots{
-		ReadRoots:  readRoots,
-		WriteRoots: writeRoots,
+		ReadRoots:        readRoots,
+		WriteRoots:       writeRoots,
+		InternalReadable: dedup(roots.InternalReadable),
+		InternalWritable: dedup(roots.InternalWritable),
 	}
 }
 

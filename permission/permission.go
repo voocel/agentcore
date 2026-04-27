@@ -41,13 +41,14 @@ const (
 type DecisionSource string
 
 const (
-	DecisionSourceTool   DecisionSource = "tool"
-	DecisionSourceRule   DecisionSource = "rule"
-	DecisionSourceSkill  DecisionSource = "skill"
-	DecisionSourceMode   DecisionSource = "mode"
-	DecisionSourcePrompt DecisionSource = "prompt"
-	DecisionSourceStore  DecisionSource = "store"
-	DecisionSourceRoots  DecisionSource = "roots"
+	DecisionSourceTool     DecisionSource = "tool"
+	DecisionSourceRule     DecisionSource = "rule"
+	DecisionSourceSkill    DecisionSource = "skill"
+	DecisionSourceMode     DecisionSource = "mode"
+	DecisionSourcePrompt   DecisionSource = "prompt"
+	DecisionSourceStore    DecisionSource = "store"
+	DecisionSourceRoots    DecisionSource = "roots"
+	DecisionSourceInternal DecisionSource = "internal"
 )
 
 type Choice string
@@ -59,9 +60,28 @@ const (
 	ChoiceDeny         Choice = "deny"
 )
 
+// FilesystemRoots scope filesystem access for tool requests. The two pairs
+// serve different audiences:
+//
+//   - ReadRoots / WriteRoots: user-configured. Subject to deny rules and
+//     mode-based prompts (e.g. balanced mode asks for any write). Out-of-roots
+//     access triggers an OutsideRoots prompt; AllowAlways for that prompt is
+//     downgraded to AllowOnce so a one-shot consent does not silently grant
+//     persistent access.
+//
+//   - InternalReadable / InternalWritable: harness-declared. Reserved for
+//     paths the harness itself manages (auto-memory dir, plan store, scratch
+//     space). Matches bypass the OutsideRoots prompt and the mode-based ask
+//     so the agent can read/write these locations silently. Deny rules and
+//     plan-mode read-only enforcement still apply.
+//
+// A path matched by InternalWritable is also treated as readable, so callers
+// that want bidirectional access only need to populate the writable list.
 type FilesystemRoots struct {
-	ReadRoots  []string
-	WriteRoots []string
+	ReadRoots        []string
+	WriteRoots       []string
+	InternalReadable []string
+	InternalWritable []string
 }
 
 type Metadata struct {
