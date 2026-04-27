@@ -18,25 +18,34 @@ type Engine struct {
 	store     *Store
 	onAudit   func(AuditEntry)
 
-	mu           sync.RWMutex
-	mode         Mode
-	planMode     bool
-	approver     Approver
-	fsRoots      FilesystemRoots
-	sessionAllow map[string]StoreEntry
-	skillAllows  []Rule
+	mu               sync.RWMutex
+	mode             Mode
+	planMode         bool
+	approver         Approver
+	fsRoots          FilesystemRoots
+	sessionAllow     map[string]StoreEntry
+	skillAllows      []Rule
+	planAllowedTools map[string]struct{}
 }
 
 func NewEngine(cfg EngineConfig) *Engine {
+	allowed := make(map[string]struct{}, len(cfg.PlanModeAllowedTools))
+	for _, name := range cfg.PlanModeAllowedTools {
+		if name == "" {
+			continue
+		}
+		allowed[name] = struct{}{}
+	}
 	return &Engine{
-		workspace:    cfg.Workspace,
-		rules:        cfg.Rules,
-		store:        cfg.Store,
-		onAudit:      cfg.OnAudit,
-		mode:         cfg.Mode,
-		approver:     cfg.Approver,
-		fsRoots:      normalizeFilesystemRoots(cfg.Workspace, cfg.Roots),
-		sessionAllow: make(map[string]StoreEntry),
+		workspace:        cfg.Workspace,
+		rules:            cfg.Rules,
+		store:            cfg.Store,
+		onAudit:          cfg.OnAudit,
+		mode:             cfg.Mode,
+		approver:         cfg.Approver,
+		fsRoots:          normalizeFilesystemRoots(cfg.Workspace, cfg.Roots),
+		sessionAllow:     make(map[string]StoreEntry),
+		planAllowedTools: allowed,
 	}
 }
 
@@ -61,14 +70,10 @@ func (e *Engine) Decide(ctx context.Context, req Request) (*Decision, error) {
 		}
 	}
 
-	if planMode {
-		switch info.capability {
-		case CapabilityRead, CapabilityInternal:
-		default:
-			decision := denyDecision(DecisionSourceMode, info, "plan mode is read-only")
-			e.audit(info, decision)
-			return decision, nil
-		}
+	if planMode && !e.planModeAllowed(info) {
+		decision := denyDecision(DecisionSourceMode, info, "plan mode is read-only")
+		e.audit(info, decision)
+		return decision, nil
 	}
 
 	// Harness-declared internal path: silent allow for the requested
@@ -402,6 +407,26 @@ type toolInfo struct {
 func (i toolInfo) withReason(reason string) toolInfo {
 	i.reason = reason
 	return i
+}
+
+// planModeAllowed reports whether a tool may run while the harness is in plan
+// mode. Read-capability tools always pass; Internal control tools may opt in
+// via EngineConfig.PlanModeAllowedTools. Write/Exec/Network/Subagent stay
+// blocked unconditionally — even if a destructive tool is mistakenly listed,
+// it does not get promoted. The library stays harness-agnostic: it knows the
+// shape of the rule but never the names of allowed tools.
+func (e *Engine) planModeAllowed(info toolInfo) bool {
+	if info.capability == CapabilityRead {
+		return true
+	}
+	if info.capability != CapabilityInternal {
+		return false
+	}
+	if len(e.planAllowedTools) == 0 {
+		return false
+	}
+	_, ok := e.planAllowedTools[info.tool]
+	return ok
 }
 
 type ruleAction string

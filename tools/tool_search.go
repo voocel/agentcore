@@ -9,6 +9,7 @@ import (
 	"sync"
 
 	"github.com/voocel/agentcore"
+	"github.com/voocel/agentcore/permission"
 )
 
 // ToolSearchTool provides LLM-driven discovery of deferred tools.
@@ -58,10 +59,13 @@ func NewToolSearchTool(deferred ...agentcore.Tool) *ToolSearchTool {
 	}
 }
 
-func (t *ToolSearchTool) Name() string                              { return "tool_search" }
-func (t *ToolSearchTool) ReadOnly(_ json.RawMessage) bool            { return true }
-func (t *ToolSearchTool) ConcurrencySafe(_ json.RawMessage) bool     { return true }
+func (t *ToolSearchTool) Name() string                                 { return "tool_search" }
+func (t *ToolSearchTool) ReadOnly(_ json.RawMessage) bool              { return true }
+func (t *ToolSearchTool) ConcurrencySafe(_ json.RawMessage) bool       { return true }
 func (t *ToolSearchTool) ActivityDescription(_ json.RawMessage) string { return "Searching tools" }
+func (t *ToolSearchTool) PermissionMetadata() permission.Metadata {
+	return permission.Metadata{Capability: permission.CapabilityInternal}
+}
 
 func (t *ToolSearchTool) Description() string {
 	return "Fetches full schema definitions for deferred tools so they can be called. " +

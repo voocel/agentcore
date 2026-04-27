@@ -121,6 +121,73 @@ func TestPlanModeDeniesPersistedWrite(t *testing.T) {
 	}
 }
 
+func TestPlanModeRejectsInternalByDefault(t *testing.T) {
+	engine := newTestEngine(t, t.TempDir(), ModeBalanced, nil)
+	engine.SetPlanMode(true)
+
+	decision, err := engine.Decide(context.Background(), Request{
+		ToolName: "custom_internal",
+		Metadata: Metadata{Capability: CapabilityInternal},
+	})
+	if err != nil {
+		t.Fatalf("Decide: %v", err)
+	}
+	if decision == nil || decision.Kind != DecisionDeny || decision.Source != DecisionSourceMode {
+		t.Fatalf("expected plan-mode denial, got %#v", decision)
+	}
+}
+
+func TestPlanModeAllowsConfiguredAllowlistedTool(t *testing.T) {
+	store, err := NewStore(filepath.Join(t.TempDir(), "approvals.json"))
+	if err != nil {
+		t.Fatalf("NewStore: %v", err)
+	}
+	engine := NewEngine(EngineConfig{
+		Workspace:            t.TempDir(),
+		Mode:                 ModeBalanced,
+		Store:                store,
+		PlanModeAllowedTools: []string{"custom_plan_control"},
+	})
+	engine.SetPlanMode(true)
+
+	decision, err := engine.Decide(context.Background(), Request{
+		ToolName: "custom_plan_control",
+		Metadata: Metadata{Capability: CapabilityInternal},
+	})
+	if err != nil {
+		t.Fatalf("Decide: %v", err)
+	}
+	if decision == nil || !decision.Allowed() {
+		t.Fatalf("expected allow in plan mode, got %#v", decision)
+	}
+}
+
+func TestPlanModeAllowlistDoesNotPromoteWriteCapability(t *testing.T) {
+	store, err := NewStore(filepath.Join(t.TempDir(), "approvals.json"))
+	if err != nil {
+		t.Fatalf("NewStore: %v", err)
+	}
+	engine := NewEngine(EngineConfig{
+		Workspace:            t.TempDir(),
+		Mode:                 ModeBalanced,
+		Store:                store,
+		PlanModeAllowedTools: []string{"custom_writer"},
+	})
+	engine.SetPlanMode(true)
+
+	decision, err := engine.Decide(context.Background(), Request{
+		ToolName: "custom_writer",
+		Args:     mustJSON(t, map[string]any{"path": "out.txt"}),
+		Metadata: Metadata{Capability: CapabilityWrite},
+	})
+	if err != nil {
+		t.Fatalf("Decide: %v", err)
+	}
+	if decision == nil || decision.Kind != DecisionDeny || decision.Source != DecisionSourceMode {
+		t.Fatalf("expected plan-mode denial for write capability, got %#v", decision)
+	}
+}
+
 func TestPlanModeOutsideReadStillPrompts(t *testing.T) {
 	workspace := t.TempDir()
 	outside := filepath.Join(t.TempDir(), "outside.txt")

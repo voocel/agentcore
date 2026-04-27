@@ -165,4 +165,9 @@ type EngineConfig struct {
 	Store     *Store
 	Approver  Approver
 	OnAudit   func(AuditEntry)
+	// PlanModeAllowedTools names tools that may run in plan mode despite not
+	// having Read capability. Empty by default — plan mode is read-only.
+	// Use this for harness-specific control tools (e.g. an "exit_plan_mode"
+	// tool that must run while the harness is in plan mode).
+	PlanModeAllowedTools []string
 }
