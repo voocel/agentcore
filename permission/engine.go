@@ -26,6 +26,7 @@ type Engine struct {
 	sessionAllow     map[string]StoreEntry
 	skillAllows      []Rule
 	planAllowedTools map[string]struct{}
+	planExecAllowed  func(Request) bool
 }
 
 func NewEngine(cfg EngineConfig) *Engine {
@@ -46,6 +47,7 @@ func NewEngine(cfg EngineConfig) *Engine {
 		fsRoots:          normalizeFilesystemRoots(cfg.Workspace, cfg.Roots),
 		sessionAllow:     make(map[string]StoreEntry),
 		planAllowedTools: allowed,
+		planExecAllowed:  cfg.PlanModeExecAllowed,
 	}
 }
 
@@ -70,10 +72,23 @@ func (e *Engine) Decide(ctx context.Context, req Request) (*Decision, error) {
 		}
 	}
 
-	if planMode && !e.planModeAllowed(info) {
-		decision := denyDecision(DecisionSourceMode, info, "plan mode is read-only")
-		e.audit(info, decision)
-		return decision, nil
+	if planMode {
+		if !e.planModeAllowed(info, req) {
+			decision := denyDecision(DecisionSourceMode, info, "plan mode is read-only")
+			e.audit(info, decision)
+			return decision, nil
+		}
+		// Exec calls that pass the plan-mode allow-list are allowed outright:
+		// the harness owns the safety contract (typically via system prompt),
+		// and bouncing to the underlying mode's ask flow would interrupt the
+		// model with an approval dialog mid-exploration. Read/Internal calls
+		// fall through to the regular pipeline so outsideRoots / store / rule
+		// checks continue to apply as before.
+		if info.capability == CapabilityExec {
+			decision := allowDecision(DecisionSourceMode, info, "allowed in plan mode")
+			e.audit(info, decision)
+			return decision, nil
+		}
 	}
 
 	// Harness-declared internal path: silent allow for the requested
@@ -411,22 +426,30 @@ func (i toolInfo) withReason(reason string) toolInfo {
 
 // planModeAllowed reports whether a tool may run while the harness is in plan
 // mode. Read-capability tools always pass; Internal control tools may opt in
-// via EngineConfig.PlanModeAllowedTools. Write/Exec/Network/Subagent stay
-// blocked unconditionally — even if a destructive tool is mistakenly listed,
+// via EngineConfig.PlanModeAllowedTools; Exec calls may opt in via
+// EngineConfig.PlanModeExecAllowed (typically used for read-only bash usage
+// during plan exploration). Write/Network/Subagent stay blocked unconditionally
+// — even if a destructive tool is mistakenly listed under PlanModeAllowedTools,
 // it does not get promoted. The library stays harness-agnostic: it knows the
 // shape of the rule but never the names of allowed tools.
-func (e *Engine) planModeAllowed(info toolInfo) bool {
-	if info.capability == CapabilityRead {
+func (e *Engine) planModeAllowed(info toolInfo, req Request) bool {
+	switch info.capability {
+	case CapabilityRead:
 		return true
-	}
-	if info.capability != CapabilityInternal {
+	case CapabilityExec:
+		if e.planExecAllowed == nil {
+			return false
+		}
+		return e.planExecAllowed(req)
+	case CapabilityInternal:
+		if len(e.planAllowedTools) == 0 {
+			return false
+		}
+		_, ok := e.planAllowedTools[info.tool]
+		return ok
+	default:
 		return false
 	}
-	if len(e.planAllowedTools) == 0 {
-		return false
-	}
-	_, ok := e.planAllowedTools[info.tool]
-	return ok
 }
 
 type ruleAction string

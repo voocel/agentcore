@@ -188,6 +188,55 @@ func TestPlanModeAllowlistDoesNotPromoteWriteCapability(t *testing.T) {
 	}
 }
 
+func TestPlanModeExecAllowedHookPasses(t *testing.T) {
+	store, err := NewStore(filepath.Join(t.TempDir(), "approvals.json"))
+	if err != nil {
+		t.Fatalf("NewStore: %v", err)
+	}
+	engine := NewEngine(EngineConfig{
+		Workspace: t.TempDir(),
+		Mode:      ModeBalanced,
+		Store:     store,
+		PlanModeExecAllowed: func(req Request) bool {
+			return req.ToolName == "bash"
+		},
+	})
+	engine.SetPlanMode(true)
+	// Approver would fire if plan-mode short-circuit didn't kick in — fail loudly
+	// rather than silently auto-allow.
+	engine.SetApprover(func(context.Context, Prompt) (Choice, error) {
+		t.Fatalf("plan-mode exec allow-list should bypass approver")
+		return ChoiceDeny, nil
+	})
+
+	decision, err := engine.Decide(context.Background(), Request{
+		ToolName: "bash",
+		Args:     mustJSON(t, map[string]any{"command": "git status"}),
+	})
+	if err != nil {
+		t.Fatalf("Decide: %v", err)
+	}
+	if decision == nil || !decision.Allowed() || decision.Source != DecisionSourceMode {
+		t.Fatalf("expected plan-mode allow for bash, got %#v", decision)
+	}
+}
+
+func TestPlanModeExecWithoutHookStillDenies(t *testing.T) {
+	engine := newTestEngine(t, t.TempDir(), ModeBalanced, nil)
+	engine.SetPlanMode(true)
+
+	decision, err := engine.Decide(context.Background(), Request{
+		ToolName: "bash",
+		Args:     mustJSON(t, map[string]any{"command": "git status"}),
+	})
+	if err != nil {
+		t.Fatalf("Decide: %v", err)
+	}
+	if decision == nil || decision.Kind != DecisionDeny || decision.Source != DecisionSourceMode {
+		t.Fatalf("expected plan-mode denial without exec hook, got %#v", decision)
+	}
+}
+
 func TestPlanModeOutsideReadStillPrompts(t *testing.T) {
 	workspace := t.TempDir()
 	outside := filepath.Join(t.TempDir(), "outside.txt")

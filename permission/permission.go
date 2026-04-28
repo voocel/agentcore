@@ -170,4 +170,12 @@ type EngineConfig struct {
 	// Use this for harness-specific control tools (e.g. an "exit_plan_mode"
 	// tool that must run while the harness is in plan mode).
 	PlanModeAllowedTools []string
+	// PlanModeExecAllowed lets the harness opt specific exec calls (typically
+	// the bash tool, used for grep/find/git status during plan exploration)
+	// through plan-mode's default exec ban. When this returns true, the call
+	// is allowed in plan mode without triggering the underlying mode's ask
+	// flow — the harness is asserting the exec is safe under plan-mode
+	// semantics (typically enforced by the system prompt). Nil = default
+	// behavior (all exec denied in plan mode).
+	PlanModeExecAllowed func(req Request) bool
 }
