@@ -27,6 +27,7 @@ type Engine struct {
 	skillAllows      []Rule
 	planAllowedTools map[string]struct{}
 	planExecAllowed  func(Request) bool
+	planWriteAllowed func(Request) bool
 }
 
 func NewEngine(cfg EngineConfig) *Engine {
@@ -48,6 +49,7 @@ func NewEngine(cfg EngineConfig) *Engine {
 		sessionAllow:     make(map[string]StoreEntry),
 		planAllowedTools: allowed,
 		planExecAllowed:  cfg.PlanModeExecAllowed,
+		planWriteAllowed: cfg.PlanModeWriteAllowed,
 	}
 }
 
@@ -78,13 +80,13 @@ func (e *Engine) Decide(ctx context.Context, req Request) (*Decision, error) {
 			e.audit(info, decision)
 			return decision, nil
 		}
-		// Exec calls that pass the plan-mode allow-list are allowed outright:
-		// the harness owns the safety contract (typically via system prompt),
-		// and bouncing to the underlying mode's ask flow would interrupt the
-		// model with an approval dialog mid-exploration. Read/Internal calls
+		// Exec/Write calls that pass the plan-mode allow-list are allowed
+		// outright: the harness owns the safety contract (typically via system
+		// prompt or path matching), and bouncing to the underlying mode's ask
+		// flow would interrupt the model mid-planning. Read/Internal calls
 		// fall through to the regular pipeline so outsideRoots / store / rule
 		// checks continue to apply as before.
-		if info.capability == CapabilityExec {
+		if info.capability == CapabilityExec || info.capability == CapabilityWrite {
 			decision := allowDecision(DecisionSourceMode, info, "allowed in plan mode")
 			e.audit(info, decision)
 			return decision, nil
@@ -428,7 +430,9 @@ func (i toolInfo) withReason(reason string) toolInfo {
 // mode. Read-capability tools always pass; Internal control tools may opt in
 // via EngineConfig.PlanModeAllowedTools; Exec calls may opt in via
 // EngineConfig.PlanModeExecAllowed (typically used for read-only bash usage
-// during plan exploration). Write/Network/Subagent stay blocked unconditionally
+// during plan exploration); Write calls may opt in via
+// EngineConfig.PlanModeWriteAllowed (typically the plan file itself, edited
+// incrementally during planning). Network/Subagent stay blocked unconditionally
 // — even if a destructive tool is mistakenly listed under PlanModeAllowedTools,
 // it does not get promoted. The library stays harness-agnostic: it knows the
 // shape of the rule but never the names of allowed tools.
@@ -441,6 +445,11 @@ func (e *Engine) planModeAllowed(info toolInfo, req Request) bool {
 			return false
 		}
 		return e.planExecAllowed(req)
+	case CapabilityWrite:
+		if e.planWriteAllowed == nil {
+			return false
+		}
+		return e.planWriteAllowed(req)
 	case CapabilityInternal:
 		if len(e.planAllowedTools) == 0 {
 			return false

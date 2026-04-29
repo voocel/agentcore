@@ -201,15 +201,11 @@ func runLoop(ctx context.Context, currentCtx *AgentContext, newMessages *[]Agent
 
 			var streamedTools *turnToolExecutor
 			hooks := llmCallHooks{
-				OnToolCallComplete: func(call ToolCall) bool {
-					if config.ExclusiveTurnTool != nil {
-						return false
-					}
+				OnToolCallComplete: func(call ToolCall) {
 					if streamedTools == nil {
 						streamedTools = newTurnToolExecutor(ctx, currentCtx.Tools, config, toolErrors, ch)
 					}
 					streamedTools.Add(call)
-					return true
 				},
 			}
 
@@ -315,9 +311,7 @@ func runLoop(ctx context.Context, currentCtx *AgentContext, newMessages *[]Agent
 			if config.StopAfterTool != nil {
 				for _, tr := range turnToolResults {
 					if !tr.IsError && config.StopAfterTool(tr.ToolName) {
-						summary := buildSummary(turnCount, EndReasonStop)
-						summary.StopAfterTool = tr.ToolName
-						emit(ch, Event{Type: EventAgentEnd, NewMessages: *newMessages, Summary: summary})
+						emit(ch, Event{Type: EventAgentEnd, NewMessages: *newMessages, Summary: buildSummary(turnCount, EndReasonStop)})
 						return
 					}
 				}
@@ -371,12 +365,11 @@ func runLoop(ctx context.Context, currentCtx *AgentContext, newMessages *[]Agent
 }
 
 type llmCallHooks struct {
-	OnToolCallComplete func(ToolCall) bool
+	OnToolCallComplete func(ToolCall)
 }
 
 type llmCallInfo struct {
 	HasCompletedToolCalls bool
-	HasStartedToolActions bool
 }
 
 // callLLMWithRetry wraps callLLM with retry logic for retryable errors.
@@ -417,7 +410,7 @@ func callLLMWithRetry(ctx context.Context, agentCtx *AgentContext, config LoopCo
 		// risks duplicating side effects from tools that already started — unless
 		// the caller has declared its tools idempotent, in which case we abort
 		// the in-flight executions and retry the whole turn cleanly.
-		if info.HasStartedToolActions && !config.ToolsAreIdempotent {
+		if info.HasCompletedToolCalls && !config.ToolsAreIdempotent {
 			return Message{}, info, err
 		}
 
@@ -710,9 +703,7 @@ func callLLMStream(ctx context.Context, model ChatModel, messages []Message, too
 			if ev.CompletedToolCall != nil {
 				info.HasCompletedToolCalls = true
 				if hooks.OnToolCallComplete != nil {
-					if hooks.OnToolCallComplete(*ev.CompletedToolCall) {
-						info.HasStartedToolActions = true
-					}
+					hooks.OnToolCallComplete(*ev.CompletedToolCall)
 				}
 			}
 
@@ -742,44 +733,11 @@ func callLLMStream(ctx context.Context, model ChatModel, messages []Message, too
 // executeToolCalls runs tool calls for one assistant turn using the shared
 // turn executor. The same executor also powers streaming tool execution.
 func executeToolCalls(ctx context.Context, tools []Tool, calls []ToolCall, config LoopConfig, toolErrors map[string]int, ch chan<- Event) ([]ToolResult, []AgentMessage) {
-	if idx := firstExclusiveToolCall(calls, config.ExclusiveTurnTool); idx >= 0 {
-		return executeExclusiveToolCall(ctx, tools, calls, idx, config, toolErrors, ch)
-	}
 	exec := newTurnToolExecutor(ctx, tools, config, toolErrors, ch)
 	for _, call := range calls {
 		exec.Add(call)
 	}
 	return exec.Wait()
-}
-
-func firstExclusiveToolCall(calls []ToolCall, exclusive func(string) bool) int {
-	if exclusive == nil {
-		return -1
-	}
-	for i, call := range calls {
-		if exclusive(call.Name) {
-			return i
-		}
-	}
-	return -1
-}
-
-func executeExclusiveToolCall(ctx context.Context, tools []Tool, calls []ToolCall, selected int, config LoopConfig, toolErrors map[string]int, ch chan<- Event) ([]ToolResult, []AgentMessage) {
-	results := make([]ToolResult, 0, len(calls))
-	var steering []AgentMessage
-	reason := "Skipped because " + calls[selected].Name + " is exclusive for this assistant turn."
-	for i, call := range calls {
-		if i != selected {
-			results = append(results, skipToolCallWithMessage(call, tools, ch, reason))
-			continue
-		}
-		exec := newTurnToolExecutor(ctx, tools, config, toolErrors, ch)
-		exec.Add(call)
-		selectedResults, selectedSteering := exec.Wait()
-		results = append(results, selectedResults...)
-		steering = selectedSteering
-	}
-	return results, steering
 }
 
 // executeSingleToolCall executes one tool call: emit events, validate, preview,

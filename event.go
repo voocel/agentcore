@@ -56,12 +56,6 @@ type RunSummary struct {
 	ToolCalls  int
 	ToolErrors int
 	EndReason  EndReason
-	// StopAfterTool names the tool that triggered the early-stop when
-	// EndReason==Stop and LoopConfig.StopAfterTool fired. Empty otherwise.
-	// Lets the harness distinguish a model-driven natural stop from a
-	// terminal-tool-driven stop and react accordingly (e.g. continue the
-	// agent run with a refreshed tool snapshot after a mode-switch tool).
-	StopAfterTool string
 }
 
 // DeltaKind identifies what kind of content a message_update delta carries.

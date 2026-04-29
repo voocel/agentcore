@@ -60,7 +60,6 @@ type Agent struct {
 	stopGuard             StopGuard
 	onMaxTurns            MaxTurnsAction
 	stopAfterTool         func(toolName string) bool
-	exclusiveTurnTool     func(toolName string) bool
 
 	// State
 	messages         []AgentMessage
@@ -676,7 +675,6 @@ func (a *Agent) buildConfig() LoopConfig {
 		OnMaxTurns:            a.onMaxTurns,
 		ToolsAreIdempotent:    a.toolsAreIdempotent,
 		StopAfterTool:         a.stopAfterTool,
-		ExclusiveTurnTool:     a.exclusiveTurnTool,
 	}
 }
 

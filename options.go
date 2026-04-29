@@ -259,23 +259,10 @@ func WithOnMaxTurns(action MaxTurnsAction) AgentOption {
 
 // WithStopAfterTool installs a predicate that ends the agent run after a
 // successful execution of any tool whose name returns true. The terminating
-// tool's result is committed to history before the run exits, and
-// RunSummary.StopAfterTool carries the tool name so the harness can decide
-// whether to Continue() with the refreshed agent state (e.g. new tool snapshot
-// after a mode-switch tool).
+// tool's result is committed to history before the run exits.
 //
-// Use cases: terminal "transition" tools that change the agent's tool set or
-// system prompt — without ending the run, the in-progress tool snapshot keeps
-// the old tool list visible to the LLM on subsequent turns.
+// Use cases: terminal tools (e.g. commit_chapter, exit_plan_mode) that
+// shouldn't waste another LLM turn after they succeed.
 func WithStopAfterTool(fn func(toolName string) bool) AgentOption {
 	return func(a *Agent) { a.stopAfterTool = fn }
-}
-
-// WithExclusiveTurnTool installs a predicate for tools that must be exclusive
-// within a single assistant turn. When any matching tool_call appears, only
-// the first matching call is executed; all sibling tool_calls are returned to
-// the model as skipped results. This prevents a transition tool that changes
-// host mode/tool availability from being bundled with stale sibling actions.
-func WithExclusiveTurnTool(fn func(toolName string) bool) AgentOption {
-	return func(a *Agent) { a.exclusiveTurnTool = fn }
 }

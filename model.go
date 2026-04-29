@@ -128,15 +128,6 @@ type LoopConfig struct {
 	// terminal tool (e.g. commit_chapter) end the loop without wasting turns.
 	StopAfterTool func(toolName string) bool
 
-	// ExclusiveTurnTool, if non-nil, marks tools that must be the only tool
-	// executed from an assistant turn. If any matching tool_call appears, the
-	// first matching call runs and all sibling calls are skipped with a
-	// structured tool_result. This is intended for transition tools that change
-	// the host mode/tool snapshot. When configured, streaming tool execution is
-	// deferred until the assistant message is complete so earlier sibling calls
-	// cannot run before a later exclusive call is observed.
-	ExclusiveTurnTool func(toolName string) bool
-
 	// OnMessage, if non-nil, is called after each message is appended to
 	// context (assistant, tool result, steering). Use for session logging.
 	OnMessage func(msg AgentMessage)

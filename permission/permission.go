@@ -178,4 +178,10 @@ type EngineConfig struct {
 	// semantics (typically enforced by the system prompt). Nil = default
 	// behavior (all exec denied in plan mode).
 	PlanModeExecAllowed func(req Request) bool
+	// PlanModeWriteAllowed lets the harness opt specific write calls through
+	// plan-mode's default write ban. Typical use: a designated plan file the
+	// model edits incrementally during planning. The harness owns the policy
+	// (path matching, etc.); agentcore stays generic. Nil = default behavior
+	// (all writes denied in plan mode).
+	PlanModeWriteAllowed func(req Request) bool
 }

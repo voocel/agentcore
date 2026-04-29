@@ -221,6 +221,73 @@ func TestPlanModeExecAllowedHookPasses(t *testing.T) {
 	}
 }
 
+func TestPlanModeWriteAllowedHookPasses(t *testing.T) {
+	workspace := t.TempDir()
+	planFile := filepath.Join(workspace, "plan.md")
+	store, err := NewStore(filepath.Join(t.TempDir(), "approvals.json"))
+	if err != nil {
+		t.Fatalf("NewStore: %v", err)
+	}
+	engine := NewEngine(EngineConfig{
+		Workspace: workspace,
+		Mode:      ModeBalanced,
+		Store:     store,
+		PlanModeWriteAllowed: func(req Request) bool {
+			var args struct {
+				Path string `json:"path"`
+			}
+			_ = json.Unmarshal(req.Args, &args)
+			return args.Path == planFile
+		},
+	})
+	engine.SetPlanMode(true)
+	engine.SetApprover(func(context.Context, Prompt) (Choice, error) {
+		t.Fatalf("plan-mode write allow-list should bypass approver")
+		return ChoiceDeny, nil
+	})
+
+	decision, err := engine.Decide(context.Background(), Request{
+		ToolName: "write",
+		Args:     mustJSON(t, map[string]any{"path": planFile, "content": "# Plan"}),
+	})
+	if err != nil {
+		t.Fatalf("Decide: %v", err)
+	}
+	if decision == nil || !decision.Allowed() || decision.Source != DecisionSourceMode {
+		t.Fatalf("expected plan-mode allow for plan-file write, got %#v", decision)
+	}
+
+	// Other paths must still be denied — the hook is path-specific, not
+	// blanket-permissive.
+	decision, err = engine.Decide(context.Background(), Request{
+		ToolName: "write",
+		Args:     mustJSON(t, map[string]any{"path": filepath.Join(workspace, "other.go"), "content": "x"}),
+	})
+	if err != nil {
+		t.Fatalf("Decide: %v", err)
+	}
+	if decision == nil || decision.Kind != DecisionDeny {
+		t.Fatalf("expected plan-mode deny for non-plan-file write, got %#v", decision)
+	}
+}
+
+func TestPlanModeWriteWithoutHookStillDenies(t *testing.T) {
+	workspace := t.TempDir()
+	engine := newTestEngine(t, workspace, ModeBalanced, nil)
+	engine.SetPlanMode(true)
+
+	decision, err := engine.Decide(context.Background(), Request{
+		ToolName: "write",
+		Args:     mustJSON(t, map[string]any{"path": filepath.Join(workspace, "plan.md"), "content": "# Plan"}),
+	})
+	if err != nil {
+		t.Fatalf("Decide: %v", err)
+	}
+	if decision == nil || decision.Kind != DecisionDeny || decision.Source != DecisionSourceMode {
+		t.Fatalf("expected plan-mode denial without write hook, got %#v", decision)
+	}
+}
+
 func TestPlanModeExecWithoutHookStillDenies(t *testing.T) {
 	engine := newTestEngine(t, t.TempDir(), ModeBalanced, nil)
 	engine.SetPlanMode(true)
