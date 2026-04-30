@@ -1107,7 +1107,7 @@ func toolLabel(tool Tool) string {
 func approvalSummary(call ToolCall) string {
 	var payload map[string]any
 	if len(call.Args) > 0 && json.Unmarshal(call.Args, &payload) == nil {
-		for _, key := range []string{"path", "command", "url", "query"} {
+		for _, key := range []string{"file_path", "path", "command", "url", "query"} {
 			if raw, ok := payload[key].(string); ok && strings.TrimSpace(raw) != "" {
 				return fmt.Sprintf("%s: %s", key, strings.TrimSpace(raw))
 			}

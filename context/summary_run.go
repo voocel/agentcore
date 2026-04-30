@@ -344,12 +344,18 @@ func extractFileOps(msgs []agentcore.AgentMessage) (readFiles, modifiedFiles []s
 	return
 }
 
-// extractPathArg extracts the "path" field from JSON tool args.
+// extractPathArg extracts a file path from JSON tool args. Accepts both
+// "file_path" (preferred, matches edit/read/write) and "path" (used by
+// glob/grep/ls). file_path wins when both are present.
 func extractPathArg(args json.RawMessage) string {
 	var obj struct {
-		Path string `json:"path"`
+		FilePath string `json:"file_path"`
+		Path     string `json:"path"`
 	}
 	if json.Unmarshal(args, &obj) == nil {
+		if obj.FilePath != "" {
+			return obj.FilePath
+		}
 		return obj.Path
 	}
 	return ""

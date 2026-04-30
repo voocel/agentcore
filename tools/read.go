@@ -53,22 +53,32 @@ func (t *ReadTool) ConcurrencySafe(_ json.RawMessage) bool     { return true }
 func (t *ReadTool) ActivityDescription(_ json.RawMessage) string { return "Reading file" }
 func (t *ReadTool) Description() string {
 	return fmt.Sprintf(
-		"Read a file or directory from the local filesystem. Supports relative or absolute paths. Text output is streamed and truncated to %d lines or %s. Use offset to continue reading later sections, and avoid tiny repeated slices when you need broader context. Directory entries are returned one per line with a trailing '/' for subdirectories. Long lines are truncated. Use grep to find specific content in large files, and use glob if you are unsure of the path. Supports JPEG, PNG, GIF, and WebP images. Binary files are rejected.",
-		defaultMaxLines, formatSize(defaultMaxBytes),
+		`Reads a file from the local filesystem. You can access any file directly by using this tool.
+
+Usage:
+- The file_path parameter accepts relative or absolute paths.
+- By default, reads up to %d lines starting from the beginning of the file.
+- You can optionally specify a line offset and limit (especially handy for long files), but it's recommended to read the whole file by not providing these parameters.
+- Results are returned using cat -n format, with line numbers starting at 1.
+- This tool also lists directory contents when file_path points to a directory; entries are returned one per line with a trailing '/' for subdirectories.
+- Long lines are truncated. Output is capped at %d lines or %s (whichever is hit first).
+- Use grep to find specific content in large files, and glob if you are unsure of the path.
+- Supports JPEG, PNG, GIF, and WebP images. Binary files are rejected.`,
+		defaultMaxLines, defaultMaxLines, formatSize(defaultMaxBytes),
 	)
 }
 func (t *ReadTool) Schema() map[string]any {
 	return schema.Object(
-		schema.Property("path", schema.String("Path to the file or directory to read (relative or absolute)")).Required(),
-		schema.Property("offset", schema.Int("Line or entry number to start from (1-based, default: 1)")),
-		schema.Property("limit", schema.Int("Maximum number of lines or directory entries to read (default: 2000)")),
+		schema.Property("file_path", schema.String("The path to the file or directory to read (relative or absolute)")).Required(),
+		schema.Property("offset", schema.Int("The line number to start reading from. Only provide if the file is too large to read at once")),
+		schema.Property("limit", schema.Int("The number of lines to read. Only provide if the file is too large to read at once")),
 	)
 }
 
 type readArgs struct {
-	Path   string `json:"path"`
-	Offset int    `json:"offset"`
-	Limit  int    `json:"limit"`
+	FilePath string `json:"file_path"`
+	Offset   int    `json:"offset"`
+	Limit    int    `json:"limit"`
 }
 
 type resolvedRead struct {
@@ -122,7 +132,7 @@ func (t *ReadTool) parseArgs(args json.RawMessage) (resolvedRead, error) {
 		return resolvedRead{}, fmt.Errorf("offset must be greater than or equal to 1")
 	}
 
-	p := ResolvePath(t.WorkDir, a.Path)
+	p := ResolvePath(t.WorkDir, a.FilePath)
 	info, err := os.Stat(p)
 	if err != nil {
 		if os.IsNotExist(err) {

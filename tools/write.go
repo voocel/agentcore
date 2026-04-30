@@ -24,18 +24,25 @@ func (t *WriteTool) ReadOnly(_ json.RawMessage) bool            { return false }
 func (t *WriteTool) ConcurrencySafe(_ json.RawMessage) bool     { return false }
 func (t *WriteTool) ActivityDescription(_ json.RawMessage) string { return "Writing file" }
 func (t *WriteTool) Description() string {
-	return "Write or overwrite a file on disk. Prefer edit for partial changes to existing files. If you are replacing an existing file, read it first so you understand the current content before overwriting it. Creates parent directories if needed. Avoid creating docs or README files unless the user explicitly asks for them."
+	return `Writes a file to the local filesystem.
+
+Usage:
+- This tool will overwrite the existing file if there is one at the provided path.
+- If this is an existing file, you MUST use the read tool first to read the file's contents. This tool will fail if you did not read the file first.
+- Prefer the edit tool for modifying existing files — it only sends the diff. Only use this tool to create new files or for complete rewrites.
+- Creates parent directories if needed.
+- NEVER create documentation files (*.md) or README files unless explicitly requested by the user.`
 }
 func (t *WriteTool) Schema() map[string]any {
 	return schema.Object(
-		schema.Property("path", schema.String("Path to the file to write or overwrite (relative or absolute)")).Required(),
-		schema.Property("content", schema.String("Full file content to write")).Required(),
+		schema.Property("file_path", schema.String("The path to the file to write or overwrite (relative or absolute)")).Required(),
+		schema.Property("content", schema.String("The content to write to the file")).Required(),
 	)
 }
 
 type writeArgs struct {
-	Path    string `json:"path"`
-	Content string `json:"content"`
+	FilePath string `json:"file_path"`
+	Content  string `json:"content"`
 }
 
 type writeState struct {
@@ -51,19 +58,19 @@ func (t *WriteTool) parseWrite(args json.RawMessage) (*writeState, error) {
 		return nil, fmt.Errorf("invalid args: %w", err)
 	}
 
-	a.Path = ResolvePath(t.WorkDir, a.Path)
+	a.FilePath = ResolvePath(t.WorkDir, a.FilePath)
 
 	contentOld := ""
 	exists := false
-	if data, err := os.ReadFile(a.Path); err == nil {
+	if data, err := os.ReadFile(a.FilePath); err == nil {
 		contentOld = string(data)
 		exists = true
 	} else if !os.IsNotExist(err) {
-		return nil, fmt.Errorf("read %s: %w", a.Path, err)
+		return nil, fmt.Errorf("read %s: %w", a.FilePath, err)
 	}
 
 	return &writeState{
-		path:       a.Path,
+		path:       a.FilePath,
 		contentOld: contentOld,
 		contentNew: a.Content,
 		exists:     exists,

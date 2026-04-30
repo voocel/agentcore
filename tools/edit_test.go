@@ -20,9 +20,9 @@ func TestEditFuzzyMatchTrailingUnicodeSpace(t *testing.T) {
 
 	tool := NewEdit(dir)
 	args, err := json.Marshal(map[string]any{
-		"path":     "test.txt",
-		"old_text": "line\n",
-		"new_text": "repl\n",
+		"file_path": "test.txt",
+		"old_string": "line\n",
+		"new_string": "repl\n",
 	})
 	if err != nil {
 		t.Fatalf("marshal args: %v", err)
@@ -53,9 +53,9 @@ func TestEditFuzzyDoesNotChangeUnrelatedSameLineText(t *testing.T) {
 
 	tool := NewEdit(dir)
 	args, err := json.Marshal(map[string]any{
-		"path":     "test.txt",
-		"old_text": "target='old'",
-		"new_text": "target='new'",
+		"file_path": "test.txt",
+		"old_string": "target='old'",
+		"new_string": "target='new'",
 	})
 	if err != nil {
 		t.Fatalf("marshal args: %v", err)
@@ -87,9 +87,9 @@ func TestEditPreviewFuzzyNoMutation(t *testing.T) {
 
 	tool := NewEdit(dir)
 	args, err := json.Marshal(map[string]any{
-		"path":     "test.txt",
-		"old_text": "target='old'",
-		"new_text": "target='new'",
+		"file_path": "test.txt",
+		"old_string": "target='old'",
+		"new_string": "target='new'",
 	})
 	if err != nil {
 		t.Fatalf("marshal args: %v", err)
@@ -131,9 +131,9 @@ func TestEditIndentAwareMatch(t *testing.T) {
 
 	tool := NewEdit(dir)
 	args, err := json.Marshal(map[string]any{
-		"path": "test.txt",
-		"old_text": "if true {\n\tprintln(\"old\")\n}",
-		"new_text": "if true {\n\tprintln(\"new\")\n}",
+		"file_path": "test.txt",
+		"old_string": "if true {\n\tprintln(\"old\")\n}",
+		"new_string": "if true {\n\tprintln(\"new\")\n}",
 	})
 	if err != nil {
 		t.Fatalf("marshal args: %v", err)
@@ -165,9 +165,9 @@ func TestEditIndentAwareRequiresUniqueMatch(t *testing.T) {
 
 	tool := NewEdit(dir)
 	args, err := json.Marshal(map[string]any{
-		"path": "test.txt",
-		"old_text": "if true {\n\tprintln(\"old\")\n}",
-		"new_text": "if true {\n\tprintln(\"new\")\n}",
+		"file_path": "test.txt",
+		"old_string": "if true {\n\tprintln(\"old\")\n}",
+		"new_string": "if true {\n\tprintln(\"new\")\n}",
 	})
 	if err != nil {
 		t.Fatalf("marshal args: %v", err)
@@ -190,9 +190,9 @@ func TestEditFailureIncludesClosestMatchHint(t *testing.T) {
 
 	tool := NewEdit(dir)
 	args, err := json.Marshal(map[string]any{
-		"path": "test.txt",
-		"old_text": "if true {\n\tprintln(\"old\")\n}",
-		"new_text": "if true {\n\tprintln(\"new\")\n}",
+		"file_path": "test.txt",
+		"old_string": "if true {\n\tprintln(\"old\")\n}",
+		"new_string": "if true {\n\tprintln(\"new\")\n}",
 	})
 	if err != nil {
 		t.Fatalf("marshal args: %v", err)
@@ -203,7 +203,7 @@ func TestEditFailureIncludesClosestMatchHint(t *testing.T) {
 		t.Fatalf("expected edit error")
 	}
 	msg := err.Error()
-	if !strings.Contains(msg, "Possible old_text candidates (copy one exactly):") {
+	if !strings.Contains(msg, "Possible old_string candidates (copy one exactly):") {
 		t.Fatalf("expected closest match hint, got %q", msg)
 	}
 	if !strings.Contains(msg, "lines 2-4") {

@@ -25,21 +25,28 @@ func (t *EditTool) ReadOnly(_ json.RawMessage) bool            { return false }
 func (t *EditTool) ConcurrencySafe(_ json.RawMessage) bool     { return false }
 func (t *EditTool) ActivityDescription(_ json.RawMessage) string { return "Editing file" }
 func (t *EditTool) Description() string {
-	return "Edit an existing file by replacing one unique text block. Use read first, then copy the exact file content into old_text without any line numbers or prefixes. Preserve indentation for multi-line edits. If the target appears multiple times, include more surrounding context or set replace_all=true to replace every occurrence."
+	return `Performs exact string replacements in files.
+
+Usage:
+- You must use the read tool at least once in the conversation before editing. This tool will error if you attempt an edit without reading the file.
+- When editing text from read tool output, ensure you preserve the exact indentation (tabs/spaces) as it appears AFTER the line number prefix. The line number prefix format is: line number + tab. Everything after that is the actual file content to match. Never include any part of the line number prefix in the old_string or new_string.
+- ALWAYS prefer editing existing files in the codebase. NEVER write new files unless explicitly required.
+- The edit will FAIL if ` + "`old_string`" + ` is not unique in the file. Either provide a larger string with more surrounding context to make it unique or use ` + "`replace_all`" + ` to change every instance of ` + "`old_string`" + `.
+- Use ` + "`replace_all`" + ` for replacing and renaming strings across the file. This parameter is useful if you want to rename a variable for instance.`
 }
 func (t *EditTool) Schema() map[string]any {
 	return schema.Object(
-		schema.Property("path", schema.String("Path to the file to edit (relative or absolute)")).Required(),
-		schema.Property("old_text", schema.String("Exact text to find and replace (must be unique unless replace_all is true)")).Required(),
-		schema.Property("new_text", schema.String("New text to replace the old text with")).Required(),
-		schema.Property("replace_all", schema.Bool("Replace all occurrences of old_text (default: false)")),
+		schema.Property("file_path", schema.String("The path to the file to modify (relative or absolute)")).Required(),
+		schema.Property("old_string", schema.String("The text to replace (must be unique unless replace_all is true)")).Required(),
+		schema.Property("new_string", schema.String("The text to replace it with (must be different from old_string)")).Required(),
+		schema.Property("replace_all", schema.Bool("Replace all occurrences of old_string (default: false)")),
 	)
 }
 
 type editArgs struct {
-	Path       string `json:"path"`
-	OldText    string `json:"old_text"`
-	NewText    string `json:"new_text"`
+	FilePath   string `json:"file_path"`
+	OldString  string `json:"old_string"`
+	NewString  string `json:"new_string"`
 	ReplaceAll bool   `json:"replace_all"`
 }
 
@@ -59,11 +66,11 @@ func (t *EditTool) parseAndMatch(args json.RawMessage) (*editResult, error) {
 		return nil, fmt.Errorf("invalid args: %w", err)
 	}
 
-	a.Path = ResolvePath(t.WorkDir, a.Path)
+	a.FilePath = ResolvePath(t.WorkDir, a.FilePath)
 
-	data, err := os.ReadFile(a.Path)
+	data, err := os.ReadFile(a.FilePath)
 	if err != nil {
-		return nil, fmt.Errorf("file not found: %s", a.Path)
+		return nil, fmt.Errorf("file not found: %s", a.FilePath)
 	}
 
 	raw := string(data)
@@ -71,8 +78,8 @@ func (t *EditTool) parseAndMatch(args json.RawMessage) (*editResult, error) {
 
 	originalEnding := detectLineEnding(raw)
 	content := normalizeToLF(raw)
-	oldText := normalizeToLF(a.OldText)
-	newText := normalizeToLF(a.NewText)
+	oldText := normalizeToLF(a.OldString)
+	newText := normalizeToLF(a.NewString)
 	multiline := strings.Contains(oldText, "\n")
 
 	// Matching chain: exact/fuzzy → escape → blockAnchor → indentAware
@@ -92,7 +99,7 @@ func (t *EditTool) parseAndMatch(args json.RawMessage) (*editResult, error) {
 		var count int
 		idx, matchLen, count = indentAwareFind(content, oldText)
 		if count > 1 && !a.ReplaceAll {
-			return nil, fmt.Errorf("found %d indentation-insensitive occurrences of the text in %s. Provide more context or use replace_all=true", count, a.Path)
+			return nil, fmt.Errorf("found %d indentation-insensitive occurrences of the text in %s. Provide more context or use replace_all=true", count, a.FilePath)
 		}
 		if idx >= 0 {
 			needsReindent = true
@@ -101,9 +108,9 @@ func (t *EditTool) parseAndMatch(args json.RawMessage) (*editResult, error) {
 
 	if idx < 0 {
 		if hints := formatEditCandidates(content, oldText); hints != "" {
-			return nil, fmt.Errorf("could not find the exact text in %s. The old text must match exactly including all whitespace and newlines.\n\nPossible old_text candidates (copy one exactly):\n%s", a.Path, hints)
+			return nil, fmt.Errorf("could not find the exact text in %s. The old text must match exactly including all whitespace and newlines.\n\nPossible old_string candidates (copy one exactly):\n%s", a.FilePath, hints)
 		}
-		return nil, fmt.Errorf("could not find the exact text in %s. The old text must match exactly including all whitespace and newlines", a.Path)
+		return nil, fmt.Errorf("could not find the exact text in %s. The old text must match exactly including all whitespace and newlines", a.FilePath)
 	}
 
 	matchedText := content[idx : idx+matchLen]
@@ -119,20 +126,20 @@ func (t *EditTool) parseAndMatch(args json.RawMessage) (*editResult, error) {
 	} else {
 		count := strings.Count(content, matchedText)
 		if count > 1 {
-			return nil, fmt.Errorf("found %d occurrences of the text in %s. Use replace_all=true to replace all, or provide more context to make the match unique", count, a.Path)
+			return nil, fmt.Errorf("found %d occurrences of the text in %s. Use replace_all=true to replace all, or provide more context to make the match unique", count, a.FilePath)
 		}
 		newContent = content[:idx] + replacement + content[idx+matchLen:]
 	}
 
 	if content == newContent {
 		if replacement == matchedText {
-			return nil, fmt.Errorf("old_text and new_text are identical in %s. Provide a new_text that is different from the matched text", a.Path)
+			return nil, fmt.Errorf("old_string and new_string are identical in %s. Provide a new_string that is different from the matched text", a.FilePath)
 		}
-		return nil, fmt.Errorf("no changes made to %s. The replacement produced identical content (likely a whitespace or line-ending difference was normalized away)", a.Path)
+		return nil, fmt.Errorf("no changes made to %s. The replacement produced identical content (likely a whitespace or line-ending difference was normalized away)", a.FilePath)
 	}
 
 	return &editResult{
-		path:       a.Path,
+		path:       a.FilePath,
 		bom:        bom,
 		ending:     originalEnding,
 		oldContent: content,

@@ -304,12 +304,34 @@ func (l *LiteLLMAdapter) GenerateStream(ctx context.Context, messages []agentcor
 
 // convertMessages converts agentcore.Message to litellm.Message.
 // Handles multipart content (text + images) via litellm.Contents field.
+//
+// Drops assistant messages that would carry no content/reasoning/tool_calls
+// after conversion. Such messages occur when a model stops with only a
+// thinking block (or a thinking block we cannot forward to the provider) and
+// would otherwise be rejected by strict OpenAI-compatible providers with
+// "assistant must provide content, reasoning_content or tool_calls".
 func convertMessages(messages []agentcore.Message) []litellm.Message {
-	llmMessages := make([]litellm.Message, len(messages))
-	for i, msg := range messages {
-		llmMessages[i] = convertSingleMessage(msg)
+	llmMessages := make([]litellm.Message, 0, len(messages))
+	for _, msg := range messages {
+		converted := convertSingleMessage(msg)
+		if msg.Role == agentcore.RoleAssistant && isEmptyAssistantMessage(converted) {
+			continue
+		}
+		llmMessages = append(llmMessages, converted)
 	}
 	return llmMessages
+}
+
+// isEmptyAssistantMessage reports whether a converted assistant message has
+// no payload that any provider could consume.
+func isEmptyAssistantMessage(m litellm.Message) bool {
+	if m.Content != "" || m.ReasoningContent != "" {
+		return false
+	}
+	if len(m.Contents) > 0 || len(m.ToolCalls) > 0 {
+		return false
+	}
+	return true
 }
 
 // hasImageContent reports whether any content block is an image.
@@ -350,6 +372,18 @@ func convertSingleMessage(msg agentcore.Message) litellm.Message {
 		llmMsg.Contents = parts
 	} else {
 		llmMsg.Content = msg.TextContent()
+	}
+
+	// Forward thinking content as reasoning_content for assistant messages.
+	// DeepSeek/GLM/Qwen/Mimo and other reasoning-aware OpenAI-compatible
+	// providers require assistant turns to carry at least one of
+	// content/reasoning_content/tool_calls; preserving thinking here keeps
+	// thinking-only turns valid on replay. Vanilla OpenAI and Anthropic
+	// ignore the field on the request side.
+	if msg.Role == agentcore.RoleAssistant {
+		if thinking := msg.ThinkingContent(); thinking != "" {
+			llmMsg.ReasoningContent = thinking
+		}
 	}
 
 	// Pass cache_control from Metadata for system messages (multi-block prompt caching).
