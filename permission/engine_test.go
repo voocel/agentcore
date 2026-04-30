@@ -554,7 +554,11 @@ func TestUserRootsTakePrecedenceOverInternal(t *testing.T) {
 	}
 }
 
-func TestInternalPathRespectsPlanMode(t *testing.T) {
+func TestPlanModeAllowsInternalWritablePath(t *testing.T) {
+	// InternalWritable is the harness saying "this directory is mine to
+	// manage" (plan files, auto-memory, scratch). Plan mode trusts that
+	// declaration and lets writes through without needing PlanModeWriteAllowed.
+	// Mirrors how InternalReadable rides the Read pass-through.
 	workspace := t.TempDir()
 	memDir := t.TempDir()
 	engine := newTestEngine(t, workspace, ModeBalanced, nil)
@@ -571,11 +575,34 @@ func TestInternalPathRespectsPlanMode(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Decide: %v", err)
 	}
-	if decision == nil || decision.Allowed() {
-		t.Fatalf("plan mode must block write to internal path, got %#v", decision)
+	if decision == nil || !decision.Allowed() {
+		t.Fatalf("expected plan-mode allow for InternalWritable path, got %#v", decision)
 	}
 	if decision.Source != DecisionSourceMode {
-		t.Fatalf("expected plan-mode deny, got source %q", decision.Source)
+		t.Fatalf("expected plan-mode allow source, got %q", decision.Source)
+	}
+}
+
+func TestPlanModeAllowsNetwork(t *testing.T) {
+	// Network capability passes plan mode unconditionally — web_fetch /
+	// web_search are read-only by nature and plan exploration commonly
+	// needs to look up references.
+	engine := newTestEngine(t, t.TempDir(), ModeBalanced, nil)
+	engine.SetPlanMode(true)
+	engine.SetApprover(func(context.Context, Prompt) (Choice, error) {
+		t.Fatalf("plan-mode network should bypass approver")
+		return ChoiceDeny, nil
+	})
+
+	decision, err := engine.Decide(context.Background(), Request{
+		ToolName: "web_search",
+		Args:     mustJSON(t, map[string]any{"query": "go context cancel"}),
+	})
+	if err != nil {
+		t.Fatalf("Decide: %v", err)
+	}
+	if decision == nil || !decision.Allowed() || decision.Source != DecisionSourceMode {
+		t.Fatalf("expected plan-mode allow for network, got %#v", decision)
 	}
 }
 

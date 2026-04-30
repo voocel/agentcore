@@ -82,13 +82,14 @@ func (e *Engine) Decide(ctx context.Context, req Request) (*Decision, error) {
 			e.audit(info, decision)
 			return decision, nil
 		}
-		// Exec/Write calls that pass the plan-mode allow-list are allowed
-		// outright: the harness owns the safety contract (typically via system
-		// prompt or path matching), and bouncing to the underlying mode's ask
-		// flow would interrupt the model mid-planning. Read/Internal calls
-		// fall through to the regular pipeline so outsideRoots / store / rule
-		// checks continue to apply as before.
-		if info.capability == CapabilityExec || info.capability == CapabilityWrite {
+		// Exec/Write/Network calls that pass the plan-mode allow-list are
+		// allowed outright: the harness owns the safety contract (system
+		// prompt or path matching), and bouncing to the underlying mode's
+		// ask flow would interrupt the model mid-planning. Read/Internal
+		// calls fall through to the regular pipeline so outsideRoots /
+		// store / rule checks continue to apply as before.
+		switch info.capability {
+		case CapabilityExec, CapabilityWrite, CapabilityNetwork:
 			decision := allowDecision(DecisionSourceMode, info, "allowed in plan mode")
 			e.audit(info, decision)
 			return decision, nil
@@ -429,19 +430,29 @@ func (i toolInfo) withReason(reason string) toolInfo {
 }
 
 // planModeAllowed reports whether a tool may run while the harness is in plan
-// mode. Read-capability tools always pass; Internal control tools may opt in
-// via EngineConfig.PlanModeAllowedTools; Exec calls may opt in via
-// EngineConfig.PlanModeExecAllowed (typically used for read-only bash usage
-// during plan exploration); Write calls may opt in via
-// EngineConfig.PlanModeWriteAllowed (typically the plan file itself, edited
-// incrementally during planning). Network and unclassified tools stay blocked
-// unconditionally — even if a destructive tool is mistakenly listed under
-// PlanModeAllowedTools, it does not get promoted. The library stays
-// harness-agnostic: it knows the shape of the rule but never the names of
-// allowed tools.
+// mode.
+//
+//   - Read and Network capabilities pass unconditionally — both are read-only
+//     by nature and the plan phase typically needs to look up code and
+//     external references to build context.
+//   - Write capability passes when the target is a harness-declared internal
+//     path (info.internalPath) — InternalWritable is the harness saying "this
+//     directory is mine to manage", so plan mode should not second-guess it
+//     (mirrors how InternalReadable participates in the Read pass-through).
+//     Otherwise the call is allowed only if EngineConfig.PlanModeWriteAllowed
+//     opts it in, typically used to whitelist a designated file inside the
+//     user's WriteRoots.
+//   - Exec capability passes only if EngineConfig.PlanModeExecAllowed opts it
+//     in (typically read-only bash usage during plan exploration).
+//   - Internal control tools opt in via EngineConfig.PlanModeAllowedTools —
+//     even if a destructive tool is mistakenly listed there, it does not get
+//     promoted because capability classification has already happened.
+//
+// The library stays harness-agnostic: it knows the shape of the rule but
+// never the names of allowed tools.
 func (e *Engine) planModeAllowed(info toolInfo, req Request) bool {
 	switch info.capability {
-	case CapabilityRead:
+	case CapabilityRead, CapabilityNetwork:
 		return true
 	case CapabilityExec:
 		if e.planExecAllowed == nil {
@@ -449,6 +460,9 @@ func (e *Engine) planModeAllowed(info toolInfo, req Request) bool {
 		}
 		return e.planExecAllowed(req)
 	case CapabilityWrite:
+		if info.internalPath {
+			return true
+		}
 		if e.planWriteAllowed == nil {
 			return false
 		}
