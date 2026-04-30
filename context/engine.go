@@ -41,7 +41,6 @@ type EngineConfig struct {
 	// MaxConsecutiveFailures is the circuit breaker threshold. After this many
 	// consecutive Project failures, the engine skips compression and returns
 	// the original messages to avoid wasting API calls. 0 = default (3).
-	// Matches Claude Code's MAX_CONSECUTIVE_AUTOCOMPACT_FAILURES behavior.
 	MaxConsecutiveFailures int
 }
 
@@ -220,8 +219,7 @@ func (e *ContextEngine) Project(ctx context.Context, msgs []agentcore.AgentMessa
 
 	// Circuit breaker: skip compression after too many consecutive failures.
 	// Unlike a silent bypass, we still fire OnProject so the host can observe
-	// and display the skipped state (matches Claude Code's circuit breaker
-	// logging at autoCompact.ts:344).
+	// and display the skipped state.
 	e.mu.Lock()
 	tripped := e.consecutiveFailures >= e.maxFailures
 	failures := e.consecutiveFailures

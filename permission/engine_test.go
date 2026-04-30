@@ -8,6 +8,37 @@ import (
 	"testing"
 )
 
+// testClassifier maps a fixed set of conventional tool names to capabilities
+// for the test suite. Production callers register their own classifier via
+// EngineConfig.Classifier; the engine itself has no built-in tool name knowledge.
+func testClassifier(req Request) Classification {
+	args := map[string]any{}
+	if len(req.Args) > 0 {
+		_ = json.Unmarshal(req.Args, &args)
+	}
+	str := func(key string) string {
+		v, _ := args[key].(string)
+		return v
+	}
+	switch req.ToolName {
+	case "read", "glob", "grep", "ls":
+		return Classification{Capability: CapabilityRead, Path: str("path")}
+	case "write", "edit":
+		return Classification{Capability: CapabilityWrite, Path: str("path")}
+	case "bash":
+		return Classification{
+			Capability: CapabilityExec,
+			Command:    str("command"),
+			Workdir:    str("workdir"),
+		}
+	case "web_fetch":
+		return Classification{Capability: CapabilityNetwork, URL: str("url")}
+	case "web_search":
+		return Classification{Capability: CapabilityNetwork, Key: "network:search"}
+	}
+	return Classification{}
+}
+
 func newTestEngine(t *testing.T, workspace string, mode Mode, rules *RuleSet) *Engine {
 	t.Helper()
 	store, err := NewStore(filepath.Join(t.TempDir(), "approvals.json"))
@@ -15,10 +46,11 @@ func newTestEngine(t *testing.T, workspace string, mode Mode, rules *RuleSet) *E
 		t.Fatalf("NewStore: %v", err)
 	}
 	return NewEngine(EngineConfig{
-		Workspace: workspace,
-		Mode:      mode,
-		Rules:     rules,
-		Store:     store,
+		Workspace:  workspace,
+		Mode:       mode,
+		Rules:      rules,
+		Store:      store,
+		Classifier: testClassifier,
 	})
 }
 
@@ -194,9 +226,10 @@ func TestPlanModeExecAllowedHookPasses(t *testing.T) {
 		t.Fatalf("NewStore: %v", err)
 	}
 	engine := NewEngine(EngineConfig{
-		Workspace: t.TempDir(),
-		Mode:      ModeBalanced,
-		Store:     store,
+		Workspace:  t.TempDir(),
+		Mode:       ModeBalanced,
+		Store:      store,
+		Classifier: testClassifier,
 		PlanModeExecAllowed: func(req Request) bool {
 			return req.ToolName == "bash"
 		},
@@ -229,9 +262,10 @@ func TestPlanModeWriteAllowedHookPasses(t *testing.T) {
 		t.Fatalf("NewStore: %v", err)
 	}
 	engine := NewEngine(EngineConfig{
-		Workspace: workspace,
-		Mode:      ModeBalanced,
-		Store:     store,
+		Workspace:  workspace,
+		Mode:       ModeBalanced,
+		Store:      store,
+		Classifier: testClassifier,
 		PlanModeWriteAllowed: func(req Request) bool {
 			var args struct {
 				Path string `json:"path"`
@@ -484,8 +518,8 @@ func TestUserRootsTakePrecedenceOverInternal(t *testing.T) {
 	// When a path is in BOTH the user's WriteRoots and InternalWritable,
 	// the user-configured root wins: the request runs through the normal
 	// mode-based flow (balanced → ask) instead of the internal silent allow.
-	// This matches CC's working-dir-before-internal-path order and prevents
-	// the harness from silently overriding what the user explicitly opted
+	// User intent takes precedence over harness-declared internal paths so
+	// the harness cannot silently override what the user explicitly opted
 	// into. Lock this in so a future refactor can't quietly invert it.
 	workspace := t.TempDir()
 	memDir := t.TempDir()

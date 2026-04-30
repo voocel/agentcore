@@ -23,7 +23,6 @@ const (
 	CapabilityExec     Capability = "exec"
 	CapabilityHook     Capability = "hook"
 	CapabilityNetwork  Capability = "network"
-	CapabilitySubagent Capability = "subagent"
 	CapabilityInternal Capability = "internal"
 	CapabilityUnknown  Capability = "unknown"
 )
@@ -157,6 +156,40 @@ type AuditEntry struct {
 	Allow      bool       `json:"allow"`
 }
 
+// Classification describes how the permission engine should treat a tool
+// call. The harness owns the mapping from tool names to capabilities and
+// operand fields, and provides it via EngineConfig.Classifier.
+//
+// Field semantics by Capability:
+//   - Read    : Path is checked against ReadRoots; populates summary.
+//   - Write   : Path is checked against WriteRoots; populates summary
+//     and contributes to the audit key (write:<path>).
+//   - Exec    : Command populates summary; hashed into the audit key
+//     (exec:<hash>). Workdir, if set, is checked against WriteRoots.
+//   - Network : URL populates summary; host extracted into audit key
+//     (network:<host>). Empty URL falls back to network:<tool>.
+//   - Internal: no operand fields used; key is internal:<tool>.
+//   - Unknown : key is tool:<tool>.
+//
+// Summary, Reason, and Key are optional overrides — empty fields fall
+// back to engine-derived defaults.
+type Classification struct {
+	Capability Capability
+	Path       string
+	Command    string
+	Workdir    string
+	URL        string
+	Summary    string
+	Reason     string
+	Key        string
+}
+
+// Classifier maps a Request to a Classification. The harness owns the
+// mapping from tool names to capabilities and operand fields. If nil,
+// every request defaults to CapabilityUnknown unless Request.Metadata
+// supplies a Capability override.
+type Classifier func(req Request) Classification
+
 type EngineConfig struct {
 	Workspace string
 	Mode      Mode
@@ -165,6 +198,9 @@ type EngineConfig struct {
 	Store     *Store
 	Approver  Approver
 	OnAudit   func(AuditEntry)
+	// Classifier maps tool requests to capabilities + operand fields.
+	// See Classification for field semantics.
+	Classifier Classifier
 	// PlanModeAllowedTools names tools that may run in plan mode despite not
 	// having Read capability. Empty by default — plan mode is read-only.
 	// Use this for harness-specific control tools (e.g. an "exit_plan_mode"

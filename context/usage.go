@@ -9,8 +9,8 @@ import (
 // estimateTextTokens estimates token count for a text string with CJK awareness.
 // For CJK-dominant text (bytes/runes > 2): uses runes * 1.5 (empirical fit for
 // Chinese/Japanese/Korean tokenizers). For ASCII-dominant text: uses bytes / 4
-// (standard BPE approximation). This matches Claude Code's bytesPerToken approach
-// but auto-detects the dominant script instead of requiring caller configuration.
+// (standard BPE approximation). The dominant script is auto-detected so callers
+// do not need to configure it.
 func estimateTextTokens(text string) int {
 	bytes := len(text)
 	if bytes == 0 {

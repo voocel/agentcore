@@ -13,10 +13,11 @@ import (
 )
 
 type Engine struct {
-	workspace string
-	rules     *RuleSet
-	store     *Store
-	onAudit   func(AuditEntry)
+	workspace  string
+	rules      *RuleSet
+	store      *Store
+	onAudit    func(AuditEntry)
+	classifier Classifier
 
 	mu               sync.RWMutex
 	mode             Mode
@@ -43,6 +44,7 @@ func NewEngine(cfg EngineConfig) *Engine {
 		rules:            cfg.Rules,
 		store:            cfg.Store,
 		onAudit:          cfg.OnAudit,
+		classifier:       cfg.Classifier,
 		mode:             cfg.Mode,
 		approver:         cfg.Approver,
 		fsRoots:          normalizeFilesystemRoots(cfg.Workspace, cfg.Roots),
@@ -54,7 +56,7 @@ func NewEngine(cfg EngineConfig) *Engine {
 }
 
 func (e *Engine) Decide(ctx context.Context, req Request) (*Decision, error) {
-	info := inspectRequest(e.workspace, e.filesystemRoots(), req)
+	info := inspectRequest(e.workspace, e.filesystemRoots(), e.classifier, req)
 	if info.hardDeny != "" {
 		decision := denyDecision(DecisionSourceRoots, info, info.hardDeny)
 		e.audit(info, decision)
@@ -432,10 +434,11 @@ func (i toolInfo) withReason(reason string) toolInfo {
 // EngineConfig.PlanModeExecAllowed (typically used for read-only bash usage
 // during plan exploration); Write calls may opt in via
 // EngineConfig.PlanModeWriteAllowed (typically the plan file itself, edited
-// incrementally during planning). Network/Subagent stay blocked unconditionally
-// — even if a destructive tool is mistakenly listed under PlanModeAllowedTools,
-// it does not get promoted. The library stays harness-agnostic: it knows the
-// shape of the rule but never the names of allowed tools.
+// incrementally during planning). Network and unclassified tools stay blocked
+// unconditionally — even if a destructive tool is mistakenly listed under
+// PlanModeAllowedTools, it does not get promoted. The library stays
+// harness-agnostic: it knows the shape of the rule but never the names of
+// allowed tools.
 func (e *Engine) planModeAllowed(info toolInfo, req Request) bool {
 	switch info.capability {
 	case CapabilityRead:
@@ -495,43 +498,56 @@ func allowDecision(source DecisionSource, info toolInfo, reason string) *Decisio
 	}
 }
 
-func inspectRequest(workspace string, roots FilesystemRoots, req Request) toolInfo {
-	payload := decodeArgs(req.Args)
+func inspectRequest(workspace string, roots FilesystemRoots, classifier Classifier, req Request) toolInfo {
+	var c Classification
+	if classifier != nil {
+		c = classifier(req)
+	}
 	info := toolInfo{
 		tool:       req.ToolName,
-		capability: CapabilityUnknown,
+		capability: c.Capability,
 		summary:    strings.TrimSpace(req.Summary),
 		reason:     strings.TrimSpace(req.Reason),
 		preview:    previewText(req.Preview),
 		workspace:  workspace,
 	}
+	if info.capability == "" {
+		info.capability = CapabilityUnknown
+	}
+	if info.summary == "" {
+		info.summary = strings.TrimSpace(c.Summary)
+	}
 	if info.summary == "" {
 		info.summary = req.ToolName
 	}
-	switch req.ToolName {
-	case "read", "glob", "grep", "ls":
-		info.capability = CapabilityRead
+	if info.reason == "" {
+		info.reason = strings.TrimSpace(c.Reason)
+	}
+
+	switch info.capability {
+	case CapabilityRead:
 		info.key = "read"
 		info.roots = roots.ReadRoots
-		path, deny := checkedPath(workspace, roots.ReadRoots, payload, "readable")
-		if path != "" {
-			info.summary = path
-		}
-		if deny != "" {
-			// Harness-declared internal paths bypass the user-roots check.
-			// InternalWritable implies readability — populating only the
-			// writable list is the common case for fully-managed dirs.
-			if pathInRoots(path, roots.InternalReadable) || pathInRoots(path, roots.InternalWritable) {
-				info.internalPath = true
-			} else {
-				info.outsideRoots = true
-				info.reason = deny
+		if c.Path != "" {
+			path, deny := checkedPath(workspace, roots.ReadRoots, c.Path, "readable")
+			if path != "" {
+				info.summary = path
+			}
+			if deny != "" {
+				// Harness-declared internal paths bypass the user-roots check.
+				// InternalWritable implies readability — populating only the
+				// writable list is the common case for fully-managed dirs.
+				if pathInRoots(path, roots.InternalReadable) || pathInRoots(path, roots.InternalWritable) {
+					info.internalPath = true
+				} else {
+					info.outsideRoots = true
+					info.reason = deny
+				}
 			}
 		}
-	case "write", "edit":
-		info.capability = CapabilityWrite
+	case CapabilityWrite:
 		info.roots = roots.WriteRoots
-		path, deny := checkedPath(workspace, roots.WriteRoots, payload, "writable")
+		path, deny := checkedPath(workspace, roots.WriteRoots, c.Path, "writable")
 		info.summary = firstNonEmpty(path, info.summary)
 		info.key = "write:" + path
 		if info.reason == "" {
@@ -544,7 +560,7 @@ func inspectRequest(workspace string, roots FilesystemRoots, req Request) toolIn
 			case pathInRoots(path, roots.InternalReadable):
 				info.hardDeny = fmt.Sprintf("path in read-only internal root, not writable: %s", path)
 			default:
-				_, notInReadRoots := checkedPath(workspace, roots.ReadRoots, payload, "readable")
+				_, notInReadRoots := checkedPath(workspace, roots.ReadRoots, c.Path, "readable")
 				if notInReadRoots == "" {
 					info.hardDeny = fmt.Sprintf("path in read-only root, not writable: %s", path)
 				} else {
@@ -553,40 +569,32 @@ func inspectRequest(workspace string, roots FilesystemRoots, req Request) toolIn
 				}
 			}
 		}
-	case "bash":
-		info.capability = CapabilityExec
-		command := strings.TrimSpace(stringArg(payload, "command"))
+	case CapabilityExec:
+		command := strings.TrimSpace(c.Command)
 		info.summary = firstNonEmpty(command, info.summary)
 		info.key = "exec:" + shortHash(command)
 		if info.reason == "" {
 			info.reason = "shell execution requires approval"
 		}
-		if wd := strings.TrimSpace(stringArg(payload, "workdir")); wd != "" {
-			_, deny := checkedPath(workspace, roots.WriteRoots, map[string]any{"path": wd}, "writable")
+		if wd := strings.TrimSpace(c.Workdir); wd != "" {
+			_, deny := checkedPath(workspace, roots.WriteRoots, wd, "writable")
 			if deny != "" {
 				info.outsideRoots = true
-				info.reason = fmt.Sprintf("bash workdir outside writable roots: %s", wd)
+				info.reason = fmt.Sprintf("workdir outside writable roots: %s", wd)
 			}
 		}
-	case "web_fetch":
-		info.capability = CapabilityNetwork
-		targetURL := strings.TrimSpace(stringArg(payload, "url"))
-		host := hostOf(targetURL)
-		info.summary = firstNonEmpty(targetURL, info.summary)
-		info.key = "network:" + host
+	case CapabilityNetwork:
+		target := strings.TrimSpace(c.URL)
+		info.summary = firstNonEmpty(target, info.summary)
+		if target != "" {
+			info.key = "network:" + hostOf(target)
+		} else {
+			info.key = "network:" + req.ToolName
+		}
 		if info.reason == "" {
 			info.reason = "network access requires approval"
 		}
-	case "web_search":
-		info.capability = CapabilityNetwork
-		query := strings.TrimSpace(stringArg(payload, "query"))
-		info.summary = firstNonEmpty(query, info.summary)
-		info.key = "network:search"
-		if info.reason == "" {
-			info.reason = "network access requires approval"
-		}
-	case "ask_user", "enter_plan_mode", "exit_plan_mode", "task_create", "task_get", "task_update", "task_list", "cron_create", "cron_list", "cron_remove", "tool_search", "subagent":
-		info.capability = CapabilityInternal
+	case CapabilityInternal:
 		info.key = "internal:" + req.ToolName
 	default:
 		info.capability = CapabilityUnknown
@@ -594,6 +602,10 @@ func inspectRequest(workspace string, roots FilesystemRoots, req Request) toolIn
 		if info.reason == "" {
 			info.reason = "unclassified tool requires approval"
 		}
+	}
+
+	if c.Key != "" {
+		info.key = c.Key
 	}
 
 	meta := req.Metadata
@@ -614,41 +626,22 @@ func inspectRequest(workspace string, roots FilesystemRoots, req Request) toolIn
 	return info
 }
 
-func decodeArgs(raw json.RawMessage) map[string]any {
-	if len(raw) == 0 {
-		return nil
+// checkedPath resolves raw against workspace, then verifies it falls within
+// at least one of roots. Returns the absolute path plus a deny message when
+// the path lies outside; an empty raw input returns ("", "").
+func checkedPath(workspace string, roots []string, raw, rootLabel string) (string, string) {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return "", ""
 	}
-	var payload map[string]any
-	_ = json.Unmarshal(raw, &payload)
-	return payload
-}
-
-func stringArg(payload map[string]any, key string) string {
-	if payload == nil {
-		return ""
-	}
-	value, _ := payload[key].(string)
-	return value
-}
-
-func pathArg(workspace string, payload map[string]any) string {
-	path := strings.TrimSpace(stringArg(payload, "path"))
-	if path == "" {
-		return ""
-	}
-	if filepath.IsAbs(path) {
-		return filepath.Clean(path)
-	}
-	if workspace == "" {
-		return filepath.Clean(path)
-	}
-	return filepath.Clean(filepath.Join(workspace, path))
-}
-
-func checkedPath(workspace string, roots []string, payload map[string]any, rootLabel string) (string, string) {
-	path := pathArg(workspace, payload)
-	if path == "" {
-		return path, ""
+	var path string
+	switch {
+	case filepath.IsAbs(raw):
+		path = filepath.Clean(raw)
+	case workspace == "":
+		path = filepath.Clean(raw)
+	default:
+		path = filepath.Clean(filepath.Join(workspace, raw))
 	}
 	if len(roots) == 0 {
 		if workspace == "" {

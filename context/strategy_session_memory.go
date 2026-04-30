@@ -12,9 +12,8 @@ import (
 // strategy that substitutes a harness-maintained, pre-computed summary for
 // the LLM-generated one produced by FullSummaryStrategy.
 //
-// The strategy mirrors Claude Code v2.1.88's sessionMemoryCompact.ts: when a
-// project-scoped session memory already exists, compaction can skip the
-// synchronous summarization LLM call and reuse the living memory as the
+// When a project-scoped session memory already exists, compaction can skip
+// the synchronous summarization LLM call and reuse the living memory as the
 // ContextSummary body. The harness supplies the seed via SeedFn.
 type SessionMemoryConfig struct {
 	// SeedFn returns the pre-computed session memory text. Called lazily at

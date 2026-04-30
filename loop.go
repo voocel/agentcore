@@ -1157,8 +1157,8 @@ func buildToolSpecs(tools []Tool) []ToolSpec {
 // validateToolArgs validates tool call arguments against the tool's JSON Schema.
 // Collects every missing-required and type-mismatch issue in one pass so weaker
 // models can self-correct in a single follow-up turn instead of trial-and-error.
-// Error text mirrors Claude Code's formatZodValidationError — natural-language,
-// one line per issue — which empirically recovers faster than terse errors.
+// Error text is natural-language, one line per issue — empirically recovers
+// faster than terse errors.
 func validateToolArgs(tool Tool, args json.RawMessage) error {
 	schema := tool.Schema()
 	if schema == nil {
