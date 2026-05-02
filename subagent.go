@@ -51,6 +51,10 @@ type SubAgentConfig struct {
 	// terminal tool (e.g. "commit_chapter") end the loop cleanly.
 	StopAfterTools []string
 
+	// StopAfterToolResult is the result-aware variant of StopAfterTools. It is
+	// useful when a tool is terminal only after a specific structured result.
+	StopAfterToolResult func(toolName string, result json.RawMessage) bool
+
 	// OnMessage, if non-nil, is called after each message is appended to
 	// context. The agentName and task are provided for session routing.
 	OnMessage func(agentName, task string, msg AgentMessage)
@@ -95,12 +99,13 @@ type subagentChain struct {
 
 // subagentResult captures one sub-agent's execution outcome.
 type subagentResult struct {
-	Agent   string         `json:"agent"`
-	Task    string         `json:"task"`
-	Output  string         `json:"output"`
-	IsError bool           `json:"is_error,omitempty"`
-	Step    int            `json:"step,omitempty"`
-	Usage   *subagentUsage `json:"usage,omitempty"`
+	Agent          string          `json:"agent"`
+	Task           string          `json:"task"`
+	Output         string          `json:"output"`
+	TerminalResult json.RawMessage `json:"terminal_result,omitempty"`
+	IsError        bool            `json:"is_error,omitempty"`
+	Step           int             `json:"step,omitempty"`
+	Usage          *subagentUsage  `json:"usage,omitempty"`
 }
 
 // subagentUsage tracks token consumption and cost for a sub-agent run.
@@ -297,7 +302,7 @@ func (t *SubAgentTool) executeBackground(agentName, task, description string, mo
 			}
 		}
 
-		_, usage, err := t.runAgent(bgCtx, agentName, task, modelOverride, &bgRunOpts{taskID: taskID, rt: rt, outFile: outFile})
+		_, _, usage, err := t.runAgent(bgCtx, agentName, task, modelOverride, &bgRunOpts{taskID: taskID, rt: rt, outFile: outFile})
 		if outFile != nil {
 			outFile.Close()
 		}
@@ -340,17 +345,21 @@ func (t *SubAgentTool) notify(taskID string) {
 
 // executeSingle runs one sub-agent with an isolated context.
 func (t *SubAgentTool) executeSingle(ctx context.Context, agentName, task string, modelOverride ChatModel) (json.RawMessage, error) {
-	output, usage, err := t.runAgent(ctx, agentName, task, modelOverride, nil)
+	output, terminalResult, usage, err := t.runAgent(ctx, agentName, task, modelOverride, nil)
 	if err != nil {
-		return json.Marshal(map[string]any{
-			"error": fmt.Sprintf("Agent %q failed: %v", agentName, err),
-			"usage": usage,
-		})
+		if usage != nil {
+			return nil, fmt.Errorf("agent %q failed: %w (turns=%d tools=%d)", agentName, err, usage.Turns, usage.Tools)
+		}
+		return nil, fmt.Errorf("agent %q failed: %w", agentName, err)
 	}
-	return json.Marshal(map[string]any{
+	result := map[string]any{
 		"output": output,
 		"usage":  usage,
-	})
+	}
+	if len(terminalResult) > 0 {
+		result["terminal_result"] = terminalResult
+	}
+	return json.Marshal(result)
 }
 
 // executeChain runs sub-agents sequentially, passing each output to the next via {previous}.
@@ -364,13 +373,14 @@ func (t *SubAgentTool) executeChain(ctx context.Context, chain []subagentChain, 
 		}
 
 		task := strings.ReplaceAll(step.Task, "{previous}", previous)
-		output, usage, err := t.runAgent(ctx, step.Agent, task, modelOverride, nil)
+		output, terminalResult, usage, err := t.runAgent(ctx, step.Agent, task, modelOverride, nil)
 
 		result := subagentResult{
-			Agent: step.Agent,
-			Task:  task,
-			Step:  i + 1,
-			Usage: usage,
+			Agent:          step.Agent,
+			Task:           task,
+			Step:           i + 1,
+			Usage:          usage,
+			TerminalResult: terminalResult,
 		}
 
 		if err != nil {
@@ -411,11 +421,12 @@ func (t *SubAgentTool) executeParallel(ctx context.Context, tasks []subagentTask
 			sem <- struct{}{}
 			defer func() { <-sem }()
 
-			output, usage, err := t.runAgent(ctx, st.Agent, st.Task, modelOverride, nil)
+			output, terminalResult, usage, err := t.runAgent(ctx, st.Agent, st.Task, modelOverride, nil)
 			result := subagentResult{
-				Agent: st.Agent,
-				Task:  st.Task,
-				Usage: usage,
+				Agent:          st.Agent,
+				Task:           st.Task,
+				Usage:          usage,
+				TerminalResult: terminalResult,
 			}
 			if err != nil {
 				result.Output = err.Error()
@@ -452,14 +463,14 @@ type bgRunOpts struct {
 
 // runAgent executes an isolated agent loop for the given agent config and task.
 // Includes panic recovery to prevent a subagent crash from taking down the parent.
-func (t *SubAgentTool) runAgent(ctx context.Context, agentName, task string, modelOverride ChatModel, bg *bgRunOpts) (output string, usage *subagentUsage, err error) {
+func (t *SubAgentTool) runAgent(ctx context.Context, agentName, task string, modelOverride ChatModel, bg *bgRunOpts) (output string, terminalResult json.RawMessage, usage *subagentUsage, err error) {
 	cfg, ok := t.agents[agentName]
 	if !ok {
 		available := make([]string, 0, len(t.agents))
 		for name := range t.agents {
 			available = append(available, name)
 		}
-		return "", nil, fmt.Errorf("unknown agent %q, available: %s", agentName, strings.Join(available, ", "))
+		return "", nil, nil, fmt.Errorf("unknown agent %q, available: %s", agentName, strings.Join(available, ", "))
 	}
 
 	// Panic recovery — isolated subagent should never crash the parent
@@ -504,6 +515,7 @@ func (t *SubAgentTool) runAgent(ctx context.Context, agentName, task string, mod
 			return ok
 		}
 	}
+	loopCfg.StopAfterToolResult = cfg.StopAfterToolResult
 	if cfg.StopGuardFactory != nil {
 		loopCfg.StopGuard = cfg.StopGuardFactory(agentName, task)
 	}
@@ -518,7 +530,7 @@ func (t *SubAgentTool) runAgent(ctx context.Context, agentName, task string, mod
 	events := AgentLoop(ctx, []AgentMessage{UserMsg(task)}, agentCtx, loopCfg)
 
 	var lastAssistantContent string
-	var terminalToolResult string // result from StopAfterTool trigger
+	var terminalToolResult json.RawMessage // result from StopAfterTool trigger
 	var lastErr error
 	su := &subagentUsage{}
 
@@ -603,8 +615,9 @@ func (t *SubAgentTool) runAgent(ctx context.Context, agentName, task string, mod
 			// Capture terminal tool result for inclusion in subagent output.
 			// When StopAfterTool fires, this is the last tool result and
 			// contains actionable data (e.g. system_hints) for the caller.
-			if !ev.IsError && loopCfg.StopAfterTool != nil && loopCfg.StopAfterTool(ev.Tool) {
-				terminalToolResult = string(ev.Result)
+			if !ev.IsError && ((loopCfg.StopAfterTool != nil && loopCfg.StopAfterTool(ev.Tool)) ||
+				(loopCfg.StopAfterToolResult != nil && loopCfg.StopAfterToolResult(ev.Tool, ev.Result))) {
+				terminalToolResult = append(terminalToolResult[:0], ev.Result...)
 			}
 			if bg == nil {
 				reportSubagentContext(ctx, agentName, contextManager)
@@ -668,20 +681,20 @@ func (t *SubAgentTool) runAgent(ctx context.Context, agentName, task string, mod
 		}
 	}
 
-	if lastErr != nil && lastAssistantContent == "" {
-		return "", su, lastErr
+	if lastErr != nil {
+		return "", nil, su, lastErr
 	}
 	output = lastAssistantContent
-	if terminalToolResult != "" {
+	if len(terminalToolResult) > 0 {
 		if output != "" {
 			output += "\n\n"
 		}
-		output += terminalToolResult
+		output += string(terminalToolResult)
 	}
 	if output == "" {
-		return "(no output)", su, nil
+		return "(no output)", terminalToolResult, su, nil
 	}
-	return output, su, nil
+	return output, terminalToolResult, su, nil
 }
 
 func reportSubagentContext(ctx context.Context, agentName string, mgr ContextManager) {

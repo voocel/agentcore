@@ -308,9 +308,16 @@ func runLoop(ctx context.Context, currentCtx *AgentContext, newMessages *[]Agent
 			turnCount++
 
 			// Early exit: a terminal tool completed successfully.
-			if config.StopAfterTool != nil {
+			if config.StopAfterTool != nil || config.StopAfterToolResult != nil {
 				for _, tr := range turnToolResults {
-					if !tr.IsError && config.StopAfterTool(tr.ToolName) {
+					if tr.IsError {
+						continue
+					}
+					if config.StopAfterTool != nil && config.StopAfterTool(tr.ToolName) {
+						emit(ch, Event{Type: EventAgentEnd, NewMessages: *newMessages, Summary: buildSummary(turnCount, EndReasonStop)})
+						return
+					}
+					if config.StopAfterToolResult != nil && config.StopAfterToolResult(tr.ToolName, tr.Content) {
 						emit(ch, Event{Type: EventAgentEnd, NewMessages: *newMessages, Summary: buildSummary(turnCount, EndReasonStop)})
 						return
 					}

@@ -2,6 +2,7 @@ package agentcore
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"sync"
 	"time"
@@ -127,6 +128,11 @@ type LoopConfig struct {
 	// EndReasonStop — even when ToolChoice is "required". Use this to let a
 	// terminal tool (e.g. commit_chapter) end the loop without wasting turns.
 	StopAfterTool func(toolName string) bool
+
+	// StopAfterToolResult is the result-aware variant of StopAfterTool. It is
+	// useful when the same tool can be an intermediate step or a terminal step
+	// depending on its structured result.
+	StopAfterToolResult func(toolName string, result json.RawMessage) bool
 
 	// OnMessage, if non-nil, is called after each message is appended to
 	// context (assistant, tool result, steering). Use for session logging.

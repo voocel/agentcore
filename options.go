@@ -2,6 +2,7 @@ package agentcore
 
 import (
 	"context"
+	"encoding/json"
 	"time"
 
 	"github.com/voocel/agentcore/permission"
@@ -265,4 +266,11 @@ func WithOnMaxTurns(action MaxTurnsAction) AgentOption {
 // shouldn't waste another LLM turn after they succeed.
 func WithStopAfterTool(fn func(toolName string) bool) AgentOption {
 	return func(a *Agent) { a.stopAfterTool = fn }
+}
+
+// WithStopAfterToolResult installs a result-aware predicate that ends the
+// agent run after a successful tool execution whose structured result returns
+// true. The terminating tool's result is committed to history before exit.
+func WithStopAfterToolResult(fn func(toolName string, result json.RawMessage) bool) AgentOption {
+	return func(a *Agent) { a.stopAfterToolResult = fn }
 }

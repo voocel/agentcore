@@ -3,6 +3,7 @@ package agentcore
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"strings"
 	"testing"
 )
@@ -44,14 +45,46 @@ func TestSubAgentTool_Single(t *testing.T) {
 
 func TestSubAgentTool_UnknownAgent(t *testing.T) {
 	tool := NewSubAgentTool(simpleAgent("writer", "x"))
-	result, err := tool.Execute(context.Background(), json.RawMessage(`{"agent":"unknown","task":"hi"}`))
-	if err != nil {
-		t.Fatal(err)
+	_, err := tool.Execute(context.Background(), json.RawMessage(`{"agent":"unknown","task":"hi"}`))
+	if err == nil || !strings.Contains(err.Error(), "unknown agent") {
+		t.Fatalf("expected unknown agent error, got %v", err)
 	}
-	out := parseResult(t, result)
-	errMsg, _ := out["error"].(string)
-	if !strings.Contains(errMsg, "unknown agent") {
-		t.Fatalf("expected unknown agent error, got %v", out)
+}
+
+func TestSubAgentTool_SinglePropagatesFinalErrorAfterPartialOutput(t *testing.T) {
+	noop := NewFuncTool("noop", "noop", map[string]any{
+		"type": "object", "properties": map[string]any{},
+	}, func(ctx context.Context, args json.RawMessage) (json.RawMessage, error) {
+		return json.Marshal(map[string]bool{"ok": true})
+	})
+
+	cfg := SubAgentConfig{
+		Name:        "writer",
+		Description: "writer agent",
+		Tools:       []Tool{noop},
+		StreamFn: sequentialStreamFn(func(i int, req *LLMRequest) (*LLMResponse, error) {
+			if i == 0 {
+				return &LLMResponse{Message: Message{
+					Role: RoleAssistant,
+					Content: []ContentBlock{
+						TextBlock("partial output before failure"),
+						ToolCallBlock(ToolCall{ID: "tc1", Name: "noop", Args: json.RawMessage(`{}`)}),
+					},
+					StopReason: StopReasonToolUse,
+				}}, nil
+			}
+			return nil, errors.New("llm failed after partial output")
+		}),
+		MaxTurns: 3,
+	}
+
+	tool := NewSubAgentTool(cfg)
+	result, err := tool.Execute(context.Background(), json.RawMessage(`{"agent":"writer","task":"write"}`))
+	if err == nil {
+		t.Fatalf("expected final LLM error to propagate, got result %s", string(result))
+	}
+	if !strings.Contains(err.Error(), "llm failed after partial output") {
+		t.Fatalf("expected original error in message, got %v", err)
 	}
 }
 

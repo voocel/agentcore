@@ -800,6 +800,74 @@ func TestAgentLoop_StopAfterTool(t *testing.T) {
 	}
 }
 
+func TestAgentLoop_StopAfterToolResult(t *testing.T) {
+	saveTool := NewFuncTool("save_foundation", "save foundation", map[string]any{
+		"type": "object", "properties": map[string]any{},
+	}, func(ctx context.Context, args json.RawMessage) (json.RawMessage, error) {
+		var p struct {
+			Ready bool `json:"ready"`
+		}
+		_ = json.Unmarshal(args, &p)
+		return json.Marshal(map[string]bool{"foundation_ready": p.Ready})
+	})
+
+	callCount := 0
+	streamFn := sequentialStreamFn(func(i int, req *LLMRequest) (*LLMResponse, error) {
+		callCount++
+		ready := "false"
+		if i == 1 {
+			ready = "true"
+		}
+		return &LLMResponse{
+			Message: Message{
+				Role: RoleAssistant,
+				Content: []ContentBlock{
+					ToolCallBlock(ToolCall{
+						ID:   fmt.Sprintf("tc%d", i),
+						Name: "save_foundation",
+						Args: json.RawMessage(fmt.Sprintf(`{"ready":%s}`, ready)),
+					}),
+				},
+				StopReason: StopReasonToolUse,
+			},
+		}, nil
+	})
+
+	events := runTestLoop(t,
+		[]AgentMessage{UserMsg("save all foundation parts")},
+		AgentContext{Tools: []Tool{saveTool}},
+		LoopConfig{
+			StreamFn: streamFn,
+			StopAfterToolResult: func(name string, result json.RawMessage) bool {
+				if name != "save_foundation" {
+					return false
+				}
+				var r struct {
+					FoundationReady bool `json:"foundation_ready"`
+				}
+				_ = json.Unmarshal(result, &r)
+				return r.FoundationReady
+			},
+		},
+	)
+
+	if callCount != 2 {
+		t.Fatalf("expected loop to stop only after ready result (2 LLM calls), got %d", callCount)
+	}
+	var endEvent *Event
+	for _, ev := range events {
+		if ev.Type == EventAgentEnd {
+			endEvent = &ev
+		}
+	}
+	if endEvent == nil {
+		t.Fatal("no EventAgentEnd emitted")
+	}
+	if endEvent.Summary == nil || endEvent.Summary.EndReason != EndReasonStop {
+		t.Fatalf("expected EndReasonStop, got %v", endEvent.Summary)
+	}
+}
+
 func TestAgentLoop_StreamingToolExecutionHonorsSteeringForQueuedTools(t *testing.T) {
 	var calls []string
 	var mu sync.Mutex

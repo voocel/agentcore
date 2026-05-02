@@ -2,6 +2,7 @@ package agentcore
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"strings"
@@ -60,6 +61,7 @@ type Agent struct {
 	stopGuard             StopGuard
 	onMaxTurns            MaxTurnsAction
 	stopAfterTool         func(toolName string) bool
+	stopAfterToolResult   func(toolName string, result json.RawMessage) bool
 
 	// State
 	messages         []AgentMessage
@@ -675,6 +677,7 @@ func (a *Agent) buildConfig() LoopConfig {
 		OnMaxTurns:            a.onMaxTurns,
 		ToolsAreIdempotent:    a.toolsAreIdempotent,
 		StopAfterTool:         a.stopAfterTool,
+		StopAfterToolResult:   a.stopAfterToolResult,
 	}
 }
 
