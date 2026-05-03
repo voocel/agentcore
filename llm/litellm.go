@@ -81,6 +81,11 @@ func NewOpenRouterModel(model, apiKey string, baseURL ...string) (*LiteLLMAdapte
 	return newProviderAdapter("openrouter", model, apiKey, baseURL...)
 }
 
+// NewDeepSeekModel creates a DeepSeek adapter.
+func NewDeepSeekModel(model, apiKey string, baseURL ...string) (*LiteLLMAdapter, error) {
+	return newProviderAdapter("deepseek", model, apiKey, baseURL...)
+}
+
 // ProviderName returns the provider name (e.g. "openai", "anthropic").
 // Implements agentcore.ProviderNamer for per-provider API key resolution.
 func (l *LiteLLMAdapter) ProviderName() string {

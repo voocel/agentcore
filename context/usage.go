@@ -88,10 +88,12 @@ type ContextUsageEstimate struct {
 }
 
 // calculateContextTokens computes total input tokens from LLM-reported Usage.
-// Sums Input + CacheRead + CacheWrite to get the full prompt size (Output is
-// excluded because previous outputs are already counted as input in the next call).
+// Input already includes CacheRead (litellm convention), so the full prompt
+// size is Input + CacheWrite (cache creation is reported separately and not
+// rolled into Input). Output is excluded because previous outputs are already
+// counted as input in the next call.
 func calculateContextTokens(u *agentcore.Usage) int {
-	total := u.Input + u.CacheRead + u.CacheWrite
+	total := u.Input + u.CacheWrite
 	if total > 0 {
 		return total
 	}

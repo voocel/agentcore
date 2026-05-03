@@ -13,12 +13,21 @@ type ModelPricing struct {
 
 // CalculateCost computes the monetary cost from pricing rates and token usage.
 // Returns nil if pricing or usage is nil.
+//
+// Pricing semantic: usage.Input already includes usage.CacheRead per the
+// underlying litellm convention. The cached portion must only be billed at
+// the cache-read rate; charging full Input at input rate AND CacheRead at
+// cache-read rate would double-bill.
 func CalculateCost(pricing *ModelPricing, usage *agentcore.Usage) *agentcore.Cost {
 	if pricing == nil || usage == nil {
 		return nil
 	}
+	nonCachedInput := usage.Input - usage.CacheRead
+	if nonCachedInput < 0 {
+		nonCachedInput = usage.Input
+	}
 	c := &agentcore.Cost{
-		Input:      float64(usage.Input) * pricing.InputPerToken,
+		Input:      float64(nonCachedInput) * pricing.InputPerToken,
 		Output:     float64(usage.Output) * pricing.OutputPerToken,
 		CacheRead:  float64(usage.CacheRead) * pricing.CacheReadPerToken,
 		CacheWrite: float64(usage.CacheWrite) * pricing.CacheWritePerToken,
