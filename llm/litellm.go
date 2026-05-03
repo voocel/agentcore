@@ -305,17 +305,29 @@ func (l *LiteLLMAdapter) GenerateStream(ctx context.Context, messages []agentcor
 // convertMessages converts agentcore.Message to litellm.Message.
 // Handles multipart content (text + images) via litellm.Contents field.
 //
-// Drops assistant messages that would carry no content/reasoning/tool_calls
-// after conversion. Such messages occur when a model stops with only a
-// thinking block (or a thinking block we cannot forward to the provider) and
-// would otherwise be rejected by strict OpenAI-compatible providers with
-// "assistant must provide content, reasoning_content or tool_calls".
+// Drops two classes of assistant turns that strict OpenAI-compatible providers
+// reject with "assistant must provide content, reasoning_content or
+// tool_calls":
+//   - Fully empty turns (no content/reasoning/tool_calls/images at all).
+//   - Reasoning-only turns that stopped naturally (stop_reason=stop, no
+//     externally-visible action). These are valid on reasoning-aware
+//     providers (DeepSeek/GLM/Qwen) which accept reasoning_content on
+//     replay, but trip providers that ignore reasoning_content on the
+//     request side. Skipping is semantically equivalent to "this turn
+//     produced nothing": no text was uttered, no tool was invoked, so the
+//     next request lets the model decide afresh from prior history without
+//     leaking the discarded internal reasoning back into the transcript.
 func convertMessages(messages []agentcore.Message) []litellm.Message {
 	llmMessages := make([]litellm.Message, 0, len(messages))
 	for _, msg := range messages {
 		converted := convertSingleMessage(msg)
-		if msg.Role == agentcore.RoleAssistant && isEmptyAssistantMessage(converted) {
-			continue
+		if msg.Role == agentcore.RoleAssistant {
+			if isEmptyAssistantMessage(converted) {
+				continue
+			}
+			if isReasoningOnlyStopAssistant(msg, converted) {
+				continue
+			}
 		}
 		llmMessages = append(llmMessages, converted)
 	}
@@ -332,6 +344,24 @@ func isEmptyAssistantMessage(m litellm.Message) bool {
 		return false
 	}
 	return true
+}
+
+// isReasoningOnlyStopAssistant reports whether an assistant turn carried only
+// internal reasoning and stopped without any externally-visible action.
+// stop_reason=stop signals natural completion; length / toolUse turns may
+// legitimately carry reasoning before truncation or tool dispatch and are
+// preserved.
+func isReasoningOnlyStopAssistant(orig agentcore.Message, converted litellm.Message) bool {
+	if orig.StopReason != agentcore.StopReasonStop {
+		return false
+	}
+	if converted.Content != "" {
+		return false
+	}
+	if len(converted.Contents) > 0 || len(converted.ToolCalls) > 0 {
+		return false
+	}
+	return converted.ReasoningContent != ""
 }
 
 // hasImageContent reports whether any content block is an image.
