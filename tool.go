@@ -3,8 +3,6 @@ package agentcore
 import (
 	"context"
 	"encoding/json"
-
-	"github.com/voocel/agentcore/permission"
 )
 
 // ---------------------------------------------------------------------------
@@ -138,17 +136,38 @@ type Previewer interface {
 	Preview(ctx context.Context, args json.RawMessage) (json.RawMessage, error)
 }
 
-// PermissionMetadataProvider lets a tool override the default permission
-// classification used by the decision engine.
-type PermissionMetadataProvider interface {
-	PermissionMetadata() permission.Metadata
+// ---------------------------------------------------------------------------
+// ToolGate — pluggable approval / policy hook
+// ---------------------------------------------------------------------------
+
+// GateRequest carries the inputs that a ToolGate sees for one tool call.
+// Tool exposes the underlying tool instance so gates can typeswitch against
+// any tool-specific marker interfaces they care about (e.g. capability hints)
+// without the agent core needing to know those interfaces.
+type GateRequest struct {
+	Tool      Tool
+	Call      ToolCall
+	ToolLabel string          // resolved via ToolLabeler when available
+	Preview   json.RawMessage // resolved via Previewer when available; may be nil
 }
 
-// PermissionChecker lets a tool perform tool-specific permission checks before
-// the shared decision engine runs. Returning nil means "fall through".
-type PermissionChecker interface {
-	CheckPermission(ctx context.Context, req permission.Request) (*permission.Decision, error)
+// GateDecision is the gate's verdict for one tool call.
+//
+// Allowed=true => execute the tool with Call.Args.
+// Allowed=false => return Reason as the tool result error; do not execute.
+//
+// A nil decision is treated as Allowed=true (the gate has no opinion).
+type GateDecision struct {
+	Allowed bool
+	Reason  string
 }
+
+// ToolGate is the pluggable hook called once per tool call, after argument
+// validation and after the optional Previewer pass, but before tool
+// execution. Returning a non-nil error is treated as deny with the error
+// message as the reason. The agent core does not perform any permission
+// reasoning of its own; install a gate (or leave it nil) to control policy.
+type ToolGate func(ctx context.Context, req GateRequest) (*GateDecision, error)
 
 // DeferFilter controls deferred tool loading for the LLM.
 // When a tool in the agent's tool list implements DeferFilter:

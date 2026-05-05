@@ -9,7 +9,6 @@ import (
 	"strings"
 	"time"
 
-	"github.com/voocel/agentcore/permission"
 	"github.com/voocel/litellm"
 )
 
@@ -771,78 +770,18 @@ func executeSingleToolCall(ctx context.Context, tools []Tool, call ToolCall, con
 			}
 		}
 
-		permReq := permission.Request{
-			ToolID:    call.ID,
-			ToolName:  call.Name,
-			ToolLabel: label,
-			Summary:   approvalSummary(call),
-			Args:      call.Args,
-			Preview:   preview,
-		}
-		if tool != nil {
-			if provider, ok := tool.(PermissionMetadataProvider); ok {
-				permReq.Metadata = provider.PermissionMetadata()
+		if config.ToolGate != nil {
+			gateReq := GateRequest{
+				Tool:      tool,
+				Call:      call,
+				ToolLabel: label,
+				Preview:   preview,
 			}
-		}
-
-		var decision *permission.Decision
-		if checker, ok := tool.(PermissionChecker); ok {
-			toolDecision, err := checker.CheckPermission(ctx, permReq)
+			decision, err := config.ToolGate(ctx, gateReq)
 			if err != nil {
-				decision = &permission.Decision{
-					Kind:       permission.DecisionDeny,
-					Source:     permission.DecisionSourceTool,
-					Reason:     err.Error(),
-					Summary:    permReq.Summary,
-					Capability: permReq.Metadata.Capability,
-				}
-			} else {
-				decision = toolDecision
+				decision = &GateDecision{Allowed: false, Reason: err.Error()}
 			}
-		}
-		if decision == nil && config.PermissionEngine != nil {
-			engineDecision, err := config.PermissionEngine.Decide(ctx, permReq)
-			if err != nil {
-				decision = &permission.Decision{
-					Kind:       permission.DecisionDeny,
-					Source:     permission.DecisionSourcePrompt,
-					Reason:     err.Error(),
-					Summary:    permReq.Summary,
-					Capability: permReq.Metadata.Capability,
-				}
-			} else {
-				decision = engineDecision
-			}
-		}
-		execArgs := call.Args
-		if decision != nil {
-			if len(decision.UpdatedArgs) > 0 {
-				execArgs = decision.UpdatedArgs
-			}
-			call.Args = execArgs
-			reqCopy := permReq
-			reqCopy.Args = execArgs
-			decisionCopy := *decision
-			if decision.Prompted {
-				emit(ch, Event{
-					Type:              EventToolApprovalRequest,
-					ToolID:            call.ID,
-					Tool:              call.Name,
-					ToolLabel:         label,
-					Args:              execArgs,
-					Preview:           preview,
-					PermissionRequest: &reqCopy,
-				})
-			}
-			emit(ch, Event{
-				Type:               EventToolApprovalResolved,
-				ToolID:             call.ID,
-				Tool:               call.Name,
-				ToolLabel:          label,
-				PermissionRequest:  &reqCopy,
-				PermissionDecision: &decisionCopy,
-			})
-			if !decision.Allowed() {
+			if decision != nil && !decision.Allowed {
 				reason := decision.Reason
 				if reason == "" {
 					reason = "tool execution denied"
@@ -922,9 +861,9 @@ func executeSingleToolCall(ctx context.Context, tools []Tool, call ToolCall, con
 			var execErr error
 			if len(config.Middlewares) > 0 {
 				exec := buildMiddlewareChain(call, tool.Execute, config.Middlewares)
-				output, execErr = exec(progressCtx, execArgs)
+				output, execErr = exec(progressCtx, call.Args)
 			} else {
-				output, execErr = tool.Execute(progressCtx, execArgs)
+				output, execErr = tool.Execute(progressCtx, call.Args)
 			}
 			if execErr != nil {
 				errContent, _ := json.Marshal(execErr.Error())
@@ -1037,18 +976,6 @@ func toolLabel(tool Tool) string {
 		return labeler.Label()
 	}
 	return ""
-}
-
-func approvalSummary(call ToolCall) string {
-	var payload map[string]any
-	if len(call.Args) > 0 && json.Unmarshal(call.Args, &payload) == nil {
-		for _, key := range []string{"file_path", "path", "command", "url", "query"} {
-			if raw, ok := payload[key].(string); ok && strings.TrimSpace(raw) != "" {
-				return fmt.Sprintf("%s: %s", key, strings.TrimSpace(raw))
-			}
-		}
-	}
-	return call.Name
 }
 
 // buildToolSpecs converts Tool interfaces to ToolSpec for the LLM.

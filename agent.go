@@ -8,8 +8,6 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
-
-	"github.com/voocel/agentcore/permission"
 )
 
 // AgentState is a snapshot of the agent's current state.
@@ -40,7 +38,7 @@ type Agent struct {
 	convertToLLM       func([]AgentMessage) []Message
 	contextWindow      int
 	contextEstimateFn  ContextEstimateFn
-	permissionEngine   permission.DecisionEngine
+	toolGate           ToolGate
 	middlewares        []ToolMiddleware
 	maxToolConcurrency int
 	toolsAreIdempotent bool
@@ -582,7 +580,7 @@ func (a *Agent) buildConfig() LoopConfig {
 			a.syncContextManagerLocked()
 			return nil
 		},
-		PermissionEngine: a.permissionEngine,
+		ToolGate: a.toolGate,
 		GetSteeringMessages: func() []AgentMessage {
 			a.mu.Lock()
 			defer a.mu.Unlock()

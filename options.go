@@ -1,9 +1,5 @@
 package agentcore
 
-import (
-	"github.com/voocel/agentcore/permission"
-)
-
 // AgentOption configures an Agent.
 type AgentOption func(*Agent)
 
@@ -81,9 +77,12 @@ func WithContextManager(mgr ContextManager) AgentOption {
 // Tool Execution — permissions, concurrency, middleware, circuit breaker
 // ---------------------------------------------------------------------------
 
-// WithPermissionEngine sets the runtime permission engine called before tool execution.
-func WithPermissionEngine(engine permission.DecisionEngine) AgentOption {
-	return func(a *Agent) { a.permissionEngine = engine }
+// WithToolGate installs a hook called once per tool call after argument
+// validation and the optional Previewer pass. Returning Allowed=false rejects
+// the call (Reason becomes the tool result error). The agent core does not
+// implement permission reasoning of its own — gates are user-supplied.
+func WithToolGate(gate ToolGate) AgentOption {
+	return func(a *Agent) { a.toolGate = gate }
 }
 
 // WithMiddlewares sets tool execution middlewares.

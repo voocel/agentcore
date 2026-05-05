@@ -9,8 +9,6 @@ import (
 	"sync/atomic"
 	"testing"
 	"time"
-
-	"github.com/voocel/agentcore/permission"
 )
 
 func TestAgentLoop_SimpleTextResponse(t *testing.T) {
@@ -279,7 +277,7 @@ func TestAgentLoop_Middleware(t *testing.T) {
 			[]AgentMessage{UserMsg("test")},
 			AgentContext{Tools: []Tool{echoTool(&calls)}},
 			LoopConfig{
-				Model:    mockModel(toolCallMsg(tc), assistantMsg("done", StopReasonStop)),
+				Model:       mockModel(toolCallMsg(tc), assistantMsg("done", StopReasonStop)),
 				Middlewares: []ToolMiddleware{mw},
 			},
 		)
@@ -345,9 +343,9 @@ func TestAgentLoop_Middleware(t *testing.T) {
 	})
 }
 
-func TestAgentLoop_PermissionEngine(t *testing.T) {
-	t.Run("approval denied does not execute tool or disable it", func(t *testing.T) {
-		var approvalChecks int
+func TestAgentLoop_ToolGate(t *testing.T) {
+	t.Run("denied gate blocks execution without disabling the tool", func(t *testing.T) {
+		var gateChecks int
 		var calls []string
 
 		events := runTestLoop(t,
@@ -364,14 +362,10 @@ func TestAgentLoop_PermissionEngine(t *testing.T) {
 					}
 					return &LLMResponse{Message: assistantMsg("done", StopReasonStop)}, nil
 				}),
-				PermissionEngine: permissionEngineFunc(func(ctx context.Context, req permission.Request) (*permission.Decision, error) {
-					approvalChecks++
-					return &permission.Decision{
-						Kind:   permission.DecisionDeny,
-						Source: permission.DecisionSourcePrompt,
-						Reason: "denied",
-					}, nil
-				}),
+				ToolGate: func(ctx context.Context, req GateRequest) (*GateDecision, error) {
+					gateChecks++
+					return &GateDecision{Allowed: false, Reason: "denied"}, nil
+				},
 				MaxToolErrors: 1,
 			},
 		)
@@ -379,8 +373,8 @@ func TestAgentLoop_PermissionEngine(t *testing.T) {
 		if len(calls) != 0 {
 			t.Fatalf("tool should not execute, got %v", calls)
 		}
-		if approvalChecks != 3 {
-			t.Fatalf("approval check should run for every tool call, got %d", approvalChecks)
+		if gateChecks != 3 {
+			t.Fatalf("gate should run for every tool call, got %d", gateChecks)
 		}
 		end, ok := findEvent(events, EventToolExecEnd)
 		if !ok || !end.IsError {
@@ -388,12 +382,12 @@ func TestAgentLoop_PermissionEngine(t *testing.T) {
 		}
 		for _, ev := range events {
 			if ev.Type == EventToolExecEnd && strings.Contains(string(ev.Result), "disabled after") {
-				t.Fatalf("approval denial should not disable the tool, got result %s", string(ev.Result))
+				t.Fatalf("denial should not disable the tool, got result %s", string(ev.Result))
 			}
 		}
 	})
 
-	t.Run("updated args are executed", func(t *testing.T) {
+	t.Run("gate error is treated as deny", func(t *testing.T) {
 		var calls []string
 
 		runTestLoop(t,
@@ -401,25 +395,39 @@ func TestAgentLoop_PermissionEngine(t *testing.T) {
 			AgentContext{Tools: []Tool{echoTool(&calls)}},
 			LoopConfig{
 				Model: mockModel(
-					toolCallMsg(ToolCall{
-						ID:   "tc1",
-						Name: "echo",
-						Args: json.RawMessage(`{"value":"original"}`),
-					}),
+					toolCallMsg(ToolCall{ID: "tc1", Name: "echo", Args: json.RawMessage(`{"value":"x"}`)}),
 					assistantMsg("done", StopReasonStop),
 				),
-				PermissionEngine: permissionEngineFunc(func(ctx context.Context, req permission.Request) (*permission.Decision, error) {
-					return &permission.Decision{
-						Kind:        permission.DecisionAllow,
-						Source:      permission.DecisionSourceMode,
-						UpdatedArgs: json.RawMessage(`{"value":"rewritten"}`),
-					}, nil
-				}),
+				ToolGate: func(ctx context.Context, req GateRequest) (*GateDecision, error) {
+					return nil, fmt.Errorf("gate exploded")
+				},
 			},
 		)
 
-		if len(calls) != 1 || calls[0] != "rewritten" {
-			t.Fatalf("expected rewritten args to execute, got %v", calls)
+		if len(calls) != 0 {
+			t.Fatalf("tool must not execute when gate errors, got %v", calls)
+		}
+	})
+
+	t.Run("nil decision is treated as allow", func(t *testing.T) {
+		var calls []string
+
+		runTestLoop(t,
+			[]AgentMessage{UserMsg("test")},
+			AgentContext{Tools: []Tool{echoTool(&calls)}},
+			LoopConfig{
+				Model: mockModel(
+					toolCallMsg(ToolCall{ID: "tc1", Name: "echo", Args: json.RawMessage(`{"value":"x"}`)}),
+					assistantMsg("done", StopReasonStop),
+				),
+				ToolGate: func(ctx context.Context, req GateRequest) (*GateDecision, error) {
+					return nil, nil
+				},
+			},
+		)
+
+		if len(calls) != 1 || calls[0] != "x" {
+			t.Fatalf("expected tool to execute when gate returns nil, got %v", calls)
 		}
 	})
 }
@@ -1266,12 +1274,6 @@ func TestMockModel_StreamAndGenerateDoNotShareCursor(t *testing.T) {
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
-
-type permissionEngineFunc func(ctx context.Context, req permission.Request) (*permission.Decision, error)
-
-func (fn permissionEngineFunc) Decide(ctx context.Context, req permission.Request) (*permission.Decision, error) {
-	return fn(ctx, req)
-}
 
 // mockChatModel returns canned responses in order. Used as a test stand-in for
 // real ChatModel adapters.

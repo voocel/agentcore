@@ -5,8 +5,6 @@ import (
 	"encoding/json"
 	"fmt"
 	"sync"
-
-	"github.com/voocel/agentcore/permission"
 )
 
 // ---------------------------------------------------------------------------
@@ -70,9 +68,11 @@ type LoopConfig struct {
 	// overflow recovery.
 	CommitContext func(msgs []AgentMessage, usage *ContextUsage) error
 
-	// PermissionEngine is called after validation/preview and before execution.
-	// Returning nil means no extra approval step was required.
-	PermissionEngine permission.DecisionEngine
+	// ToolGate, when non-nil, is called once per tool call after argument
+	// validation and the optional Previewer pass. Allowed=false rejects the
+	// call (Reason becomes the tool result). The agent core does no permission
+	// reasoning of its own.
+	ToolGate ToolGate
 
 	// Steering: called after each tool execution to check for user interruptions.
 	GetSteeringMessages func() []AgentMessage
@@ -315,4 +315,3 @@ type StreamEvent struct {
 	StopReason        StopReason // finish reason (for done events)
 	Err               error      // for error events
 }
-
