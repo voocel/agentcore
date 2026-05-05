@@ -17,7 +17,7 @@ func TestAgentLoop_SimpleTextResponse(t *testing.T) {
 	events := runTestLoop(t,
 		[]AgentMessage{UserMsg("hi")},
 		AgentContext{},
-		LoopConfig{StreamFn: mockStreamFn(assistantMsg("hello", StopReasonStop))},
+		LoopConfig{Model: mockModel(assistantMsg("hello", StopReasonStop))},
 	)
 
 	requireEvent(t, events, EventAgentStart)
@@ -67,12 +67,12 @@ func TestCallLLM_CommitsProjectedContextWhenRequested(t *testing.T) {
 				ShouldCommit: true,
 			},
 		},
-		StreamFn: func(ctx context.Context, req *LLMRequest) (*LLMResponse, error) {
+		Model: funcModel(func(ctx context.Context, req *LLMRequest) (*LLMResponse, error) {
 			if got := req.Messages[0].TextContent(); got == original {
 				t.Fatal("expected projected request to be trimmed before model call")
 			}
 			return &LLMResponse{Message: assistantMsg("ok", StopReasonStop)}, nil
-		},
+		}),
 		CommitContext: func(msgs []AgentMessage, usage *ContextUsage) error {
 			committed = copyMessages(msgs)
 			return nil
@@ -92,39 +92,6 @@ func TestCallLLM_CommitsProjectedContextWhenRequested(t *testing.T) {
 	}
 }
 
-func TestAgentLoop_StrictMessageSequenceRejectsMalformedHistory(t *testing.T) {
-	tc := ToolCall{ID: "tc-strict", Name: "echo", Args: json.RawMessage(`{"value":"x"}`)}
-	var modelCalled atomic.Bool
-
-	events := runTestLoop(t,
-		[]AgentMessage{UserMsg("strict mode")},
-		AgentContext{
-			Messages: []AgentMessage{
-				toolCallMsg(tc),
-			},
-		},
-		LoopConfig{
-			StreamFn: func(ctx context.Context, req *LLMRequest) (*LLMResponse, error) {
-				modelCalled.Store(true)
-				return nil, fmt.Errorf("model should not be called in strict mode")
-			},
-			StrictMessageSequence: true,
-		},
-	)
-
-	if modelCalled.Load() {
-		t.Fatal("expected strict message validation to fail before model invocation")
-	}
-
-	errEvent, ok := findEvent(events, EventError)
-	if !ok || errEvent.Err == nil {
-		t.Fatalf("expected strict message sequence error, got %+v", events)
-	}
-	if !strings.Contains(errEvent.Err.Error(), `missing tool result for "tc-strict"`) {
-		t.Fatalf("unexpected strict mode error: %v", errEvent.Err)
-	}
-}
-
 func TestAgentLoop_ToolCallAndResult(t *testing.T) {
 	var calls []string
 	tc := ToolCall{ID: "tc1", Name: "echo", Args: json.RawMessage(`{"value":"ping"}`)}
@@ -132,7 +99,7 @@ func TestAgentLoop_ToolCallAndResult(t *testing.T) {
 	events := runTestLoop(t,
 		[]AgentMessage{UserMsg("test")},
 		AgentContext{Tools: []Tool{echoTool(&calls)}},
-		LoopConfig{StreamFn: mockStreamFn(toolCallMsg(tc), assistantMsg("done", StopReasonStop))},
+		LoopConfig{Model: mockModel(toolCallMsg(tc), assistantMsg("done", StopReasonStop))},
 	)
 
 	if len(calls) != 1 || calls[0] != "ping" {
@@ -160,7 +127,7 @@ func TestAgentLoop_MaxTurns(t *testing.T) {
 	events := runTestLoop(t,
 		[]AgentMessage{UserMsg("loop")},
 		AgentContext{Tools: []Tool{echoTool(&calls)}},
-		LoopConfig{StreamFn: mockStreamFn(responses...), MaxTurns: 3},
+		LoopConfig{Model: mockModel(responses...), MaxTurns: 3},
 	)
 
 	requireEvent(t, events, EventError)
@@ -190,9 +157,9 @@ func TestAgentLoop_AbortBehavior(t *testing.T) {
 				[]AgentMessage{UserMsg("cancelled")},
 				AgentContext{},
 				LoopConfig{
-					StreamFn: func(ctx context.Context, req *LLMRequest) (*LLMResponse, error) {
+					Model: funcModel(func(ctx context.Context, req *LLMRequest) (*LLMResponse, error) {
 						return nil, ctx.Err()
-					},
+					}),
 					ShouldEmitAbortMarker: func() bool { return tc.emitAbortMarker },
 				},
 			))
@@ -231,7 +198,7 @@ func TestAgentLoop_SteeringInterrupt(t *testing.T) {
 		[]AgentMessage{UserMsg("test steering")},
 		AgentContext{Tools: []Tool{echoTool(&calls)}},
 		LoopConfig{
-			StreamFn: sequentialStreamFn(func(i int, _ *LLMRequest) (*LLMResponse, error) {
+			Model: sequentialModel(func(i int, _ *LLMRequest) (*LLMResponse, error) {
 				if i == 0 {
 					return &LLMResponse{Message: toolCallMsg(
 						ToolCall{ID: "tc1", Name: "echo", Args: json.RawMessage(`{"value":"first"}`)},
@@ -265,7 +232,7 @@ func TestAgentLoop_FollowUp(t *testing.T) {
 		[]AgentMessage{UserMsg("initial")},
 		AgentContext{},
 		LoopConfig{
-			StreamFn: sequentialStreamFn(func(i int, _ *LLMRequest) (*LLMResponse, error) {
+			Model: sequentialModel(func(i int, _ *LLMRequest) (*LLMResponse, error) {
 				if i == 0 {
 					return &LLMResponse{Message: assistantMsg("first", StopReasonStop)}, nil
 				}
@@ -312,7 +279,7 @@ func TestAgentLoop_Middleware(t *testing.T) {
 			[]AgentMessage{UserMsg("test")},
 			AgentContext{Tools: []Tool{echoTool(&calls)}},
 			LoopConfig{
-				StreamFn:    mockStreamFn(toolCallMsg(tc), assistantMsg("done", StopReasonStop)),
+				Model:    mockModel(toolCallMsg(tc), assistantMsg("done", StopReasonStop)),
 				Middlewares: []ToolMiddleware{mw},
 			},
 		)
@@ -336,7 +303,7 @@ func TestAgentLoop_Middleware(t *testing.T) {
 			[]AgentMessage{UserMsg("test")},
 			AgentContext{Tools: []Tool{rt}},
 			LoopConfig{
-				StreamFn: sequentialStreamFn(func(i int, req *LLMRequest) (*LLMResponse, error) {
+				Model: sequentialModel(func(i int, req *LLMRequest) (*LLMResponse, error) {
 					if i == 0 {
 						return &LLMResponse{Message: toolCallMsg(tc)}, nil
 					}
@@ -387,7 +354,7 @@ func TestAgentLoop_PermissionEngine(t *testing.T) {
 			[]AgentMessage{UserMsg("test")},
 			AgentContext{Tools: []Tool{echoTool(&calls)}},
 			LoopConfig{
-				StreamFn: sequentialStreamFn(func(i int, _ *LLMRequest) (*LLMResponse, error) {
+				Model: sequentialModel(func(i int, _ *LLMRequest) (*LLMResponse, error) {
 					if i < 3 {
 						return &LLMResponse{Message: toolCallMsg(ToolCall{
 							ID:   fmt.Sprintf("tc%d", i),
@@ -433,7 +400,7 @@ func TestAgentLoop_PermissionEngine(t *testing.T) {
 			[]AgentMessage{UserMsg("test")},
 			AgentContext{Tools: []Tool{echoTool(&calls)}},
 			LoopConfig{
-				StreamFn: mockStreamFn(
+				Model: mockModel(
 					toolCallMsg(ToolCall{
 						ID:   "tc1",
 						Name: "echo",
@@ -486,7 +453,7 @@ func TestAgentLoop_PreviewAndProgress(t *testing.T) {
 			events := runTestLoop(t,
 				[]AgentMessage{UserMsg("test")},
 				AgentContext{Tools: []Tool{pt}},
-				LoopConfig{StreamFn: mockStreamFn(toolCallMsg(ToolCall{
+				LoopConfig{Model: mockModel(toolCallMsg(ToolCall{
 					ID:   "tc-preview",
 					Name: "preview_tool",
 					Args: tc.args,
@@ -692,7 +659,7 @@ func TestAgentLoop_LengthRecoveryForTruncatedToolCalls(t *testing.T) {
 	// pieces). This prevents silent failure when large tool arguments exceed
 	// the output token limit.
 	callCount := 0
-	streamFn := sequentialStreamFn(func(i int, req *LLMRequest) (*LLMResponse, error) {
+	model := sequentialModel(func(i int, req *LLMRequest) (*LLMResponse, error) {
 		callCount++
 		if i == 0 {
 			// First call: truncated output with incomplete tool call
@@ -720,7 +687,7 @@ func TestAgentLoop_LengthRecoveryForTruncatedToolCalls(t *testing.T) {
 	runTestLoop(t,
 		[]AgentMessage{UserMsg("recover truncated tool call")},
 		AgentContext{},
-		LoopConfig{StreamFn: streamFn},
+		LoopConfig{Model: model},
 	)
 
 	if callCount != 2 {
@@ -744,7 +711,7 @@ func TestAgentLoop_StopAfterTool(t *testing.T) {
 	})
 
 	callCount := 0
-	streamFn := sequentialStreamFn(func(i int, req *LLMRequest) (*LLMResponse, error) {
+	model := sequentialModel(func(i int, req *LLMRequest) (*LLMResponse, error) {
 		callCount++
 		if i == 0 {
 			return &LLMResponse{
@@ -774,8 +741,7 @@ func TestAgentLoop_StopAfterTool(t *testing.T) {
 		[]AgentMessage{UserMsg("do work")},
 		AgentContext{Tools: []Tool{commitTool, neverTool}},
 		LoopConfig{
-			StreamFn:   streamFn,
-			ToolChoice: "required",
+			Model: model,
 			StopAfterTool: func(name string) bool {
 				return name == "commit"
 			},
@@ -812,7 +778,7 @@ func TestAgentLoop_StopAfterToolResult(t *testing.T) {
 	})
 
 	callCount := 0
-	streamFn := sequentialStreamFn(func(i int, req *LLMRequest) (*LLMResponse, error) {
+	model := sequentialModel(func(i int, req *LLMRequest) (*LLMResponse, error) {
 		callCount++
 		ready := "false"
 		if i == 1 {
@@ -837,7 +803,7 @@ func TestAgentLoop_StopAfterToolResult(t *testing.T) {
 		[]AgentMessage{UserMsg("save all foundation parts")},
 		AgentContext{Tools: []Tool{saveTool}},
 		LoopConfig{
-			StreamFn: streamFn,
+			Model: model,
 			StopAfterToolResult: func(name string, result json.RawMessage) bool {
 				if name != "save_foundation" {
 					return false
@@ -1021,7 +987,7 @@ func TestAgentLoop_CircuitBreaker(t *testing.T) {
 		[]AgentMessage{UserMsg("test")},
 		AgentContext{Tools: []Tool{failTool}},
 		LoopConfig{
-			StreamFn: sequentialStreamFn(func(i int, _ *LLMRequest) (*LLMResponse, error) {
+			Model: sequentialModel(func(i int, _ *LLMRequest) (*LLMResponse, error) {
 				if i < 5 {
 					return &LLMResponse{Message: toolCallMsg(ToolCall{ID: fmt.Sprintf("tc%d", i), Name: "fail", Args: json.RawMessage(`{}`)})}, nil
 				}
@@ -1041,7 +1007,7 @@ func TestLoopPublicAPIs(t *testing.T) {
 		events := collectEvents(AgentLoopContinue(
 			context.Background(),
 			AgentContext{Messages: []AgentMessage{UserMsg("existing")}},
-			LoopConfig{StreamFn: mockStreamFn(assistantMsg("continued", StopReasonStop))},
+			LoopConfig{Model: mockModel(assistantMsg("continued", StopReasonStop))},
 		))
 
 		ev, _ := findEvent(events, EventAgentEnd)
@@ -1054,7 +1020,7 @@ func TestLoopPublicAPIs(t *testing.T) {
 		events := collectEvents(AgentLoopContinue(
 			context.Background(),
 			AgentContext{},
-			LoopConfig{StreamFn: mockStreamFn()},
+			LoopConfig{Model: mockModel()},
 		))
 		requireEvent(t, events, EventError)
 		ev, _ := findEvent(events, EventAgentEnd)
@@ -1068,7 +1034,7 @@ func TestLoopPublicAPIs(t *testing.T) {
 			context.Background(),
 			[]AgentMessage{UserMsg("hi")},
 			AgentContext{},
-			LoopConfig{StreamFn: mockStreamFn(assistantMsg("ok", StopReasonStop))},
+			LoopConfig{Model: mockModel(assistantMsg("ok", StopReasonStop))},
 		))
 		if err != nil {
 			t.Fatalf("unexpected error: %v", err)
@@ -1083,7 +1049,7 @@ func TestLoopPublicAPIs(t *testing.T) {
 			context.Background(),
 			[]AgentMessage{UserMsg("hi")},
 			AgentContext{},
-			LoopConfig{StreamFn: mockStreamFn(assistantMsg("ok", StopReasonStop))},
+			LoopConfig{Model: mockModel(assistantMsg("ok", StopReasonStop))},
 		))
 
 		count := 0
@@ -1125,7 +1091,7 @@ func TestOnMessage_AssistantAndToolResult(t *testing.T) {
 		[]AgentMessage{UserMsg("test")},
 		AgentContext{Tools: []Tool{echoTool(&calls)}},
 		LoopConfig{
-			StreamFn: mockStreamFn(toolCallMsg(tc), assistantMsg("done", StopReasonStop)),
+			Model: mockModel(toolCallMsg(tc), assistantMsg("done", StopReasonStop)),
 			OnMessage: func(msg AgentMessage) {
 				mu.Lock()
 				logged = append(logged, msg.GetRole())
@@ -1156,7 +1122,7 @@ func TestOnMessage_PendingSteeringMessages(t *testing.T) {
 		[]AgentMessage{UserMsg("test steering")},
 		AgentContext{Tools: []Tool{echoTool(&calls)}},
 		LoopConfig{
-			StreamFn: sequentialStreamFn(func(i int, _ *LLMRequest) (*LLMResponse, error) {
+			Model: sequentialModel(func(i int, _ *LLMRequest) (*LLMResponse, error) {
 				if i == 0 {
 					return &LLMResponse{Message: toolCallMsg(
 						ToolCall{ID: "tc1", Name: "echo", Args: json.RawMessage(`{"value":"first"}`)},
@@ -1202,7 +1168,7 @@ func TestOnMessage_ErrorStopReason(t *testing.T) {
 		[]AgentMessage{UserMsg("test error")},
 		AgentContext{},
 		LoopConfig{
-			StreamFn: mockStreamFn(assistantMsg("oops", StopReasonError)),
+			Model: mockModel(assistantMsg("oops", StopReasonError)),
 			OnMessage: func(msg AgentMessage) {
 				mu.Lock()
 				logged = append(logged, msg.GetRole())
@@ -1232,7 +1198,7 @@ func TestOnMessage_OrderMatchesNewMessages(t *testing.T) {
 		[]AgentMessage{UserMsg("test order")},
 		AgentContext{Tools: []Tool{echoTool(&calls)}},
 		LoopConfig{
-			StreamFn: mockStreamFn(toolCallMsg(tc), assistantMsg("done", StopReasonStop)),
+			Model: mockModel(toolCallMsg(tc), assistantMsg("done", StopReasonStop)),
 			OnMessage: func(msg AgentMessage) {
 				mu.Lock()
 				loggedTexts = append(loggedTexts, msg.TextContent())
@@ -1260,6 +1226,43 @@ func TestOnMessage_OrderMatchesNewMessages(t *testing.T) {
 	}
 }
 
+// TestMockModel_StreamAndGenerateDoNotShareCursor guards the contract that
+// each ChatModel method on the test mocks consumes exactly one response.
+// Without this, callLLMStream's GenerateStream→Generate fallback path would
+// double-advance the cursor and silently drop a scripted response.
+func TestMockModel_StreamAndGenerateDoNotShareCursor(t *testing.T) {
+	m := mockModel(
+		assistantMsg("first", StopReasonStop),
+		assistantMsg("second", StopReasonStop),
+	)
+
+	ch, err := m.GenerateStream(context.Background(), nil, nil)
+	if err != nil {
+		t.Fatalf("GenerateStream call 1: %v", err)
+	}
+	var firstMsg Message
+	for ev := range ch {
+		if ev.Type == StreamEventDone {
+			firstMsg = ev.Message
+		}
+	}
+	if firstMsg.TextContent() != "first" {
+		t.Fatalf("GenerateStream call 1: got %q, want %q", firstMsg.TextContent(), "first")
+	}
+
+	resp, err := m.Generate(context.Background(), nil, nil)
+	if err != nil {
+		t.Fatalf("Generate call 2: %v", err)
+	}
+	if resp.Message.TextContent() != "second" {
+		t.Fatalf("Generate call 2: got %q, want %q", resp.Message.TextContent(), "second")
+	}
+
+	if _, err := m.Generate(context.Background(), nil, nil); err == nil {
+		t.Fatal("Generate call 3: expected exhaustion error, got nil")
+	}
+}
+
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
@@ -1270,24 +1273,112 @@ func (fn permissionEngineFunc) Decide(ctx context.Context, req permission.Reques
 	return fn(ctx, req)
 }
 
-func mockStreamFn(responses ...Message) StreamFn {
-	var idx int64
-	return func(ctx context.Context, req *LLMRequest) (*LLMResponse, error) {
-		i := int(atomic.AddInt64(&idx, 1) - 1)
-		if i >= len(responses) {
-			return nil, fmt.Errorf("unexpected LLM call #%d (only %d responses provided)", i, len(responses))
-		}
-		return &LLMResponse{Message: responses[i]}, nil
-	}
+// mockChatModel returns canned responses in order. Used as a test stand-in for
+// real ChatModel adapters.
+//
+// Important: Generate and GenerateStream each consume exactly one response.
+// They do NOT call each other, so callLLMStream's GenerateStream→Generate
+// fallback path (used when GenerateStream returns an error) won't double-
+// advance the response cursor.
+type mockChatModel struct {
+	responses []Message
+	idx       int64
 }
 
-func sequentialStreamFn(fn func(i int, req *LLMRequest) (*LLMResponse, error)) StreamFn {
-	var idx int64
-	return func(ctx context.Context, req *LLMRequest) (*LLMResponse, error) {
-		i := int(atomic.AddInt64(&idx, 1) - 1)
-		return fn(i, req)
-	}
+func mockModel(responses ...Message) *mockChatModel {
+	return &mockChatModel{responses: responses}
 }
+
+func (m *mockChatModel) take() (Message, error) {
+	i := int(atomic.AddInt64(&m.idx, 1) - 1)
+	if i >= len(m.responses) {
+		return Message{}, fmt.Errorf("unexpected LLM call #%d (only %d responses provided)", i, len(m.responses))
+	}
+	return m.responses[i], nil
+}
+
+func (m *mockChatModel) Generate(ctx context.Context, msgs []Message, tools []ToolSpec, opts ...CallOption) (*LLMResponse, error) {
+	msg, err := m.take()
+	if err != nil {
+		return nil, err
+	}
+	return &LLMResponse{Message: msg}, nil
+}
+
+func (m *mockChatModel) GenerateStream(ctx context.Context, msgs []Message, tools []ToolSpec, opts ...CallOption) (<-chan StreamEvent, error) {
+	msg, err := m.take()
+	if err != nil {
+		return nil, err
+	}
+	ch := make(chan StreamEvent, 1)
+	ch <- StreamEvent{Type: StreamEventDone, Message: msg, StopReason: msg.StopReason}
+	close(ch)
+	return ch, nil
+}
+
+func (m *mockChatModel) SupportsTools() bool { return true }
+
+// sequentialMockModel calls fn(i, req) for each invocation, where i is the
+// 0-based call index. Useful when test responses depend on the request payload.
+// Like mockChatModel, each ChatModel method advances the cursor exactly once.
+type sequentialMockModel struct {
+	fn  func(i int, req *LLMRequest) (*LLMResponse, error)
+	idx int64
+}
+
+func sequentialModel(fn func(i int, req *LLMRequest) (*LLMResponse, error)) *sequentialMockModel {
+	return &sequentialMockModel{fn: fn}
+}
+
+func (m *sequentialMockModel) take(msgs []Message, tools []ToolSpec) (*LLMResponse, error) {
+	i := int(atomic.AddInt64(&m.idx, 1) - 1)
+	return m.fn(i, &LLMRequest{Messages: msgs, Tools: tools})
+}
+
+func (m *sequentialMockModel) Generate(ctx context.Context, msgs []Message, tools []ToolSpec, opts ...CallOption) (*LLMResponse, error) {
+	return m.take(msgs, tools)
+}
+
+func (m *sequentialMockModel) GenerateStream(ctx context.Context, msgs []Message, tools []ToolSpec, opts ...CallOption) (<-chan StreamEvent, error) {
+	resp, err := m.take(msgs, tools)
+	if err != nil {
+		return nil, err
+	}
+	ch := make(chan StreamEvent, 1)
+	ch <- StreamEvent{Type: StreamEventDone, Message: resp.Message, StopReason: resp.Message.StopReason}
+	close(ch)
+	return ch, nil
+}
+
+func (m *sequentialMockModel) SupportsTools() bool { return true }
+
+// funcMockModel wraps a single function call to act as a ChatModel.
+// Useful for inline tests where each invocation runs the same handler.
+// Each ChatModel method invokes the wrapped fn exactly once.
+type funcMockModel struct {
+	fn func(ctx context.Context, req *LLMRequest) (*LLMResponse, error)
+}
+
+func funcModel(fn func(ctx context.Context, req *LLMRequest) (*LLMResponse, error)) *funcMockModel {
+	return &funcMockModel{fn: fn}
+}
+
+func (m *funcMockModel) Generate(ctx context.Context, msgs []Message, tools []ToolSpec, opts ...CallOption) (*LLMResponse, error) {
+	return m.fn(ctx, &LLMRequest{Messages: msgs, Tools: tools})
+}
+
+func (m *funcMockModel) GenerateStream(ctx context.Context, msgs []Message, tools []ToolSpec, opts ...CallOption) (<-chan StreamEvent, error) {
+	resp, err := m.fn(ctx, &LLMRequest{Messages: msgs, Tools: tools})
+	if err != nil {
+		return nil, err
+	}
+	ch := make(chan StreamEvent, 1)
+	ch <- StreamEvent{Type: StreamEventDone, Message: resp.Message, StopReason: resp.Message.StopReason}
+	close(ch)
+	return ch, nil
+}
+
+func (m *funcMockModel) SupportsTools() bool { return true }
 
 func collectEvents(ch <-chan Event) []Event {
 	var events []Event

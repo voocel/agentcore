@@ -13,7 +13,7 @@ func simpleAgent(name, reply string) SubAgentConfig {
 	return SubAgentConfig{
 		Name:        name,
 		Description: name + " agent",
-		StreamFn: mockStreamFn(Message{
+		Model: mockModel(Message{
 			Role:       RoleAssistant,
 			Content:    []ContentBlock{TextBlock(reply)},
 			StopReason: StopReasonStop,
@@ -62,7 +62,7 @@ func TestSubAgentTool_SinglePropagatesFinalErrorAfterPartialOutput(t *testing.T)
 		Name:        "writer",
 		Description: "writer agent",
 		Tools:       []Tool{noop},
-		StreamFn: sequentialStreamFn(func(i int, req *LLMRequest) (*LLMResponse, error) {
+		Model: sequentialModel(func(i int, req *LLMRequest) (*LLMResponse, error) {
 			if i == 0 {
 				return &LLMResponse{Message: Message{
 					Role: RoleAssistant,
@@ -163,11 +163,6 @@ func TestSubAgentTool_ModelOverrideRebuildsContextManager(t *testing.T) {
 		Name:        "writer",
 		Description: "writer agent",
 		Model:       baseModel,
-		StreamFn: mockStreamFn(Message{
-			Role:       RoleAssistant,
-			Content:    []ContentBlock{TextBlock("ok")},
-			StopReason: StopReasonStop,
-		}),
 		ContextManagerFactory: func(model ChatModel) ContextManager {
 			if named, ok := model.(*fakeNamedModel); ok {
 				received = named.name
@@ -199,7 +194,11 @@ func (m *fakeNamedModel) Generate(ctx context.Context, messages []Message, tools
 }
 
 func (m *fakeNamedModel) GenerateStream(ctx context.Context, messages []Message, tools []ToolSpec, opts ...CallOption) (<-chan StreamEvent, error) {
-	return nil, context.Canceled
+	msg := Message{Role: RoleAssistant, Content: []ContentBlock{TextBlock(m.name)}, StopReason: StopReasonStop}
+	ch := make(chan StreamEvent, 1)
+	ch <- StreamEvent{Type: StreamEventDone, Message: msg, StopReason: StopReasonStop}
+	close(ch)
+	return ch, nil
 }
 
 func (m *fakeNamedModel) SupportsTools() bool { return true }

@@ -432,7 +432,7 @@ func callLLMWithRetry(ctx context.Context, agentCtx *AgentContext, config LoopCo
 			resetTurnState()
 		}
 
-		delay := retryDelay(err, attempt, config.MaxRetryDelay)
+		delay := retryDelay(err, attempt)
 
 		emit(ch, Event{
 			Type: EventRetry,
@@ -454,10 +454,11 @@ func callLLMWithRetry(ctx context.Context, agentCtx *AgentContext, config LoopCo
 	return Message{}, lastInfo, lastErr
 }
 
-// recoverOverflow attempts to compact the context and retry the LLM call.
-// If no TransformContext is configured, the original error is returned.
+// recoverOverflow attempts to compact the context via the ContextManager and
+// retry the LLM call. If no ContextManager is configured, the original error
+// is returned.
 func recoverOverflow(ctx context.Context, agentCtx *AgentContext, config LoopConfig, ch chan<- Event, originalErr error, hooks llmCallHooks, turn TurnInfo) (Message, llmCallInfo, error) {
-	if config.ContextManager == nil && config.TransformContext == nil {
+	if config.ContextManager == nil {
 		return Message{}, llmCallInfo{}, fmt.Errorf("context overflow (no compaction configured): %w", originalErr)
 	}
 
@@ -471,28 +472,19 @@ func recoverOverflow(ctx context.Context, agentCtx *AgentContext, config LoopCon
 		},
 	})
 
-	if config.ContextManager != nil {
-		recovery, err := config.ContextManager.RecoverOverflow(ctx, agentCtx.Messages, originalErr)
-		if err != nil {
-			return Message{}, llmCallInfo{}, fmt.Errorf("overflow recovery compaction failed: %w", err)
-		}
-		if len(recovery.View) == 0 {
-			return Message{}, llmCallInfo{}, fmt.Errorf("overflow recovery returned empty prompt view")
-		}
-		agentCtx.Messages = recovery.View
-		if recovery.ShouldCommit && len(recovery.CommitMessages) > 0 && config.CommitContext != nil {
-			if err := config.CommitContext(recovery.CommitMessages, recovery.Usage); err != nil {
-				return Message{}, llmCallInfo{}, fmt.Errorf("overflow recovery commit failed: %w", err)
-			}
-		}
-		return callLLM(ctx, agentCtx, config, ch, hooks, turn)
-	}
-
-	compacted, err := config.TransformContext(ctx, agentCtx.Messages)
+	recovery, err := config.ContextManager.RecoverOverflow(ctx, agentCtx.Messages, originalErr)
 	if err != nil {
 		return Message{}, llmCallInfo{}, fmt.Errorf("overflow recovery compaction failed: %w", err)
 	}
-	agentCtx.Messages = compacted
+	if len(recovery.View) == 0 {
+		return Message{}, llmCallInfo{}, fmt.Errorf("overflow recovery returned empty prompt view")
+	}
+	agentCtx.Messages = recovery.View
+	if recovery.ShouldCommit && len(recovery.CommitMessages) > 0 && config.CommitContext != nil {
+		if err := config.CommitContext(recovery.CommitMessages, recovery.Usage); err != nil {
+			return Message{}, llmCallInfo{}, fmt.Errorf("overflow recovery commit failed: %w", err)
+		}
+	}
 	return callLLM(ctx, agentCtx, config, ch, hooks, turn)
 }
 
@@ -502,11 +494,9 @@ func IsContextOverflow(err error) bool {
 }
 
 // retryDelay calculates the wait duration using exponential backoff.
-// Respects Retry-After from rate limit errors. Capped at maxDelay.
-func retryDelay(err error, attempt int, maxDelay time.Duration) time.Duration {
-	if maxDelay <= 0 {
-		maxDelay = defaultMaxRetryDelay
-	}
+// Respects Retry-After from rate limit errors. Capped at defaultMaxRetryDelay.
+func retryDelay(err error, attempt int) time.Duration {
+	maxDelay := defaultMaxRetryDelay
 	if after := litellm.GetRetryAfter(err); after > 0 {
 		d := time.Duration(after) * time.Second
 		if d > maxDelay {
@@ -544,31 +534,15 @@ func callLLM(ctx context.Context, agentCtx *AgentContext, config LoopConfig, ch 
 		if projection.Messages != nil {
 			messages = projection.Messages
 		}
-	} else if config.TransformContext != nil {
-		var err error
-		messages, err = config.TransformContext(ctx, messages)
-		if err != nil {
-			return Message{}, llmCallInfo{}, fmt.Errorf("transform context: %w", err)
-		}
 	}
 
-	// Stage 2: ConvertToLLM (AgentMessage[] → Message[])
+	// Stage 2: ConvertToLLM (AgentMessage[] → Message[]) + repair tool-call /
+	// tool-result pairing for provider compatibility.
 	convertFn := config.ConvertToLLM
 	if convertFn == nil {
 		convertFn = DefaultConvertToLLM
 	}
-	llmMessages := convertFn(messages)
-
-	// Provider-facing transcripts must satisfy tool-call / tool-result pairing
-	// invariants. Strict mode fails fast for debugging and high-fidelity runs;
-	// default mode repairs conservatively to preserve compatibility.
-	if config.StrictMessageSequence {
-		if err := AssertMessageSequence(llmMessages); err != nil {
-			return Message{}, llmCallInfo{}, err
-		}
-	} else {
-		llmMessages = RepairMessageSequence(llmMessages)
-	}
+	llmMessages := RepairMessageSequence(convertFn(messages))
 
 	// Build tool specs
 	toolSpecs := buildToolSpecs(agentCtx.Tools)
@@ -603,22 +577,6 @@ func callLLM(ctx context.Context, agentCtx *AgentContext, config LoopConfig, ch 
 		}
 	}
 
-	// Call via StreamFn (non-streaming shortcut, e.g. mock/proxy)
-	if config.StreamFn != nil {
-		resp, err := config.StreamFn(ctx, &LLMRequest{
-			Messages: llmMessages,
-			Tools:    toolSpecs,
-		})
-		if err != nil {
-			return Message{}, llmCallInfo{}, err
-		}
-		resp.Message.Timestamp = time.Now()
-		msg := resp.Message
-		emit(ch, Event{Type: EventMessageStart, Message: msg})
-		emit(ch, Event{Type: EventMessageEnd, Message: msg})
-		return msg, llmCallInfo{}, nil
-	}
-
 	if config.Model == nil {
 		return Message{}, llmCallInfo{}, fmt.Errorf("no model configured")
 	}
@@ -626,35 +584,10 @@ func callLLM(ctx context.Context, agentCtx *AgentContext, config LoopConfig, ch 
 	// Build per-call options
 	var callOpts []CallOption
 
-	// Dynamic API key resolution
-	if config.GetApiKey != nil {
-		provider := ""
-		if pn, ok := config.Model.(ProviderNamer); ok {
-			provider = pn.ProviderName()
-		}
-		if key, err := config.GetApiKey(provider); err == nil && key != "" {
-			callOpts = append(callOpts, WithAPIKey(key))
-		}
-	}
-
-	// Thinking level + budget
+	// Thinking level (provider-default budget; per-call WithThinkingBudget can be
+	// applied by ChatModel adapters that need to override).
 	if config.ThinkingLevel != "" && config.ThinkingLevel != ThinkingOff {
 		callOpts = append(callOpts, WithThinking(config.ThinkingLevel))
-		if config.ThinkingBudgets != nil {
-			if budget, ok := config.ThinkingBudgets[config.ThinkingLevel]; ok && budget > 0 {
-				callOpts = append(callOpts, WithThinkingBudget(budget))
-			}
-		}
-	}
-
-	// Session ID for provider caching
-	if config.SessionID != "" {
-		callOpts = append(callOpts, WithCallSessionID(config.SessionID))
-	}
-
-	// Tool choice: "auto" / "required" / "none"
-	if config.ToolChoice != nil {
-		callOpts = append(callOpts, WithToolChoice(config.ToolChoice))
 	}
 
 	// Use streaming for real-time token deltas

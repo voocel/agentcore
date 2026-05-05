@@ -29,39 +29,29 @@ type AgentState struct {
 // It consumes loop events to update internal state, just like any external listener.
 type Agent struct {
 	// Configuration (set via options)
-	model                 ChatModel
-	systemPrompt          string
-	systemBlocks          []SystemBlock
-	tools                 []Tool
-	maxTurns              int
-	maxRetries            int
-	maxToolErrors         int
-	strictMessageSequence bool
-	thinkingLevel         ThinkingLevel
-	streamFn              StreamFn
-	contextManager        ContextManager
-	transformContext      func(ctx context.Context, msgs []AgentMessage) ([]AgentMessage, error)
-	convertToLLM          func([]AgentMessage) []Message
-	steeringMode          QueueMode
-	followUpMode          QueueMode
-	contextWindow         int
-	contextEstimateFn     ContextEstimateFn
-	permissionEngine      permission.DecisionEngine
-	getApiKey             func(provider string) (string, error)
-	thinkingBudgets       map[ThinkingLevel]int
-	sessionID             string
-	middlewares           []ToolMiddleware
-	maxRetryDelay         time.Duration
-	maxToolConcurrency    int
-	toolsAreIdempotent    bool
-	toolChoice            any // default tool_choice for LLM calls
-	onMessage             func(AgentMessage)
-	taskRuntime           *TaskRuntime
-	reminderGens          []ReminderGenerator
-	stopGuard             StopGuard
-	onMaxTurns            MaxTurnsAction
-	stopAfterTool         func(toolName string) bool
-	stopAfterToolResult   func(toolName string, result json.RawMessage) bool
+	model               ChatModel
+	systemPrompt        string
+	systemBlocks        []SystemBlock
+	tools               []Tool
+	maxTurns            int
+	maxRetries          int
+	maxToolErrors       int
+	thinkingLevel       ThinkingLevel
+	contextManager      ContextManager
+	convertToLLM        func([]AgentMessage) []Message
+	contextWindow       int
+	contextEstimateFn   ContextEstimateFn
+	permissionEngine    permission.DecisionEngine
+	middlewares         []ToolMiddleware
+	maxToolConcurrency  int
+	toolsAreIdempotent  bool
+	onMessage           func(AgentMessage)
+	taskRuntime         *TaskRuntime
+	reminderGens        []ReminderGenerator
+	stopGuard           StopGuard
+	onMaxTurns          MaxTurnsAction
+	stopAfterTool       func(toolName string) bool
+	stopAfterToolResult func(toolName string, result json.RawMessage) bool
 
 	// State
 	messages         []AgentMessage
@@ -96,8 +86,6 @@ func NewAgent(opts ...AgentOption) *Agent {
 		maxRetries:       defaultMaxRetries,
 		maxToolErrors:    defaultMaxToolErrors,
 		thinkingLevel:    ThinkingLow,
-		steeringMode:     QueueModeAll,
-		followUpMode:     QueueModeAll,
 		pendingToolCalls: make(map[string]struct{}),
 	}
 	for _, opt := range opts {
@@ -170,12 +158,12 @@ func (a *Agent) Continue() error {
 	// If last message is assistant, try to dequeue pending messages as new prompt
 	lastMsg := a.messages[len(a.messages)-1]
 	if lastMsg.GetRole() == RoleAssistant {
-		if queued := dequeue(&a.steeringQ, a.steeringMode); len(queued) > 0 {
+		if queued := dequeue(&a.steeringQ); len(queued) > 0 {
 			a.skipNextInitialSteeringPoll = true
 			a.startPromptRunLocked(queued)
 			return nil
 		}
-		if queued := dequeue(&a.followUpQ, a.followUpMode); len(queued) > 0 {
+		if queued := dequeue(&a.followUpQ); len(queued) > 0 {
 			a.skipNextInitialSteeringPoll = true
 			a.startPromptRunLocked(queued)
 			return nil
@@ -505,7 +493,7 @@ func (a *Agent) SetSystemBlocks(blocks []SystemBlock) {
 // for an LLM call: system blocks/prompt → converted conversation messages.
 // This enables external callers (e.g., prompt suggestion) to make background
 // LLM calls that share the same message prefix for prompt cache hits.
-// Strict message-sequence mode is honored here just like in the main loop.
+// Malformed tool-call / result transcripts are repaired via RepairMessageSequence.
 func (a *Agent) BuildLLMMessages() ([]Message, error) {
 	a.mu.Lock()
 	msgs := copyMessages(a.messages)
@@ -513,7 +501,6 @@ func (a *Agent) BuildLLMMessages() ([]Message, error) {
 	sp := a.systemPrompt
 	mgr := a.contextManager
 	convertFn := a.convertToLLM
-	strict := a.strictMessageSequence
 	a.mu.Unlock()
 
 	if mgr != nil {
@@ -529,14 +516,7 @@ func (a *Agent) BuildLLMMessages() ([]Message, error) {
 	if convertFn == nil {
 		convertFn = DefaultConvertToLLM
 	}
-	llmMessages := convertFn(msgs)
-	if strict {
-		if err := AssertMessageSequence(llmMessages); err != nil {
-			return nil, err
-		}
-	} else {
-		llmMessages = RepairMessageSequence(llmMessages)
-	}
+	llmMessages := RepairMessageSequence(convertFn(msgs))
 
 	if len(blocks) > 0 {
 		sysMsgs := make([]Message, len(blocks))
@@ -631,16 +611,13 @@ func (a *Agent) buildConfig() LoopConfig {
 	a.skipNextInitialSteeringPoll = false
 
 	return LoopConfig{
-		Model:                 a.model,
-		StreamFn:              a.streamFn,
-		MaxTurns:              a.maxTurns,
-		MaxRetries:            a.maxRetries,
-		MaxToolErrors:         a.maxToolErrors,
-		StrictMessageSequence: a.strictMessageSequence,
-		ThinkingLevel:         a.thinkingLevel,
-		ContextManager:        a.contextManager,
-		TransformContext:      a.transformContext,
-		ConvertToLLM:          a.convertToLLM,
+		Model:          a.model,
+		MaxTurns:       a.maxTurns,
+		MaxRetries:     a.maxRetries,
+		MaxToolErrors:  a.maxToolErrors,
+		ThinkingLevel:  a.thinkingLevel,
+		ContextManager: a.contextManager,
+		ConvertToLLM:   a.convertToLLM,
 		CommitContext: func(msgs []AgentMessage, usage *ContextUsage) error {
 			a.mu.Lock()
 			defer a.mu.Unlock()
@@ -649,9 +626,6 @@ func (a *Agent) buildConfig() LoopConfig {
 			return nil
 		},
 		PermissionEngine: a.permissionEngine,
-		GetApiKey:        a.getApiKey,
-		ThinkingBudgets:  a.thinkingBudgets,
-		SessionID:        a.sessionID,
 		GetSteeringMessages: func() []AgentMessage {
 			a.mu.Lock()
 			defer a.mu.Unlock()
@@ -659,18 +633,16 @@ func (a *Agent) buildConfig() LoopConfig {
 				skipInitialSteering = false
 				return nil
 			}
-			return dequeue(&a.steeringQ, a.steeringMode)
+			return dequeue(&a.steeringQ)
 		},
 		GetFollowUpMessages: func() []AgentMessage {
 			a.mu.Lock()
 			defer a.mu.Unlock()
-			return dequeue(&a.followUpQ, a.followUpMode)
+			return dequeue(&a.followUpQ)
 		},
-		MaxRetryDelay:         a.maxRetryDelay,
 		Middlewares:           a.middlewares,
 		MaxToolConcurrency:    a.maxToolConcurrency,
 		ShouldEmitAbortMarker: a.wantAbortMarker.Load,
-		ToolChoice:            a.toolChoice,
 		OnMessage:             a.onMessage,
 		ReminderGens:          a.reminderGens,
 		StopGuard:             a.stopGuard,

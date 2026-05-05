@@ -135,18 +135,11 @@ func DefaultConvertToLLM(msgs []AgentMessage) []Message {
 	return out
 }
 
-// dequeue removes messages from a queue according to the given mode.
-// QueueModeAll drains everything; QueueModeOneAtATime takes only the first message.
-func dequeue(queue *[]AgentMessage, mode QueueMode) []AgentMessage {
+// dequeue drains all messages from the queue.
+func dequeue(queue *[]AgentMessage) []AgentMessage {
 	if len(*queue) == 0 {
 		return nil
 	}
-	if mode == QueueModeOneAtATime {
-		first := (*queue)[0]
-		*queue = (*queue)[1:]
-		return []AgentMessage{first}
-	}
-	// QueueModeAll: drain everything
 	result := *queue
 	*queue = nil
 	return result

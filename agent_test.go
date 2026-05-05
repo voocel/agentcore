@@ -2,55 +2,18 @@ package agentcore
 
 import (
 	"context"
-	"encoding/json"
-	"strings"
 	"sync"
 	"testing"
 	"time"
 )
 
-func TestAgentContinue_SteeringQueueOneAtATime(t *testing.T) {
-	agent := NewAgent(
-		WithStreamFn(mockStreamFn(
-			assistantMsg("initial", StopReasonStop),
-			assistantMsg("after steer 1", StopReasonStop),
-			assistantMsg("after steer 2", StopReasonStop),
-		)),
-		WithSteeringMode(QueueModeOneAtATime),
-	)
-
-	if err := agent.Prompt("start"); err != nil {
-		t.Fatalf("prompt failed: %v", err)
-	}
-	agent.WaitForIdle()
-
-	agent.Steer(UserMsg("steer-1"))
-	agent.Steer(UserMsg("steer-2"))
-
-	if err := agent.Continue(); err != nil {
-		t.Fatalf("first continue failed: %v", err)
-	}
-	agent.WaitForIdle()
-
-	msgs := agent.Messages()
-	want := []string{"start", "initial", "steer-1", "after steer 1", "steer-2", "after steer 2"}
-	if len(msgs) != len(want) {
-		t.Fatalf("expected %d messages, got %d", len(want), len(msgs))
-	}
-	for i, msg := range msgs {
-		if got := msg.TextContent(); got != want[i] {
-			t.Fatalf("message[%d]: expected %q, got %q", i, want[i], got)
-		}
-	}
-}
-
 func TestAgentInject_WhenRunning_ReturnsSteeredCurrentRun(t *testing.T) {
 	release := make(chan struct{})
 	agent := NewAgent(
-		WithStreamFn(func(ctx context.Context, req *LLMRequest) (*LLMResponse, error) {
+		WithModel(funcModel(func(ctx context.Context, req *LLMRequest) (*LLMResponse, error) {
 			<-release
 			return &LLMResponse{Message: assistantMsg("done", StopReasonStop)}, nil
-		}),
+		})),
 	)
 
 	if err := agent.Prompt("start"); err != nil {
@@ -79,7 +42,7 @@ func TestAgentInject_WhenRunning_ReturnsSteeredCurrentRun(t *testing.T) {
 
 func TestAgentInject_WhenIdleAndAssistantTail_ReturnsResumedIdleRun(t *testing.T) {
 	agent := NewAgent(
-		WithStreamFn(mockStreamFn(
+		WithModel(mockModel(
 			assistantMsg("initial", StopReasonStop),
 			assistantMsg("after inject", StopReasonStop),
 		)),
@@ -139,7 +102,7 @@ func TestAgentInject_WhenNilMessage_ReturnsError(t *testing.T) {
 
 func TestAgentInject_IsAtomicUnderConcurrentCalls(t *testing.T) {
 	agent := NewAgent(
-		WithStreamFn(mockStreamFn(
+		WithModel(mockModel(
 			assistantMsg("initial", StopReasonStop),
 			assistantMsg("after inject 1", StopReasonStop),
 			assistantMsg("after inject 2", StopReasonStop),
@@ -210,24 +173,3 @@ func TestAgentInject_IsAtomicUnderConcurrentCalls(t *testing.T) {
 	}
 }
 
-func TestAgentBuildLLMMessages_StrictMessageSequenceRejectsMalformedHistory(t *testing.T) {
-	agent := NewAgent(WithStrictMessageSequence(true))
-	if err := agent.SetMessages([]AgentMessage{
-		Message{
-			Role: RoleAssistant,
-			Content: []ContentBlock{
-				ToolCallBlock(ToolCall{ID: "tc-build", Name: "echo", Args: json.RawMessage(`{"value":"x"}`)}),
-			},
-		},
-	}); err != nil {
-		t.Fatalf("set messages failed: %v", err)
-	}
-
-	msgs, err := agent.BuildLLMMessages()
-	if err == nil {
-		t.Fatalf("expected strict BuildLLMMessages to fail, got msgs=%+v", msgs)
-	}
-	if !strings.Contains(err.Error(), `missing tool result for "tc-build"`) {
-		t.Fatalf("unexpected error: %v", err)
-	}
-}

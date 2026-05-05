@@ -5,7 +5,6 @@ import (
 	"encoding/json"
 	"fmt"
 	"sync"
-	"time"
 
 	"github.com/voocel/agentcore/permission"
 )
@@ -29,17 +28,13 @@ type AgentContext struct {
 	Tools        []Tool
 }
 
-// StreamFn is an injectable LLM call function.
-// When nil, the loop uses model.Generate / model.GenerateStream directly.
-type StreamFn func(ctx context.Context, req *LLMRequest) (*LLMResponse, error)
-
-// LLMRequest is the request passed to StreamFn.
+// LLMRequest carries the inputs to a single LLM call.
 type LLMRequest struct {
 	Messages []Message
 	Tools    []ToolSpec
 }
 
-// LLMResponse is the response from StreamFn.
+// LLMResponse carries the result of a single LLM call.
 type LLMResponse struct {
 	Message Message
 }
@@ -58,19 +53,17 @@ type ToolSpec struct {
 
 // LoopConfig configures the agent loop.
 type LoopConfig struct {
-	Model                 ChatModel
-	StreamFn              StreamFn      // nil = use Model directly
-	MaxTurns              int           // safety limit, default 10
-	MaxRetries            int           // LLM call retry limit for retryable errors, default 3
-	MaxToolErrors         int           // consecutive tool failure threshold per tool, 0 = unlimited
-	StrictMessageSequence bool          // fail fast instead of repairing malformed tool call / result history
-	ThinkingLevel         ThinkingLevel // reasoning depth
+	Model         ChatModel
+	MaxTurns      int           // safety limit, default 10
+	MaxRetries    int           // LLM call retry limit for retryable errors, default 3
+	MaxToolErrors int           // consecutive tool failure threshold per tool, 0 = unlimited
+	ThinkingLevel ThinkingLevel // reasoning depth
 
-	// Two-stage pipeline: TransformContext -> ConvertToLLM
-	// ContextManager takes precedence when configured.
-	ContextManager   ContextManager
-	TransformContext func(ctx context.Context, msgs []AgentMessage) ([]AgentMessage, error)
-	ConvertToLLM     func(msgs []AgentMessage) []Message
+	// Context lifecycle. ContextManager drives prompt projection, overflow
+	// recovery, and usage reporting; ConvertToLLM is auto-wired from it when
+	// the manager implements ContextLLMConverter.
+	ContextManager ContextManager
+	ConvertToLLM   func(msgs []AgentMessage) []Message
 
 	// CommitContext replaces the runtime message baseline after an explicit
 	// committed compaction, a committed projection rewrite, or committed
@@ -81,28 +74,11 @@ type LoopConfig struct {
 	// Returning nil means no extra approval step was required.
 	PermissionEngine permission.DecisionEngine
 
-	// GetApiKey resolves the API key before each LLM call.
-	// The provider parameter identifies which provider is being called (e.g. "openai", "anthropic").
-	// Enables per-provider key resolution, key rotation, OAuth tokens, and multi-tenant scenarios.
-	// When nil or returns empty string, the model's default key is used.
-	GetApiKey func(provider string) (string, error)
-
-	// ThinkingBudgets maps each ThinkingLevel to a max thinking token count.
-	// When set, the resolved budget is passed to the model alongside the level.
-	ThinkingBudgets map[ThinkingLevel]int
-
-	// SessionID enables provider-level session caching (e.g. Anthropic prompt cache).
-	SessionID string
-
 	// Steering: called after each tool execution to check for user interruptions.
 	GetSteeringMessages func() []AgentMessage
 
 	// FollowUp: called when the agent would otherwise stop.
 	GetFollowUpMessages func() []AgentMessage
-
-	// MaxRetryDelay caps the wait time between retries (including server-requested Retry-After).
-	// Default: 60s. Set to prevent excessively long waits from overloaded providers.
-	MaxRetryDelay time.Duration
 
 	// Middlewares are applied around each tool execution (outermost first).
 	// Use for logging, timing, argument/result modification, etc.
@@ -118,15 +94,10 @@ type LoopConfig struct {
 	// cancellation is silent (legacy behavior). Set by Agent.Abort().
 	ShouldEmitAbortMarker func() bool
 
-	// ToolChoice sets the default tool_choice for every LLM call in this loop.
-	// "auto" (default), "required" (must call a tool), "none" (no tools).
-	// nil means use provider default.
-	ToolChoice any
-
 	// StopAfterTool, if non-nil, is called after each successful (non-error)
 	// tool execution. If it returns true, the loop exits immediately with
-	// EndReasonStop — even when ToolChoice is "required". Use this to let a
-	// terminal tool (e.g. commit_chapter) end the loop without wasting turns.
+	// EndReasonStop. Use this to let a terminal tool (e.g. commit_chapter)
+	// end the loop without wasting turns.
 	StopAfterTool func(toolName string) bool
 
 	// StopAfterToolResult is the result-aware variant of StopAfterTool. It is
@@ -350,14 +321,3 @@ type StreamEvent struct {
 	Err               error      // for error events
 }
 
-// ---------------------------------------------------------------------------
-// Queue Mode
-// ---------------------------------------------------------------------------
-
-// QueueMode controls how steering/follow-up queues are drained.
-type QueueMode string
-
-const (
-	QueueModeAll        QueueMode = "all"
-	QueueModeOneAtATime QueueMode = "one-at-a-time"
-)

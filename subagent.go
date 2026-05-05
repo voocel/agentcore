@@ -27,7 +27,6 @@ type SubAgentConfig struct {
 	Model        ChatModel
 	SystemPrompt string
 	Tools        []Tool
-	StreamFn     StreamFn
 	MaxTurns     int
 
 	// MaxRetries caps the LLM call retry count for retryable errors within this
@@ -42,13 +41,9 @@ type SubAgentConfig struct {
 	// and retry. See WithToolsAreIdempotent on the main Agent for full rationale.
 	ToolsAreIdempotent bool
 
-	// ToolChoice sets the default tool_choice for every LLM call in this
-	// sub-agent's loop. nil uses the provider default ("auto").
-	ToolChoice any
-
 	// StopAfterTools lists tool names that trigger early loop exit after
-	// successful execution. Useful with ToolChoice "required" to let a
-	// terminal tool (e.g. "commit_chapter") end the loop cleanly.
+	// successful execution. Lets a terminal tool (e.g. "commit_chapter") end
+	// the loop cleanly without wasting another turn.
 	StopAfterTools []string
 
 	// StopAfterToolResult is the result-aware variant of StopAfterTools. It is
@@ -62,7 +57,6 @@ type SubAgentConfig struct {
 	// Optional context lifecycle hooks for long-running sub-agents.
 	ContextManager        ContextManager
 	ContextManagerFactory func(model ChatModel) ContextManager
-	TransformContext      func(ctx context.Context, msgs []AgentMessage) ([]AgentMessage, error)
 	ConvertToLLM          func(msgs []AgentMessage) []Message
 
 	// StopGuardFactory, if non-nil, creates a fresh StopGuard for each run.
@@ -496,13 +490,10 @@ func (t *SubAgentTool) runAgent(ctx context.Context, agentName, task string, mod
 
 	loopCfg := LoopConfig{
 		Model:              runModel,
-		StreamFn:           cfg.StreamFn,
 		MaxTurns:           cfg.MaxTurns,
 		MaxRetries:         cfg.MaxRetries,
 		ToolsAreIdempotent: cfg.ToolsAreIdempotent,
-		ToolChoice:         cfg.ToolChoice,
 		ContextManager:     contextManager,
-		TransformContext:   cfg.TransformContext,
 		ConvertToLLM:       cfg.ConvertToLLM,
 	}
 	if len(cfg.StopAfterTools) > 0 {
