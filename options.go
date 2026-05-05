@@ -106,15 +106,8 @@ func WithMaxToolErrors(n int) AgentOption {
 }
 
 // ---------------------------------------------------------------------------
-// Queues & Hooks — background tasks, callbacks
+// Hooks — message callbacks, generators, guards
 // ---------------------------------------------------------------------------
-
-// WithTaskRuntime sets a shared TaskRuntime for background task management.
-// Tools that support background execution (Bash, SubAgent) register their
-// tasks here, enabling a unified Tasks()/StopTask()/StopAllTasks() API on Agent.
-func WithTaskRuntime(rt *TaskRuntime) AgentOption {
-	return func(a *Agent) { a.taskRuntime = rt }
-}
 
 // WithOnMessage registers a callback invoked after each message is appended
 // to the agent's context. Use for session logging / message persistence.

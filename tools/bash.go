@@ -13,6 +13,7 @@ import (
 
 	"github.com/voocel/agentcore"
 	"github.com/voocel/agentcore/schema"
+	"github.com/voocel/agentcore/task"
 )
 
 // BashTool executes shell commands.
@@ -24,7 +25,7 @@ type BashTool struct {
 	Timeout         time.Duration // default: 2 minutes
 	notifyFn        func(agentcore.AgentMessage)
 	bgOutputFactory func(shellID string) (io.WriteCloser, string, error) // creates output writer for background shells
-	taskRT          *agentcore.TaskRuntime                               // shared background task registry
+	taskRT          *task.Runtime                                        // shared background task registry
 }
 
 func NewBash(workDir string) *BashTool {
@@ -48,7 +49,7 @@ func (t *BashTool) SetBgOutputFactory(fn func(shellID string) (io.WriteCloser, s
 }
 
 // SetTaskRuntime sets the shared task runtime for background task registration.
-func (t *BashTool) SetTaskRuntime(rt *agentcore.TaskRuntime) {
+func (t *BashTool) SetTaskRuntime(rt *task.Runtime) {
 	t.taskRT = rt
 }
 
@@ -205,12 +206,12 @@ func (t *BashTool) executeBackground(a bashArgs) (json.RawMessage, error) {
 		}
 	}
 
-	entry := &agentcore.BackgroundTaskEntry{
+	entry := &task.Entry{
 		ID:          shellID,
-		Type:        agentcore.TaskTypeShell,
+		Type:        task.TypeShell,
 		Command:     a.Command,
 		Description: desc,
-		Status:      agentcore.TaskRunning,
+		Status:      task.Running,
 		StartedAt:   time.Now(),
 		OutputFile:  outPath,
 		PID:         cmd.Process.Pid,
@@ -244,9 +245,9 @@ func (t *BashTool) executeBackground(a bashArgs) (json.RawMessage, error) {
 		<-done
 
 		exitCode := 0
-		status := agentcore.TaskCompleted
+		status := task.Completed
 		if waitErr != nil {
-			status = agentcore.TaskFailed
+			status = task.Failed
 			if exitErr, ok := waitErr.(*exec.ExitError); ok {
 				exitCode = exitErr.ExitCode()
 			} else {
@@ -254,7 +255,7 @@ func (t *BashTool) executeBackground(a bashArgs) (json.RawMessage, error) {
 			}
 		}
 
-		rt.Update(shellID, func(e *agentcore.BackgroundTaskEntry) {
+		rt.Update(shellID, func(e *task.Entry) {
 			e.Status = status
 			e.ExitCode = exitCode
 			e.EndedAt = time.Now()
@@ -272,7 +273,7 @@ func (t *BashTool) executeBackground(a bashArgs) (json.RawMessage, error) {
 	})
 }
 
-func (t *BashTool) notifyCompletion(rt *agentcore.TaskRuntime, shellID string) {
+func (t *BashTool) notifyCompletion(rt *task.Runtime, shellID string) {
 	if t.notifyFn == nil {
 		return
 	}
@@ -280,7 +281,7 @@ func (t *BashTool) notifyCompletion(rt *agentcore.TaskRuntime, shellID string) {
 	if e == nil {
 		return
 	}
-	t.notifyFn(agentcore.NotificationFromEntry(e).ToAgentMessage())
+	t.notifyFn(task.NotificationFromEntry(e).ToAgentMessage())
 }
 
 // executeForeground runs the command synchronously (original behavior).

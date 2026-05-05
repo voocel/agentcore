@@ -22,10 +22,14 @@ go get github.com/voocel/agentcore
 ## 架构
 
 ```
-agentcore/            Agent 核心（类型、循环、Agent、事件、SubAgent）
+agentcore/            Agent 核心（类型、循环、Agent、事件）
 agentcore/llm/        LLM 适配层（OpenAI, Anthropic, Gemini，基于 litellm）
 agentcore/tools/      内置工具：read, write, edit, bash
 agentcore/context/    上下文运行时 —— 投影、重写、溢出恢复
+agentcore/task/       后台任务注册中心（Runtime / Entry），bash + subagent 共用
+agentcore/subagent/   SubAgent 工具 —— 通过工具调用实现多 Agent
+agentcore/proxy/      ChatModel 适配器，把 LLM 调用转发到远程代理
+agentcore/permission/ 可选权限引擎，通过 WithPermissionEngine 接入
 ```
 
 核心设计：
@@ -33,8 +37,8 @@ agentcore/context/    上下文运行时 —— 投影、重写、溢出恢复
 - **无状态双循环核心**（`loop.go`）—— 无结构体依赖，所有输入通过参数注入。双层循环：内层处理工具调用 + steering 中断，外层处理 follow-up 续接
 - **有状态 Agent**（`agent.go`）—— 作为循环事件的唯一消费者，更新内部状态后分发给外部监听者
 - **事件流** —— 单一 `<-chan Event` 输出，驱动任何 UI（TUI、Web、Slack、日志）
-- **两阶段管道** —— `TransformContext`（裁剪/注入）→ `ConvertToLLM`（过滤为 LLM 消息）
-- **SubAgent 工具**（`subagent.go`）—— 通过工具调用实现多 Agent，四种模式：single、parallel、chain、background
+- **上下文管理器** —— `ContextManager` 负责 prompt 投影、溢出恢复，并通过自动接入完成消息转换/token 估算
+- **SubAgent 工具**（`subagent/`）—— 通过工具调用实现多 Agent，四种模式：single、parallel、chain、background
 - **上下文运行时**（`context/`）—— 接近上下文窗口上限时执行投影、正式重写与溢出恢复
 
 ## 快速开始
@@ -103,12 +107,19 @@ engine := permission.NewEngine(permission.EngineConfig{
 
 ### 多 Agent（SubAgent 工具）
 
-子 Agent 作为普通工具被调用，各自拥有隔离的上下文：
+子 Agent 作为普通工具被调用，各自拥有隔离的上下文。需要 import `agentcore/subagent` 子包：
 
 ```go
+import (
+    "github.com/voocel/agentcore"
+    "github.com/voocel/agentcore/llm"
+    "github.com/voocel/agentcore/subagent"
+    "github.com/voocel/agentcore/tools"
+)
+
 model, _ := llm.NewOpenAIModel("gpt-5-mini", apiKey)
 
-scout := agentcore.SubAgentConfig{
+scout := subagent.Config{
     Name:         "scout",
     Description:  "快速代码侦察",
     Model:        model,
@@ -117,7 +128,7 @@ scout := agentcore.SubAgentConfig{
     MaxTurns:     5,
 }
 
-worker := agentcore.SubAgentConfig{
+worker := subagent.Config{
     Name:         "worker",
     Description:  "通用执行者",
     Model:        model,
@@ -127,8 +138,19 @@ worker := agentcore.SubAgentConfig{
 
 agent := agentcore.NewAgent(
     agentcore.WithModel(model),
-    agentcore.WithTools(agentcore.NewSubAgentTool(scout, worker)),
+    agentcore.WithTools(subagent.New(scout, worker)),
 )
+```
+
+要启用 background 模式（异步 subagent + 完成后通知主 Agent），需要再接一个共享任务运行时：
+
+```go
+import "github.com/voocel/agentcore/task"
+
+rt := task.NewRuntime()
+sat := subagent.New(scout, worker)
+sat.SetTaskRuntime(rt)
+sat.SetNotifyFn(agent.FollowUp) // 完成后把通知作为 follow-up 送回父 Agent
 ```
 
 LLM 通过工具调用触发四种执行模式：
@@ -202,7 +224,7 @@ agent.Subscribe(func(ev agentcore.Event) {
 
 ### 可热切换模型
 
-如果需要运行时换模型，可以用 `SwappableModel` 包一层。切换会在下一次调用生效。`SubAgentConfig.Model` 会在每次子 Agent 运行开始时重新解引用，所以同一个包装器对主 Agent 和子 Agent 都生效。
+如果需要运行时换模型，可以用 `SwappableModel` 包一层。切换会在下一次调用生效。`subagent.Config.Model` 会在每次子 Agent 运行开始时重新解引用，所以同一个包装器对主 Agent 和子 Agent 都生效。
 
 ```go
 defaultModel, _ := llm.NewOpenAIModel("gpt-5-mini", apiKey)
@@ -214,18 +236,10 @@ nextModel, _ := llm.NewOpenAIModel("gpt-5", apiKey)
 sw.Swap(nextModel) // 下一轮开始使用新模型
 ```
 
-### 自定义 LLM（StreamFn）
+### 自定义 LLM 适配器
 
-替换 LLM 调用为代理、Mock 或自定义实现：
-
-```go
-agent := agentcore.NewAgent(
-    agentcore.WithStreamFn(func(ctx context.Context, req *agentcore.LLMRequest) (*agentcore.LLMResponse, error) {
-        // 路由到你自己的代理/网关
-        return callMyProxy(ctx, req)
-    }),
-)
-```
+要替换 LLM 调用为代理、Mock 或自定义实现，实现 `ChatModel` 接口并通过
+`WithModel` 传入即可。`SwappableModel` 与 `agentcore/proxy` 子包都基于这一接口构建，可作参考。
 
 ### 上下文压缩
 
@@ -255,32 +269,6 @@ agent := agentcore.NewAgent(
 2. 通过 LLM 将旧消息摘要为结构化检查点（Goal / Progress / Key Decisions / Next Steps）
 3. 跨压缩消息追踪文件操作（read/write/edit 路径）
 4. 支持增量更新 —— 后续压缩基于已有摘要更新，而非重新总结
-
-### 上下文管道
-
-如果只是简单的 transform-only 管道，`WithContextPipeline` / `WithTransformContext` 仍然可用：
-
-```go
-agent := agentcore.NewAgent(
-    // 阶段 1：裁剪旧消息，注入外部上下文
-    agentcore.WithTransformContext(func(ctx context.Context, msgs []agentcore.AgentMessage) ([]agentcore.AgentMessage, error) {
-        if len(msgs) > 100 {
-            msgs = msgs[len(msgs)-50:]
-        }
-        return msgs, nil
-    }),
-    // 阶段 2：过滤为 LLM 兼容的消息
-    agentcore.WithConvertToLLM(func(msgs []agentcore.AgentMessage) []agentcore.Message {
-        var out []agentcore.Message
-        for _, m := range msgs {
-            if msg, ok := m.(agentcore.Message); ok {
-                out = append(out, msg)
-            }
-        }
-        return out
-    }),
-)
-```
 
 ## 内置工具
 
@@ -335,6 +323,7 @@ fmt.Println(result.Disposition)
 | `State()` | 获取当前状态快照 |
 | `ExportMessages()` | 导出消息用于序列化 |
 | `ImportMessages(msgs)` | 导入反序列化的消息 |
+| `BuildLLMMessages()` | 物化下一次 LLM 调用的提示（system → 投影后的历史）。始终通过 `RepairMessageSequence` 修复 tool-call/result 序列；如需测试时严格断言，请直接调用 `AssertMessageSequence`。 |
 
 ## 许可证
 

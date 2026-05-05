@@ -6,6 +6,7 @@ import (
 
 	"github.com/voocel/agentcore"
 	"github.com/voocel/agentcore/llm"
+	"github.com/voocel/agentcore/subagent"
 	"github.com/voocel/agentcore/tools"
 )
 
@@ -28,7 +29,7 @@ func main() {
 	}
 
 	// Define sub-agent configurations (like pi's .md agent files)
-	scout := agentcore.SubAgentConfig{
+	scout := subagent.Config{
 		Name:         "scout",
 		Description:  "Fast codebase reconnaissance",
 		Model:        scoutModel,
@@ -40,7 +41,7 @@ func main() {
 		MaxTurns: 5,
 	}
 
-	reviewer := agentcore.SubAgentConfig{
+	reviewer := subagent.Config{
 		Name:         "reviewer",
 		Description:  "Code review specialist",
 		Model:        mainModel,
@@ -66,7 +67,7 @@ func main() {
 			tools.NewWrite("."),
 			tools.NewEdit("."),
 			tools.NewBash("."),
-			agentcore.NewSubAgentTool(scout, reviewer),
+			subagent.New(scout, reviewer),
 		),
 		agentcore.WithMaxTurns(20),
 	)

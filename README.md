@@ -22,10 +22,14 @@ A restrained core with open extensibility tends to be more reliable than a compl
 ## Architecture
 
 ```
-agentcore/            Agent core (types, loop, agent, events, subagent)
+agentcore/            Agent core (types, loop, agent, events)
 agentcore/llm/        LLM adapters (OpenAI, Anthropic, Gemini via litellm)
 agentcore/tools/      Built-in tools: read, write, edit, bash
 agentcore/context/    Context runtime — projection, rewrite, overflow recovery
+agentcore/task/       Background task registry (Runtime / Entry) shared by bash + subagent
+agentcore/subagent/   SubAgent tool — multi-agent via tool invocation
+agentcore/proxy/      ChatModel adapter that forwards calls to a remote proxy
+agentcore/permission/ Optional permission engine — wire via WithPermissionEngine
 ```
 
 Core design:
@@ -33,8 +37,8 @@ Core design:
 - **Standalone dual-loop core** (`loop.go`) — free function, all dependencies injected via parameters. Double loop: inner processes tool calls + steering, outer handles follow-up
 - **Stateful Agent** (`agent.go`) — sole consumer of loop events, updates internal state then dispatches to external listeners
 - **Event stream** — single `<-chan Event` output drives any UI (TUI, Web, Slack, logging)
-- **Two-stage pipeline** — `TransformContext` (prune/inject) → `ConvertToLLM` (filter to LLM messages)
-- **SubAgent tool** (`subagent.go`) — multi-agent via tool invocation, four modes: single, parallel, chain, background
+- **Context manager** — `ContextManager` drives prompt projection, overflow recovery, and (via auto-wiring) message conversion / token estimation
+- **SubAgent tool** (`subagent/`) — multi-agent via tool invocation, four modes: single, parallel, chain, background
 - **Context runtime** (`context/`) — projection, committed rewrite, and overflow recovery near the context window limit
 
 ## Quick Start
@@ -103,12 +107,20 @@ engine := permission.NewEngine(permission.EngineConfig{
 
 ### Multi-Agent (SubAgent Tool)
 
-Sub-agents are invoked as regular tools with isolated contexts:
+Sub-agents are invoked as regular tools with isolated contexts. Import the
+`agentcore/subagent` subpackage:
 
 ```go
+import (
+    "github.com/voocel/agentcore"
+    "github.com/voocel/agentcore/llm"
+    "github.com/voocel/agentcore/subagent"
+    "github.com/voocel/agentcore/tools"
+)
+
 model, _ := llm.NewOpenAIModel("gpt-5-mini", apiKey)
 
-scout := agentcore.SubAgentConfig{
+scout := subagent.Config{
     Name:         "scout",
     Description:  "Fast codebase reconnaissance",
     Model:        model,
@@ -117,7 +129,7 @@ scout := agentcore.SubAgentConfig{
     MaxTurns:     5,
 }
 
-worker := agentcore.SubAgentConfig{
+worker := subagent.Config{
     Name:         "worker",
     Description:  "General-purpose executor",
     Model:        model,
@@ -127,8 +139,20 @@ worker := agentcore.SubAgentConfig{
 
 agent := agentcore.NewAgent(
     agentcore.WithModel(model),
-    agentcore.WithTools(agentcore.NewSubAgentTool(scout, worker)),
+    agentcore.WithTools(subagent.New(scout, worker)),
 )
+```
+
+For background mode (async sub-agent runs that notify on completion), wire a
+shared task runtime:
+
+```go
+import "github.com/voocel/agentcore/task"
+
+rt := task.NewRuntime()
+sat := subagent.New(scout, worker)
+sat.SetTaskRuntime(rt)
+sat.SetNotifyFn(agent.FollowUp) // route completion notifications back to the parent
 ```
 
 Four execution modes via tool call:
@@ -202,7 +226,7 @@ agent.Subscribe(func(ev agentcore.Event) {
 
 ### Swappable Models
 
-When a model needs to change at runtime, wrap it with `SwappableModel`. The swap takes effect on the next call. `SubAgentConfig.Model` is resolved at the start of each sub-agent run, so the same wrapper also works for sub-agents.
+When a model needs to change at runtime, wrap it with `SwappableModel`. The swap takes effect on the next call. `subagent.Config.Model` is resolved at the start of each sub-agent run, so the same wrapper also works for sub-agents.
 
 ```go
 defaultModel, _ := llm.NewOpenAIModel("gpt-5-mini", apiKey)
@@ -214,18 +238,12 @@ nextModel, _ := llm.NewOpenAIModel("gpt-5", apiKey)
 sw.Swap(nextModel) // next turn uses the new model
 ```
 
-### Custom LLM (StreamFn)
+### Custom LLM Adapter
 
-Swap the LLM call with a proxy, mock, or custom implementation:
-
-```go
-agent := agentcore.NewAgent(
-    agentcore.WithStreamFn(func(ctx context.Context, req *agentcore.LLMRequest) (*agentcore.LLMResponse, error) {
-        // Route to your own proxy/gateway
-        return callMyProxy(ctx, req)
-    }),
-)
-```
+To swap the LLM call with a proxy, mock, or custom implementation, implement
+the `ChatModel` interface and pass it via `WithModel`. `SwappableModel` and
+the `agentcore/proxy` subpackage are built on this same interface and can
+serve as references.
 
 ### Context Compaction
 
@@ -255,32 +273,6 @@ When usage exceeds `ContextWindow - ReserveTokens` (default 16384), compaction:
 2. Summarizes older messages via LLM into a structured checkpoint (Goal / Progress / Key Decisions / Next Steps)
 3. Tracks file operations (read/write/edit paths) across compacted messages
 4. Supports incremental updates — subsequent compactions update the existing summary rather than re-summarizing
-
-### Context Pipeline
-
-For simpler transform-only pipelines, `WithContextPipeline` / `WithTransformContext` still work:
-
-```go
-agent := agentcore.NewAgent(
-    // Stage 1: prune old messages, inject external context
-    agentcore.WithTransformContext(func(ctx context.Context, msgs []agentcore.AgentMessage) ([]agentcore.AgentMessage, error) {
-        if len(msgs) > 100 {
-            msgs = msgs[len(msgs)-50:]
-        }
-        return msgs, nil
-    }),
-    // Stage 2: filter to LLM-compatible messages
-    agentcore.WithConvertToLLM(func(msgs []agentcore.AgentMessage) []agentcore.Message {
-        var out []agentcore.Message
-        for _, m := range msgs {
-            if msg, ok := m.(agentcore.Message); ok {
-                out = append(out, msg)
-            }
-        }
-        return out
-    }),
-)
-```
 
 ## Built-in Tools
 
@@ -336,6 +328,7 @@ Use the lower-level APIs when you need stricter control:
 | `State()` | Snapshot of current state |
 | `ExportMessages()` | Export messages for serialization |
 | `ImportMessages(msgs)` | Import deserialized messages |
+| `BuildLLMMessages()` | Materialize the next-call prompt (system → projected history). Always repairs malformed tool-call/result sequences via `RepairMessageSequence`; for fail-fast assertions in tests, call `AssertMessageSequence` directly. |
 
 ## License
 
