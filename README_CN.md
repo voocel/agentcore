@@ -17,7 +17,7 @@ go get github.com/voocel/agentcore
 ## 稳定性
 
 - 优先稳定 `Agent`、`AgentLoop`、`Event`、`Tool`、`Message` 这些核心接口
-- 行为变化先补测试，再更新说明；`examples/` 与内部实现细节不视为稳定 API
+- `examples/` 与内部实现细节不视为稳定 API
 
 ## 架构
 
@@ -29,17 +29,15 @@ agentcore/context/    上下文运行时 —— 投影、重写、溢出恢复
 agentcore/task/       后台任务注册中心（Runtime / Entry），bash + subagent 共用
 agentcore/subagent/   SubAgent 工具 —— 通过工具调用实现多 Agent
 agentcore/proxy/      ChatModel 适配器，把 LLM 调用转发到远程代理
-agentcore/permission/ 可选权限引擎，通过 WithPermissionEngine 接入
+agentcore/permission/ 可选权限引擎，自行适配为 ToolGate
 ```
 
 核心设计：
 
-- **无状态双循环核心**（`loop.go`）—— 无结构体依赖，所有输入通过参数注入。双层循环：内层处理工具调用 + steering 中断，外层处理 follow-up 续接
-- **有状态 Agent**（`agent.go`）—— 作为循环事件的唯一消费者，更新内部状态后分发给外部监听者
+- **无状态循环 + 有状态 Agent** —— `loop.go` 是 free function，所有输入通过参数注入；`agent.go` 作为循环事件的唯一消费者，更新内部状态后分发给外部监听者。双层循环：内层处理工具调用 + steering，外层处理 follow-up
 - **事件流** —— 单一 `<-chan Event` 输出，驱动任何 UI（TUI、Web、Slack、日志）
-- **上下文管理器** —— `ContextManager` 负责 prompt 投影、溢出恢复，并通过自动接入完成消息转换/token 估算
+- **上下文层** —— `ContextManager`（接口）+ `agentcore/context`（默认引擎）共同负责 prompt 投影、溢出恢复，并自动接入消息转换与 token 估算
 - **SubAgent 工具**（`subagent/`）—— 通过工具调用实现多 Agent，四种模式：single、parallel、chain、background
-- **上下文运行时**（`context/`）—— 接近上下文窗口上限时执行投影、正式重写与溢出恢复
 
 ## 快速开始
 
@@ -54,7 +52,6 @@ import (
 
     "github.com/voocel/agentcore"
     "github.com/voocel/agentcore/llm"
-    "github.com/voocel/agentcore/permission"
     "github.com/voocel/agentcore/tools"
 )
 
@@ -73,10 +70,6 @@ func main() {
             tools.NewEdit("."),
             tools.NewBash("."),
         ),
-        agentcore.WithPermissionEngine(permission.NewEngine(permission.EngineConfig{
-            Workspace: ".",
-            Mode:      permission.ModeBalanced,
-        })),
     )
 
     agent.Subscribe(func(ev agentcore.Event) {
@@ -92,18 +85,23 @@ func main() {
 }
 ```
 
-如果需要更严格的控制，使用 `agentcore.WithPermissionEngine(...)` 注入自定义决策引擎。
+如果需要工具调用拦截，注册一个 `ToolGate` ——参数校验后、工具执行前调用一次的钩子。核心本身不做任何权限判定，策略由用户提供。
 
 ```go
-engine := permission.NewEngine(permission.EngineConfig{
-    Workspace: ".",
-    Mode:      permission.ModeStrict,
-    Roots: permission.FilesystemRoots{
-        ReadRoots:  []string{"."},
-        WriteRoots: []string{"."},
-    },
-})
+gate := func(ctx context.Context, req agentcore.GateRequest) (*agentcore.GateDecision, error) {
+    if req.Call.Name == "bash" {
+        return &agentcore.GateDecision{Allowed: false, Reason: "禁止执行 bash"}, nil
+    }
+    return &agentcore.GateDecision{Allowed: true}, nil
+}
+
+agent := agentcore.NewAgent(
+    // ... model, tools 等
+    agentcore.WithToolGate(gate),
+)
 ```
+
+可选的 `agentcore/permission` 子包提供更完整的决策引擎（模式、规则、文件系统根、审计）。几行 wrapper 即可适配为 `ToolGate`。
 
 ### 多 Agent（SubAgent 工具）
 
@@ -169,18 +167,30 @@ LLM 通过工具调用触发四种执行模式：
 {"agent": "worker", "task": "运行完整测试套件", "background": true, "description": "正在执行测试"}
 ```
 
-### Steering 与 Follow-Up
+### Steering 与注入
+
+`Inject(msg)` 根据 Agent 当前状态自动派发消息——当调用方意图是「尽快送达」、不想自己判断 running / idle 时使用：
 
 ```go
-// 中断：在当前工具执行完毕后注入，跳过剩余工具
-agent.Steer(agentcore.UserMsg("停下来，改为专注于测试。"))
-
-// 续接：排队等 agent 完成后处理
-agent.FollowUp(agentcore.UserMsg("现在运行测试。"))
-
-// 立即取消
-agent.Abort()
+result, _ := agent.Inject(agentcore.UserMsg("结束前先重新检查未完成任务。"))
+fmt.Println(result.Disposition)
 ```
+
+三种结果：
+
+- `steered_current_run` —— 当前正在运行，消息进入本轮 steering 路径
+- `resumed_idle_run` —— 当前空闲且会话尾部是 assistant，消息入队后立即触发 `Continue()`
+- `queued` —— 消息已入队，但没有立即启动新 run
+
+需要更精确控制时直接使用低层 API：
+
+```go
+agent.Steer(agentcore.UserMsg("停下来，改为专注于测试。")) // 中断当前工具序列
+agent.FollowUp(agentcore.UserMsg("现在运行测试。"))       // 排到当前 run 结束之后
+agent.Abort()                                            // 立即取消
+```
+
+如果消息必须并入「下一次显式用户输入」（而不是 Agent 队列），应继续放在应用层处理。
 
 ### 事件流
 
@@ -261,8 +271,6 @@ agent := agentcore.NewAgent(
 
 当 `ContextManager` 实现了相关可选能力接口时，`NewAgent` 会自动接入消息转换、token 估算和 context window，无需再手动配置。
 
-每次 LLM 调用前，`ContextManager` 会先构造下一次请求要看的投影视图。如果某次重写应该正式成为新的运行时基线，它可以返回 `ShouldCommit=true` 和 `CommitMessages`，循环会先替换内存里的基线消息，再继续运行。
-
 当使用量超出 `ContextWindow - ReserveTokens`（默认 16384）时，压缩会：
 
 1. 保留最近消息（默认 20000 tokens）
@@ -278,30 +286,6 @@ agent := agentcore.NewAgent(
 | `write` | 写入文件，自动创建目录 |
 | `edit` | 精确文本替换，支持模糊匹配、BOM/行ending 归一化、unified diff 输出 |
 | `bash` | 执行 shell 命令，tail 截断（2000 行 / 50KB） |
-
-## 运行时注入
-
-当调用方的意图是“让这条消息尽快送达”，而不想自己判断当前是运行中还是空闲时，使用 `Inject(msg)`。
-
-```go
-result, err := agent.Inject(agentcore.UserMsg("结束前先重新检查未完成任务。"))
-if err != nil {
-    panic(err)
-}
-fmt.Println(result.Disposition)
-```
-
-`Inject` 有三种结果：
-
-- `steered_current_run`：当前正在运行，消息进入本轮 steering 路径
-- `resumed_idle_run`：当前空闲且会话尾部是 assistant，消息入队后立即触发 `Continue()`
-- `queued`：消息已入队，但没有立即启动新 run
-
-需要更强控制时，继续使用低层 API：
-
-- `Steer(msg)`：只走 steering 队列，不附带 idle 自动续跑
-- `FollowUp(msg)`：排到当前 run 结束之后
-- prompt 侧注入：如果消息必须并入“下一次显式用户输入”，应继续放在应用层处理，而不是混入 agent 队列
 
 ## API 参考
 
@@ -323,7 +307,7 @@ fmt.Println(result.Disposition)
 | `State()` | 获取当前状态快照 |
 | `ExportMessages()` | 导出消息用于序列化 |
 | `ImportMessages(msgs)` | 导入反序列化的消息 |
-| `BuildLLMMessages()` | 物化下一次 LLM 调用的提示（system → 投影后的历史）。始终通过 `RepairMessageSequence` 修复 tool-call/result 序列；如需测试时严格断言，请直接调用 `AssertMessageSequence`。 |
+| `BuildLLMMessages()` | 物化下一次 LLM 调用的提示（system → 投影后的历史） |
 
 ## 许可证
 

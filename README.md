@@ -17,7 +17,7 @@ A restrained core with open extensibility tends to be more reliable than a compl
 ## Stability
 
 - Keep `Agent`, `AgentLoop`, `Event`, `Tool`, and `Message` stable first
-- Behavioral changes should come with tests first; `examples/` and internal implementation details are not stable API
+- `examples/` and internal implementation details are not stable API
 
 ## Architecture
 
@@ -29,17 +29,15 @@ agentcore/context/    Context runtime — projection, rewrite, overflow recovery
 agentcore/task/       Background task registry (Runtime / Entry) shared by bash + subagent
 agentcore/subagent/   SubAgent tool — multi-agent via tool invocation
 agentcore/proxy/      ChatModel adapter that forwards calls to a remote proxy
-agentcore/permission/ Optional permission engine — wire via WithPermissionEngine
+agentcore/permission/ Optional permission engine — adapt to ToolGate yourself
 ```
 
 Core design:
 
-- **Standalone dual-loop core** (`loop.go`) — free function, all dependencies injected via parameters. Double loop: inner processes tool calls + steering, outer handles follow-up
-- **Stateful Agent** (`agent.go`) — sole consumer of loop events, updates internal state then dispatches to external listeners
+- **Standalone loop + stateful Agent** — `loop.go` is a free function with all dependencies injected; `agent.go` is the sole consumer of loop events, updating internal state and dispatching to listeners. Double loop: inner processes tool calls + steering, outer handles follow-up
 - **Event stream** — single `<-chan Event` output drives any UI (TUI, Web, Slack, logging)
-- **Context manager** — `ContextManager` drives prompt projection, overflow recovery, and (via auto-wiring) message conversion / token estimation
+- **Context layer** — `ContextManager` (interface) + `agentcore/context` (default engine) drive prompt projection, overflow recovery, and—via auto-wiring—message conversion and token estimation
 - **SubAgent tool** (`subagent/`) — multi-agent via tool invocation, four modes: single, parallel, chain, background
-- **Context runtime** (`context/`) — projection, committed rewrite, and overflow recovery near the context window limit
 
 ## Quick Start
 
@@ -54,7 +52,6 @@ import (
 
     "github.com/voocel/agentcore"
     "github.com/voocel/agentcore/llm"
-    "github.com/voocel/agentcore/permission"
     "github.com/voocel/agentcore/tools"
 )
 
@@ -73,10 +70,6 @@ func main() {
             tools.NewEdit("."),
             tools.NewBash("."),
         ),
-        agentcore.WithPermissionEngine(permission.NewEngine(permission.EngineConfig{
-            Workspace: ".",
-            Mode:      permission.ModeBalanced,
-        })),
     )
 
     agent.Subscribe(func(ev agentcore.Event) {
@@ -92,18 +85,23 @@ func main() {
 }
 ```
 
-For stricter control, pass a custom decision engine with `agentcore.WithPermissionEngine(...)`.
+For tool-call gating, register a `ToolGate` — a single hook called once per tool call after argument validation. The kernel implements no permission policy of its own; gates are user-supplied.
 
 ```go
-engine := permission.NewEngine(permission.EngineConfig{
-    Workspace: ".",
-    Mode:      permission.ModeStrict,
-    Roots: permission.FilesystemRoots{
-        ReadRoots:  []string{"."},
-        WriteRoots: []string{"."},
-    },
-})
+gate := func(ctx context.Context, req agentcore.GateRequest) (*agentcore.GateDecision, error) {
+    if req.Call.Name == "bash" {
+        return &agentcore.GateDecision{Allowed: false, Reason: "bash disabled"}, nil
+    }
+    return &agentcore.GateDecision{Allowed: true}, nil
+}
+
+agent := agentcore.NewAgent(
+    // ... model, tools, etc.
+    agentcore.WithToolGate(gate),
+)
 ```
+
+The optional `agentcore/permission` subpackage offers a richer decision engine (modes, rules, filesystem roots, audit). Adapt it to `ToolGate` with a small wrapper.
 
 ### Multi-Agent (SubAgent Tool)
 
@@ -171,18 +169,30 @@ Four execution modes via tool call:
 {"agent": "worker", "task": "Run full test suite", "background": true, "description": "Running tests"}
 ```
 
-### Steering & Follow-Up
+### Steering & Injection
+
+`Inject(msg)` delivers a message according to the agent's current state — preferred when the caller's intent is "deliver this as soon as possible" without manually branching on running vs idle:
 
 ```go
-// Interrupt mid-run (delivered after current tool, remaining tools skipped)
-agent.Steer(agentcore.UserMsg("Stop and focus on tests instead."))
-
-// Queue for after the agent finishes
-agent.FollowUp(agentcore.UserMsg("Now run the tests."))
-
-// Cancel immediately
-agent.Abort()
+result, _ := agent.Inject(agentcore.UserMsg("Re-check unfinished tasks before stopping."))
+fmt.Println(result.Disposition)
 ```
+
+Outcomes:
+
+- `steered_current_run` — agent was running; message went into the current run's steering path
+- `resumed_idle_run` — agent was idle with an assistant-tail conversation; message queued and `Continue()` started
+- `queued` — message queued, no run started
+
+For finer control, use the lower-level APIs directly:
+
+```go
+agent.Steer(agentcore.UserMsg("Stop and focus on tests instead.")) // mid-run interrupt
+agent.FollowUp(agentcore.UserMsg("Now run the tests."))            // queue for after current run
+agent.Abort()                                                      // cancel immediately
+```
+
+If a message must be merged into the next explicit user prompt (rather than the agent's queues), keep that in the application layer.
 
 ### Event Stream
 
@@ -265,8 +275,6 @@ agent := agentcore.NewAgent(
 
 `NewAgent` auto-wires `ConvertToLLM`, token estimation, and context window from the context manager when available.
 
-On each LLM call, the context manager first builds a projected prompt view for the next model request. When a rewrite should become the new runtime baseline, it can return `ShouldCommit=true` with `CommitMessages`, and the loop will replace the in-memory baseline before continuing.
-
 When usage exceeds `ContextWindow - ReserveTokens` (default 16384), compaction:
 
 1. Keeps recent messages (default 20000 tokens)
@@ -282,31 +290,6 @@ When usage exceeds `ContextWindow - ReserveTokens` (default 16384), compaction:
 | `write` | Write file with auto-mkdir |
 | `edit` | Exact text replacement with fuzzy match, BOM/line-ending normalization, unified diff output |
 | `bash` | Execute shell commands with tail truncation (2000 lines / 50KB) |
-
-## Runtime Injection
-
-Use `Inject(msg)` when the caller's intent is "deliver this as soon as the current
-agent state allows" without manually branching on running vs idle state.
-
-```go
-result, err := agent.Inject(agentcore.UserMsg("Re-check unfinished tasks before stopping."))
-if err != nil {
-    panic(err)
-}
-fmt.Println(result.Disposition)
-```
-
-`Inject` has three outcomes:
-
-- `steered_current_run`: the agent is running, so the message was queued into the current run's steering path
-- `resumed_idle_run`: the agent was idle with an assistant-tail conversation, so the message was queued and `Continue()` was started immediately
-- `queued`: the message was queued, but no run was started
-
-Use the lower-level APIs when you need stricter control:
-
-- `Steer(msg)`: queue for the steering path without any idle auto-resume logic
-- `FollowUp(msg)`: queue for after the current run stops
-- prompt-side injection: keep this in the application layer if the message must be merged into the next explicit user prompt rather than the agent queues
 
 ## API Reference
 
@@ -328,7 +311,7 @@ Use the lower-level APIs when you need stricter control:
 | `State()` | Snapshot of current state |
 | `ExportMessages()` | Export messages for serialization |
 | `ImportMessages(msgs)` | Import deserialized messages |
-| `BuildLLMMessages()` | Materialize the next-call prompt (system → projected history). Always repairs malformed tool-call/result sequences via `RepairMessageSequence`; for fail-fast assertions in tests, call `AssertMessageSequence` directly. |
+| `BuildLLMMessages()` | Materialize the next-call prompt (system → projected history) |
 
 ## License
 
