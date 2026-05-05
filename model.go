@@ -119,11 +119,6 @@ type LoopConfig struct {
 	// Nil (default) means every stop is allowed.
 	StopGuard StopGuard
 
-	// OnMaxTurns selects the behavior when MaxTurns is exhausted.
-	// Default (MaxTurnsTerminate) emits an error and ends the run.
-	// MaxTurnsSoftRestart resets the turn counter and continues the loop.
-	OnMaxTurns MaxTurnsAction
-
 	// ToolsAreIdempotent declares that all registered tools are safe to re-execute
 	// with the same arguments — i.e. running them twice produces the same observable
 	// state as running them once. When true, the retry loop will not bail out just

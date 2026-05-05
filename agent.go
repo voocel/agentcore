@@ -2,7 +2,6 @@ package agentcore
 
 import (
 	"context"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"strings"
@@ -29,29 +28,26 @@ type AgentState struct {
 // It consumes loop events to update internal state, just like any external listener.
 type Agent struct {
 	// Configuration (set via options)
-	model               ChatModel
-	systemPrompt        string
-	systemBlocks        []SystemBlock
-	tools               []Tool
-	maxTurns            int
-	maxRetries          int
-	maxToolErrors       int
-	thinkingLevel       ThinkingLevel
-	contextManager      ContextManager
-	convertToLLM        func([]AgentMessage) []Message
-	contextWindow       int
-	contextEstimateFn   ContextEstimateFn
-	permissionEngine    permission.DecisionEngine
-	middlewares         []ToolMiddleware
-	maxToolConcurrency  int
-	toolsAreIdempotent  bool
-	onMessage           func(AgentMessage)
-	taskRuntime         *TaskRuntime
-	reminderGens        []ReminderGenerator
-	stopGuard           StopGuard
-	onMaxTurns          MaxTurnsAction
-	stopAfterTool       func(toolName string) bool
-	stopAfterToolResult func(toolName string, result json.RawMessage) bool
+	model              ChatModel
+	systemPrompt       string
+	systemBlocks       []SystemBlock
+	tools              []Tool
+	maxTurns           int
+	maxRetries         int
+	maxToolErrors      int
+	thinkingLevel      ThinkingLevel
+	contextManager     ContextManager
+	convertToLLM       func([]AgentMessage) []Message
+	contextWindow      int
+	contextEstimateFn  ContextEstimateFn
+	permissionEngine   permission.DecisionEngine
+	middlewares        []ToolMiddleware
+	maxToolConcurrency int
+	toolsAreIdempotent bool
+	onMessage          func(AgentMessage)
+	taskRuntime        *TaskRuntime
+	reminderGens       []ReminderGenerator
+	stopGuard          StopGuard
 
 	// State
 	messages         []AgentMessage
@@ -76,10 +72,10 @@ type Agent struct {
 
 // NewAgent creates a new Agent with the given options.
 //
-// When a ContextManager is set, the agent automatically wires ConvertToLLM and
-// ContextEstimate from the manager if the manager implements the optional
-// ContextLLMConverter and/or ContextEstimator interfaces — no need to set them
-// manually.
+// When a ContextManager is set, the agent auto-wires ConvertToLLM, the
+// context-token estimator, and the context window from the manager when it
+// implements the optional ContextLLMConverter / ContextEstimator /
+// ContextWindower interfaces.
 func NewAgent(opts ...AgentOption) *Agent {
 	a := &Agent{
 		maxTurns:         defaultMaxTurns,
@@ -91,23 +87,15 @@ func NewAgent(opts ...AgentOption) *Agent {
 	for _, opt := range opts {
 		opt(a)
 	}
-	// Auto-wire ConvertToLLM and ContextEstimate from ContextManager if
-	// the manager provides them and the user hasn't set them explicitly.
 	if a.contextManager != nil {
-		if a.convertToLLM == nil {
-			if c, ok := a.contextManager.(ContextLLMConverter); ok {
-				a.convertToLLM = c.ConvertToLLM
-			}
+		if c, ok := a.contextManager.(ContextLLMConverter); ok {
+			a.convertToLLM = c.ConvertToLLM
 		}
-		if a.contextEstimateFn == nil {
-			if e, ok := a.contextManager.(ContextEstimator); ok {
-				a.contextEstimateFn = e.EstimateContext
-			}
+		if e, ok := a.contextManager.(ContextEstimator); ok {
+			a.contextEstimateFn = e.EstimateContext
 		}
-		if a.contextWindow <= 0 {
-			if w, ok := a.contextManager.(ContextWindower); ok {
-				a.contextWindow = w.ContextWindow()
-			}
+		if w, ok := a.contextManager.(ContextWindower); ok {
+			a.contextWindow = w.ContextWindow()
 		}
 	}
 	return a
@@ -646,10 +634,7 @@ func (a *Agent) buildConfig() LoopConfig {
 		OnMessage:             a.onMessage,
 		ReminderGens:          a.reminderGens,
 		StopGuard:             a.stopGuard,
-		OnMaxTurns:            a.onMaxTurns,
 		ToolsAreIdempotent:    a.toolsAreIdempotent,
-		StopAfterTool:         a.stopAfterTool,
-		StopAfterToolResult:   a.stopAfterToolResult,
 	}
 }
 

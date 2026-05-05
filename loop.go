@@ -173,14 +173,9 @@ func runLoop(ctx context.Context, currentCtx *AgentContext, newMessages *[]Agent
 			}
 
 			if turnCount >= maxTurns {
-				if config.OnMaxTurns != MaxTurnsSoftRestart {
-					emit(ch, Event{Type: EventError, Err: fmt.Errorf("max turns (%d) reached", maxTurns)})
-					emit(ch, Event{Type: EventAgentEnd, NewMessages: *newMessages, Summary: buildSummary(turnCount, EndReasonMaxTurns)})
-					return
-				}
-				// Soft restart: reset the counter and keep going.
-				turnCount = 0
-				lengthRecoveryCount = 0
+				emit(ch, Event{Type: EventError, Err: fmt.Errorf("max turns (%d) reached", maxTurns)})
+				emit(ch, Event{Type: EventAgentEnd, NewMessages: *newMessages, Summary: buildSummary(turnCount, EndReasonMaxTurns)})
+				return
 			}
 
 			if !firstTurn {

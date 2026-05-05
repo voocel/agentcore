@@ -1,8 +1,6 @@
 package agentcore
 
 import (
-	"encoding/json"
-
 	"github.com/voocel/agentcore/permission"
 )
 
@@ -72,27 +70,11 @@ func WithToolsAreIdempotent(idempotent bool) AgentOption {
 
 // WithContextManager sets the context lifecycle manager.
 // When configured, it drives prompt projection, overflow recovery, and usage
-// reporting. ConvertToLLM and ContextEstimate are auto-wired from the manager
-// when it implements the corresponding optional interfaces.
+// reporting. The agent auto-wires ConvertToLLM, context-token estimation,
+// and the context window from the manager when it implements the optional
+// ContextLLMConverter / ContextEstimator / ContextWindower interfaces.
 func WithContextManager(mgr ContextManager) AgentOption {
 	return func(a *Agent) { a.contextManager = mgr }
-}
-
-// WithConvertToLLM sets the message conversion function.
-func WithConvertToLLM(fn func([]AgentMessage) []Message) AgentOption {
-	return func(a *Agent) { a.convertToLLM = fn }
-}
-
-// WithContextWindow sets the model's context window size in tokens.
-// Used by ContextUsage() to calculate context occupancy percentage.
-func WithContextWindow(n int) AgentOption {
-	return func(a *Agent) { a.contextWindow = n }
-}
-
-// WithContextEstimate sets the context token estimation function.
-// Use context.ContextEstimateAdapter for the default hybrid estimation.
-func WithContextEstimate(fn ContextEstimateFn) AgentOption {
-	return func(a *Agent) { a.contextEstimateFn = fn }
 }
 
 // ---------------------------------------------------------------------------
@@ -162,38 +144,4 @@ func WithReminderGenerator(gen ReminderGenerator) AgentOption {
 // every stop is allowed — legacy behavior.
 func WithStopGuard(guard StopGuard) AgentOption {
 	return func(a *Agent) { a.stopGuard = guard }
-}
-
-// MaxTurnsAction selects the behavior when MaxTurns is reached.
-type MaxTurnsAction int
-
-const (
-	// MaxTurnsTerminate (default) emits an error event and ends the run.
-	MaxTurnsTerminate MaxTurnsAction = iota
-	// MaxTurnsSoftRestart resets the internal turn counter to 0 and continues
-	// the loop. Useful for very long runs where MaxTurns is a soft upper bound.
-	MaxTurnsSoftRestart
-)
-
-// WithOnMaxTurns configures what happens when the MaxTurns safety limit is
-// reached. The default is MaxTurnsTerminate.
-func WithOnMaxTurns(action MaxTurnsAction) AgentOption {
-	return func(a *Agent) { a.onMaxTurns = action }
-}
-
-// WithStopAfterTool installs a predicate that ends the agent run after a
-// successful execution of any tool whose name returns true. The terminating
-// tool's result is committed to history before the run exits.
-//
-// Use cases: terminal tools (e.g. commit_chapter, exit_plan_mode) that
-// shouldn't waste another LLM turn after they succeed.
-func WithStopAfterTool(fn func(toolName string) bool) AgentOption {
-	return func(a *Agent) { a.stopAfterTool = fn }
-}
-
-// WithStopAfterToolResult installs a result-aware predicate that ends the
-// agent run after a successful tool execution whose structured result returns
-// true. The terminating tool's result is committed to history before exit.
-func WithStopAfterToolResult(fn func(toolName string, result json.RawMessage) bool) AgentOption {
-	return func(a *Agent) { a.stopAfterToolResult = fn }
 }
