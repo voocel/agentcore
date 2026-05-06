@@ -160,6 +160,32 @@ type CallConfig struct {
 	SessionID      string // provider session caching identifier
 	MaxTokens      int    // per-call max tokens override, 0 = use model default
 	ToolChoice     any    // "auto" / "required" / "none" / {"type":"tool","name":"xxx"}, nil = provider default
+	ResponseFormat *ResponseFormat
+}
+
+const (
+	ResponseFormatText       = "text"
+	ResponseFormatJSONObject = "json_object"
+	ResponseFormatJSONSchema = "json_schema"
+)
+
+// ResponseFormat controls provider-native structured output.
+//
+// JSON object mode asks the model to return valid JSON. JSON schema mode asks
+// compatible providers to constrain the final response to the supplied schema.
+// Callers should still unmarshal and validate model output like any external
+// input.
+type ResponseFormat struct {
+	Type       string      `json:"type"`
+	JSONSchema *JSONSchema `json:"json_schema,omitempty"`
+}
+
+// JSONSchema describes the provider-native JSON schema response format.
+type JSONSchema struct {
+	Name        string `json:"name"`
+	Description string `json:"description,omitempty"`
+	Schema      any    `json:"schema"`
+	Strict      *bool  `json:"strict,omitempty"`
 }
 
 // ResolveCallConfig applies options and returns the resolved config.
@@ -201,6 +227,33 @@ func WithMaxTokens(tokens int) CallOption {
 // Accepted values: "auto" (default), "required" (must call a tool), "none" (no tools).
 func WithToolChoice(choice any) CallOption {
 	return func(c *CallConfig) { c.ToolChoice = choice }
+}
+
+// WithJSONMode requests valid JSON output without enforcing a specific schema.
+func WithJSONMode() CallOption {
+	return func(c *CallConfig) {
+		c.ResponseFormat = &ResponseFormat{Type: ResponseFormatJSONObject}
+	}
+}
+
+// WithJSONSchema requests structured JSON output constrained by a JSON Schema.
+func WithJSONSchema(name, description string, schema any, strict bool) CallOption {
+	return func(c *CallConfig) {
+		c.ResponseFormat = &ResponseFormat{
+			Type: ResponseFormatJSONSchema,
+			JSONSchema: &JSONSchema{
+				Name:        name,
+				Description: description,
+				Schema:      schema,
+				Strict:      &strict,
+			},
+		}
+	}
+}
+
+// WithResponseFormat sets a provider-native response format explicitly.
+func WithResponseFormat(format *ResponseFormat) CallOption {
+	return func(c *CallConfig) { c.ResponseFormat = format }
 }
 
 // ---------------------------------------------------------------------------

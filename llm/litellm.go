@@ -517,8 +517,8 @@ func mapStopReason(reason string) agentcore.StopReason {
 	}
 }
 
-// applyCallConfig resolves CallOptions once and applies API key, thinking, and
-// session config to the litellm request.
+// applyCallConfig resolves CallOptions once and applies API key, thinking,
+// session config, and response format to the litellm request.
 func applyCallConfig(req *litellm.Request, opts []agentcore.CallOption) {
 	callCfg := agentcore.ResolveCallConfig(opts)
 
@@ -560,6 +560,28 @@ func applyCallConfig(req *litellm.Request, opts []agentcore.CallOption) {
 	if callCfg.ToolChoice != nil {
 		req.ToolChoice = callCfg.ToolChoice
 	}
+
+	if callCfg.ResponseFormat != nil {
+		req.ResponseFormat = convertResponseFormat(callCfg.ResponseFormat)
+	}
+}
+
+func convertResponseFormat(format *agentcore.ResponseFormat) *litellm.ResponseFormat {
+	if format == nil {
+		return nil
+	}
+	out := &litellm.ResponseFormat{
+		Type: format.Type,
+	}
+	if format.JSONSchema != nil {
+		out.JSONSchema = &litellm.JSONSchema{
+			Name:        format.JSONSchema.Name,
+			Description: format.JSONSchema.Description,
+			Schema:      format.JSONSchema.Schema,
+			Strict:      format.JSONSchema.Strict,
+		}
+	}
+	return out
 }
 
 func applyToolConfig(request *litellm.Request, tools []agentcore.ToolSpec) {
