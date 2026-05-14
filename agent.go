@@ -26,26 +26,26 @@ type AgentState struct {
 // It consumes loop events to update internal state, just like any external listener.
 type Agent struct {
 	// Configuration (set via options)
-	model                ChatModel
-	systemPrompt         string
-	systemBlocks         []SystemBlock
-	tools                []Tool
-	maxTurns             int
-	maxRetries           int
-	maxToolErrors        int
-	thinkingLevel        ThinkingLevel
-	contextManager       ContextManager
-	convertToLLM         func([]AgentMessage) []Message
-	contextWindow        int
-	contextEstimateFn    ContextEstimateFn
-	toolGate             ToolGate
-	middlewares          []ToolMiddleware
-	maxToolConcurrency   int
-	toolsAreIdempotent   bool
-	onMessage            func(AgentMessage)
-	reminderGens         []ReminderGenerator
-	stopGuard            StopGuard
-	cacheLastUserMessage string
+	model              ChatModel
+	systemPrompt       string
+	systemBlocks       []SystemBlock
+	tools              []Tool
+	maxTurns           int
+	maxRetries         int
+	maxToolErrors      int
+	thinkingLevel      ThinkingLevel
+	contextManager     ContextManager
+	convertToLLM       func([]AgentMessage) []Message
+	contextWindow      int
+	contextEstimateFn  ContextEstimateFn
+	toolGate           ToolGate
+	middlewares        []ToolMiddleware
+	maxToolConcurrency int
+	toolsAreIdempotent bool
+	onMessage          func(AgentMessage)
+	reminderGens       []ReminderGenerator
+	stopGuard          StopGuard
+	cacheLastMessage   string
 
 	// State
 	messages         []AgentMessage
@@ -608,7 +608,7 @@ func (a *Agent) buildConfig() LoopConfig {
 		ReminderGens:          a.reminderGens,
 		StopGuard:             a.stopGuard,
 		ToolsAreIdempotent:    a.toolsAreIdempotent,
-		CacheLastUserMessage:  a.cacheLastUserMessage,
+		CacheLastMessage:      a.cacheLastMessage,
 	}
 }
 

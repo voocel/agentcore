@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"maps"
 	"math"
+	"slices"
 	"sort"
 	"strings"
 	"time"
@@ -572,14 +573,15 @@ func callLLM(ctx context.Context, agentCtx *AgentContext, config LoopConfig, ch 
 		}
 	}
 
-	// Place a single cache write breakpoint on the last user message when the
-	// application has opted into explicit cache orchestration. The helper scans
-	// by role=user from the tail, so trailing per-turn reminders (system role)
-	// are naturally skipped — the breakpoint lands on the user turn and covers
-	// the stable prefix (system blocks + tools + history). Reminders stay
-	// outside the cached region, which is what we want: they change every turn.
-	if config.CacheLastUserMessage != "" {
-		llmMessages = markLastUserMessageForCache(llmMessages, config.CacheLastUserMessage)
+	// Place a single cache write breakpoint on the last non-system message when
+	// the application has opted into explicit cache orchestration. The helper
+	// scans from the tail and skips system reminders, so the breakpoint lands
+	// on the freshest user input / tool_result / assistant turn — whichever is
+	// last in this request. Inside a tool loop this means each LLM call writes
+	// an entry covering the latest tool_use+tool_result, so the next call in
+	// the loop reads them from cache instead of re-uploading.
+	if config.CacheLastMessage != "" {
+		llmMessages = markLastMessageForCache(llmMessages, config.CacheLastMessage)
 	}
 
 	if config.Model == nil {
@@ -599,13 +601,15 @@ func callLLM(ctx context.Context, agentCtx *AgentContext, config LoopConfig, ch 
 	return callLLMStream(ctx, config.Model, llmMessages, toolSpecs, callOpts, ch, hooks)
 }
 
-// markLastUserMessageForCache returns a copy of messages with cache_control
-// attached to the metadata of the last user message. The caller's slice and
-// the original Message values are left untouched.
-func markLastUserMessageForCache(messages []Message, cacheControl string) []Message {
+// markLastMessageForCache returns a copy of messages with cache_control attached
+// to the metadata of the last non-system message. System messages are skipped so
+// trailing per-turn reminders (which change every turn) don't end up carrying
+// the breakpoint. The caller's slice and the original Message values are left
+// untouched.
+func markLastMessageForCache(messages []Message, cacheControl string) []Message {
 	idx := -1
 	for i := len(messages) - 1; i >= 0; i-- {
-		if messages[i].Role == RoleUser {
+		if messages[i].Role != RoleSystem {
 			idx = i
 			break
 		}
@@ -613,14 +617,13 @@ func markLastUserMessageForCache(messages []Message, cacheControl string) []Mess
 	if idx < 0 {
 		return messages
 	}
-	out := make([]Message, len(messages))
-	copy(out, messages)
-	target := out[idx]
-	md := make(map[string]any, len(target.Metadata)+1)
-	maps.Copy(md, target.Metadata)
+	out := slices.Clone(messages)
+	md := maps.Clone(out[idx].Metadata)
+	if md == nil {
+		md = map[string]any{}
+	}
 	md["cache_control"] = cacheControl
-	target.Metadata = md
-	out[idx] = target
+	out[idx].Metadata = md
 	return out
 }
 

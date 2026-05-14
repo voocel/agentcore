@@ -38,16 +38,22 @@ func WithThinkingLevel(level ThinkingLevel) AgentOption {
 	return func(a *Agent) { a.thinkingLevel = level }
 }
 
-// WithCacheLastUserMessage tags the last user message with cache_control before
-// every LLM call. Providers that support prompt caching (Anthropic, Bedrock)
-// place a write breakpoint at that position, covering the entire preceding
-// prefix (system blocks + conversation history + tools).
+// WithCacheLastMessage tags the last non-system message with cache_control
+// before every LLM call. Providers that support prompt caching (Anthropic,
+// Bedrock) place a write breakpoint at that position, covering the entire
+// preceding prefix (system blocks + conversation history + tools).
+//
+// The marker lands on whichever turn is freshest — user input, tool_result,
+// or assistant — and skips trailing per-turn system reminders. Inside a tool
+// loop this means each LLM call writes a cache entry covering the latest
+// tool_use+tool_result, so the next call reads them from cache instead of
+// re-uploading.
 //
 // Pass "" (default) to leave messages untouched. Pass "ephemeral" for the
 // standard 5-minute TTL, or any provider-recognized value. Use this when the
 // application — not the LLM library — owns cache placement.
-func WithCacheLastUserMessage(cacheControl string) AgentOption {
-	return func(a *Agent) { a.cacheLastUserMessage = cacheControl }
+func WithCacheLastMessage(cacheControl string) AgentOption {
+	return func(a *Agent) { a.cacheLastMessage = cacheControl }
 }
 
 // ---------------------------------------------------------------------------

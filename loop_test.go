@@ -1620,3 +1620,107 @@ func streamAssistantToolCalls(text string, stop StopReason, delay time.Duration,
 		}
 	}
 }
+
+func TestMarkLastMessageForCache_TagsLastNonSystemMessage(t *testing.T) {
+	cases := []struct {
+		name      string
+		lastRole  Role
+		buildLast func() Message
+	}{
+		{
+			name:      "user input",
+			lastRole:  RoleUser,
+			buildLast: func() Message { return UserMsg("改一下登录") },
+		},
+		{
+			name:      "tool result",
+			lastRole:  RoleTool,
+			buildLast: func() Message { return ToolResultMsg("call_1", []byte(`"ok"`), false) },
+		},
+		{
+			name:     "assistant turn",
+			lastRole: RoleAssistant,
+			buildLast: func() Message {
+				return Message{Role: RoleAssistant, Content: []ContentBlock{TextBlock("hi")}}
+			},
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			msgs := []Message{
+				SystemMsg("sys"),
+				UserMsg("first"),
+				{Role: RoleAssistant, Content: []ContentBlock{TextBlock("a1")}},
+				tc.buildLast(),
+			}
+			out := markLastMessageForCache(msgs, "ephemeral")
+
+			last := out[len(out)-1]
+			if last.Role != tc.lastRole {
+				t.Fatalf("last message role: want %s, got %s", tc.lastRole, last.Role)
+			}
+			if last.Metadata["cache_control"] != "ephemeral" {
+				t.Fatalf("expected cache_control on last %s message, got %v", tc.lastRole, last.Metadata)
+			}
+			for i := 0; i < len(out)-1; i++ {
+				if _, has := out[i].Metadata["cache_control"]; has {
+					t.Fatalf("unexpected cache_control on message %d (role=%s)", i, out[i].Role)
+				}
+			}
+		})
+	}
+}
+
+func TestMarkLastMessageForCache_SkipsTrailingSystemReminders(t *testing.T) {
+	msgs := []Message{
+		SystemMsg("sys"),
+		UserMsg("real question"),
+		SystemMsg("<system-reminder>per-turn reminder</system-reminder>"),
+		SystemMsg("<system-reminder>another reminder</system-reminder>"),
+	}
+	out := markLastMessageForCache(msgs, "ephemeral")
+
+	// Marker should land on the user message (index 1), not on the trailing system reminders.
+	if out[1].Metadata["cache_control"] != "ephemeral" {
+		t.Fatalf("expected cache_control on user (index 1), got metadata=%v", out[1].Metadata)
+	}
+	for i, m := range out {
+		if i == 1 {
+			continue
+		}
+		if _, has := m.Metadata["cache_control"]; has {
+			t.Fatalf("unexpected cache_control on message %d (role=%s)", i, m.Role)
+		}
+	}
+}
+
+func TestMarkLastMessageForCache_AllSystemNoOp(t *testing.T) {
+	msgs := []Message{SystemMsg("a"), SystemMsg("b")}
+	out := markLastMessageForCache(msgs, "ephemeral")
+	for i, m := range out {
+		if _, has := m.Metadata["cache_control"]; has {
+			t.Fatalf("expected no cache_control with all-system input, got one on message %d", i)
+		}
+	}
+}
+
+func TestMarkLastMessageForCache_DoesNotMutateInput(t *testing.T) {
+	original := UserMsg("u")
+	original.Metadata = map[string]any{"keep": "me"}
+	msgs := []Message{original}
+
+	out := markLastMessageForCache(msgs, "ephemeral")
+
+	if _, has := msgs[0].Metadata["cache_control"]; has {
+		t.Fatalf("input slice was mutated")
+	}
+	if msgs[0].Metadata["keep"] != "me" {
+		t.Fatalf("input metadata mutated: %v", msgs[0].Metadata)
+	}
+	if out[0].Metadata["cache_control"] != "ephemeral" {
+		t.Fatalf("output missing cache_control: %v", out[0].Metadata)
+	}
+	if out[0].Metadata["keep"] != "me" {
+		t.Fatalf("output dropped pre-existing metadata: %v", out[0].Metadata)
+	}
+}

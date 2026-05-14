@@ -127,13 +127,16 @@ type LoopConfig struct {
 	// (conservative: assume tools may have non-idempotent side effects).
 	ToolsAreIdempotent bool
 
-	// CacheLastUserMessage, when non-empty, instructs the loop to tag the last
-	// user message in every LLM request with this cache_control value (e.g.
-	// "ephemeral"). Providers that support prompt caching place a write
+	// CacheLastMessage, when non-empty, instructs the loop to tag the last
+	// non-system message in every LLM request with this cache_control value
+	// (e.g. "ephemeral"). Providers that support prompt caching place a write
 	// breakpoint at that position covering the entire preceding prefix. Empty
 	// string (default) leaves messages untouched — keep cache placement under
 	// application control.
-	CacheLastUserMessage string
+	//
+	// The breakpoint follows the freshest turn (user input, tool_result, or
+	// assistant) and skips trailing per-turn system reminders.
+	CacheLastMessage string
 }
 
 // ---------------------------------------------------------------------------
