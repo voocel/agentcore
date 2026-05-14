@@ -26,25 +26,26 @@ type AgentState struct {
 // It consumes loop events to update internal state, just like any external listener.
 type Agent struct {
 	// Configuration (set via options)
-	model              ChatModel
-	systemPrompt       string
-	systemBlocks       []SystemBlock
-	tools              []Tool
-	maxTurns           int
-	maxRetries         int
-	maxToolErrors      int
-	thinkingLevel      ThinkingLevel
-	contextManager     ContextManager
-	convertToLLM       func([]AgentMessage) []Message
-	contextWindow      int
-	contextEstimateFn  ContextEstimateFn
-	toolGate           ToolGate
-	middlewares        []ToolMiddleware
-	maxToolConcurrency int
-	toolsAreIdempotent bool
-	onMessage          func(AgentMessage)
-	reminderGens       []ReminderGenerator
-	stopGuard          StopGuard
+	model                ChatModel
+	systemPrompt         string
+	systemBlocks         []SystemBlock
+	tools                []Tool
+	maxTurns             int
+	maxRetries           int
+	maxToolErrors        int
+	thinkingLevel        ThinkingLevel
+	contextManager       ContextManager
+	convertToLLM         func([]AgentMessage) []Message
+	contextWindow        int
+	contextEstimateFn    ContextEstimateFn
+	toolGate             ToolGate
+	middlewares          []ToolMiddleware
+	maxToolConcurrency   int
+	toolsAreIdempotent   bool
+	onMessage            func(AgentMessage)
+	reminderGens         []ReminderGenerator
+	stopGuard            StopGuard
+	cacheLastUserMessage string
 
 	// State
 	messages         []AgentMessage
@@ -444,10 +445,15 @@ func (a *Agent) SetSystemBlocks(blocks []SystemBlock) {
 	a.systemPrompt = ""
 }
 
-// BuildLLMMessages constructs the message list exactly as the agent loop would
-// for an LLM call: system blocks/prompt → converted conversation messages.
-// This enables external callers (e.g., prompt suggestion) to make background
-// LLM calls that share the same message prefix for prompt cache hits.
+// BuildLLMMessages constructs the message list with the same system-blocks /
+// converted-history layout the agent loop uses for its primary LLM call.
+//
+// Loop-scoped concerns are deliberately omitted: per-turn reminders are not
+// appended, and no last-user cache_control marker is added. External callers
+// (e.g., prompt suggestion) use this to share a stable prefix with the main
+// conversation for prompt cache reads without writing new breakpoints of
+// their own — the main loop's marker remains the sole writer.
+//
 // Malformed tool-call / result transcripts are repaired via RepairMessageSequence.
 func (a *Agent) BuildLLMMessages() ([]Message, error) {
 	a.mu.Lock()
@@ -602,6 +608,7 @@ func (a *Agent) buildConfig() LoopConfig {
 		ReminderGens:          a.reminderGens,
 		StopGuard:             a.stopGuard,
 		ToolsAreIdempotent:    a.toolsAreIdempotent,
+		CacheLastUserMessage:  a.cacheLastUserMessage,
 	}
 }
 

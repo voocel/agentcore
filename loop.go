@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"maps"
 	"math"
 	"sort"
 	"strings"
@@ -571,6 +572,16 @@ func callLLM(ctx context.Context, agentCtx *AgentContext, config LoopConfig, ch 
 		}
 	}
 
+	// Place a single cache write breakpoint on the last user message when the
+	// application has opted into explicit cache orchestration. The helper scans
+	// by role=user from the tail, so trailing per-turn reminders (system role)
+	// are naturally skipped — the breakpoint lands on the user turn and covers
+	// the stable prefix (system blocks + tools + history). Reminders stay
+	// outside the cached region, which is what we want: they change every turn.
+	if config.CacheLastUserMessage != "" {
+		llmMessages = markLastUserMessageForCache(llmMessages, config.CacheLastUserMessage)
+	}
+
 	if config.Model == nil {
 		return Message{}, llmCallInfo{}, fmt.Errorf("no model configured")
 	}
@@ -586,6 +597,31 @@ func callLLM(ctx context.Context, agentCtx *AgentContext, config LoopConfig, ch 
 
 	// Use streaming for real-time token deltas
 	return callLLMStream(ctx, config.Model, llmMessages, toolSpecs, callOpts, ch, hooks)
+}
+
+// markLastUserMessageForCache returns a copy of messages with cache_control
+// attached to the metadata of the last user message. The caller's slice and
+// the original Message values are left untouched.
+func markLastUserMessageForCache(messages []Message, cacheControl string) []Message {
+	idx := -1
+	for i := len(messages) - 1; i >= 0; i-- {
+		if messages[i].Role == RoleUser {
+			idx = i
+			break
+		}
+	}
+	if idx < 0 {
+		return messages
+	}
+	out := make([]Message, len(messages))
+	copy(out, messages)
+	target := out[idx]
+	md := make(map[string]any, len(target.Metadata)+1)
+	maps.Copy(md, target.Metadata)
+	md["cache_control"] = cacheControl
+	target.Metadata = md
+	out[idx] = target
+	return out
 }
 
 // callLLMStream uses GenerateStream and emits real-time events.
