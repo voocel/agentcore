@@ -115,6 +115,14 @@ type LoopConfig struct {
 	// NOT persisted to the agent message history.
 	ReminderGens []ReminderGenerator
 
+	// AttachmentGens are invoked once per turn, just before the LLM request
+	// is built. Their output is prepended to the last user message's content
+	// as <system-reminder> text blocks — staying inside the conversation
+	// prefix without touching the system prompt. Use for dynamic system-level
+	// signals (plan mode entry/exit) that must NOT invalidate cached system
+	// blocks. Attachments are NOT persisted to the agent message history.
+	AttachmentGens []AttachmentGenerator
+
 	// StopGuard is consulted when the LLM would end a run without tool calls.
 	// Nil (default) means every stop is allowed.
 	StopGuard StopGuard

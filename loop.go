@@ -573,6 +573,17 @@ func callLLM(ctx context.Context, agentCtx *AgentContext, config LoopConfig, ch 
 		}
 	}
 
+	// Prepend per-turn attachments to the last user message's content. Unlike
+	// reminders (which sit at the tail outside the cache marker), attachments
+	// live inside the conversation prefix — they deliver dynamic system-level
+	// signals (e.g. plan mode entry/exit) WITHOUT mutating the system prompt,
+	// so SB1/SB2/SB3 cache entries stay valid.
+	if len(config.AttachmentGens) > 0 {
+		if atts := collectAttachments(ctx, config.AttachmentGens, turn); len(atts) > 0 {
+			llmMessages = injectAttachments(llmMessages, atts)
+		}
+	}
+
 	// Place a single cache write breakpoint on the last non-system message when
 	// the application has opted into explicit cache orchestration. The helper
 	// scans from the tail and skips system reminders, so the breakpoint lands

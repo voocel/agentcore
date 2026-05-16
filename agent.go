@@ -44,6 +44,7 @@ type Agent struct {
 	toolsAreIdempotent bool
 	onMessage          func(AgentMessage)
 	reminderGens       []ReminderGenerator
+	attachmentGens     []AttachmentGenerator
 	stopGuard          StopGuard
 	cacheLastMessage   string
 
@@ -606,6 +607,7 @@ func (a *Agent) buildConfig() LoopConfig {
 		ShouldEmitAbortMarker: a.wantAbortMarker.Load,
 		OnMessage:             a.onMessage,
 		ReminderGens:          a.reminderGens,
+		AttachmentGens:        a.attachmentGens,
 		StopGuard:             a.stopGuard,
 		ToolsAreIdempotent:    a.toolsAreIdempotent,
 		CacheLastMessage:      a.cacheLastMessage,
