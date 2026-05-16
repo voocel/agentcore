@@ -3,6 +3,7 @@ package agentcore
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"maps"
 	"math"
@@ -416,7 +417,13 @@ func callLLMWithRetry(ctx context.Context, agentCtx *AgentContext, config LoopCo
 			return Message{}, info, err
 		}
 
-		if !litellm.IsRetryableError(err) || attempt == maxRetries {
+		// PartialStreamError (stream closed without done) is treated as retryable:
+		// it most often signals a transient network/provider stream-format issue
+		// that a fresh request can recover from. The HasCompletedToolCalls guard
+		// above already prevents retrying after a tool side-effect has fired.
+		var pse *PartialStreamError
+		retryable := litellm.IsRetryableError(err) || errors.As(err, &pse)
+		if !retryable || attempt == maxRetries {
 			return Message{}, info, err
 		}
 
@@ -615,18 +622,29 @@ func markLastMessageForCache(messages []Message, cacheControl string) []Message 
 	return out
 }
 
+// PartialStreamError indicates a stream closed without a terminal done event.
+// The Partial field carries any content received before truncation; callers
+// can inspect it (e.g. to log diagnostics) but should NOT persist it as a
+// completed message — the stream did not finish cleanly.
+type PartialStreamError struct {
+	Partial Message
+}
+
+func (e *PartialStreamError) Error() string {
+	return "llm stream closed without done event"
+}
+
 // callLLMStream uses GenerateStream and emits real-time events.
 // The adapter builds partial Messages with ContentBlocks and emits fine-grained StreamEvents.
+//
+// Stream init failure is surfaced as an error — there is no silent fallback to
+// non-streaming Generate, because callers (TUIs, event subscribers) typically
+// depend on stream events for live rendering, tool-call deltas, and cancellation
+// semantics. Switching execution model without notice changes the contract.
 func callLLMStream(ctx context.Context, model ChatModel, messages []Message, tools []ToolSpec, opts []CallOption, ch chan<- Event, hooks llmCallHooks) (Message, llmCallInfo, error) {
 	streamCh, err := model.GenerateStream(ctx, messages, tools, opts...)
 	if err != nil {
-		// Fallback to non-streaming
-		resp, err := model.Generate(ctx, messages, tools, opts...)
-		if err != nil {
-			return Message{}, llmCallInfo{}, err
-		}
-		resp.Message.Timestamp = time.Now()
-		return resp.Message, llmCallInfo{}, nil
+		return Message{}, llmCallInfo{}, fmt.Errorf("stream init failed: %w", err)
 	}
 
 	var (
@@ -682,13 +700,12 @@ func callLLMStream(ctx context.Context, model ChatModel, messages []Message, too
 		}
 	}
 
-	// Stream closed without done event — use partial
-	partial.Timestamp = time.Now()
-	if !started {
-		emit(ch, Event{Type: EventMessageStart, Message: partial})
-	}
-	emit(ch, Event{Type: EventMessageEnd, Message: partial})
-	return partial, info, nil
+	// Stream closed without done event — surface as PartialStreamError instead
+	// of pretending the message completed. Emitting EventMessageEnd here would
+	// let callers persist a half-finished message (missing StopReason, possibly
+	// truncated tool_call args, unclosed thinking blocks) into history — the
+	// next LLM call would then see structurally invalid context.
+	return Message{}, info, &PartialStreamError{Partial: partial}
 }
 
 // executeToolCalls runs tool calls for one assistant turn using the shared
@@ -769,7 +786,7 @@ func executeSingleToolCall(ctx context.Context, tools []Tool, call ToolCall, con
 			Content:    errContent,
 			IsError:    true,
 		}
-	} else if err := validateToolArgs(tool, call.Args); err != nil {
+	} else if err := validateToolArgs(tool, call); err != nil {
 		errContent, _ := json.Marshal(err.Error())
 		result = ToolResult{
 			ToolCallID: call.ID,
@@ -1048,12 +1065,26 @@ func buildToolSpecs(tools []Tool) []ToolSpec {
 // models can self-correct in a single follow-up turn instead of trial-and-error.
 // Error text is natural-language, one line per issue — empirically recovers
 // faster than terse errors.
-func validateToolArgs(tool Tool, args json.RawMessage) error {
+//
+// When call.ArgsInvalid is set (LLM emitted unparseable args; raw payload
+// captured upstream in call.ArgsRawText / call.ArgsParseError), schema checks
+// are skipped and the captured diagnostic is surfaced directly — running
+// schema validation against the "{}" placeholder would otherwise mislead the
+// model with a "missing field" error.
+func validateToolArgs(tool Tool, call ToolCall) error {
+	if call.ArgsInvalid {
+		return fmt.Errorf(
+			"InputValidationError: %s received malformed JSON arguments: %s\nraw args: %s",
+			tool.Name(), call.ArgsParseError, call.ArgsRawText,
+		)
+	}
+
 	schema := tool.Schema()
 	if schema == nil {
 		return nil
 	}
 
+	args := call.Args
 	if len(args) == 0 {
 		args = []byte("{}")
 	}

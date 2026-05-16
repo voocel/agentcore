@@ -69,13 +69,13 @@ type Config struct {
 //   - Chain: Chain array with {previous} placeholder
 //   - Background: Single + Background=true
 type params struct {
-	Agent       string     `json:"agent,omitempty"`
-	Task        string     `json:"task,omitempty"`
-	Tasks       []taskItem `json:"tasks,omitempty"`
+	Agent       string      `json:"agent,omitempty"`
+	Task        string      `json:"task,omitempty"`
+	Tasks       []taskItem  `json:"tasks,omitempty"`
 	Chain       []chainStep `json:"chain,omitempty"`
-	Background  bool       `json:"background,omitempty"`
-	Description string     `json:"description,omitempty"`
-	Model       string     `json:"model,omitempty"`
+	Background  bool        `json:"background,omitempty"`
+	Description string      `json:"description,omitempty"`
+	Model       string      `json:"model,omitempty"`
 }
 
 type taskItem struct {
@@ -213,15 +213,17 @@ func (t *Tool) Execute(ctx context.Context, args json.RawMessage) (json.RawMessa
 	hasSingle := p.Agent != "" && p.Task != ""
 
 	// Background mode: single task running in a detached goroutine.
-	// If TaskRuntime is not wired, silently degrade to synchronous execution.
+	// Requires a wired TaskRuntime — no silent degradation to sync, because
+	// callers passing Background=true expect "return immediately + notify on
+	// completion" semantics that synchronous execution cannot satisfy.
 	if p.Background {
 		if !hasSingle {
 			return json.Marshal("background mode requires agent + task")
 		}
-		if t.taskRT != nil {
-			return t.executeBackground(p.Agent, p.Task, p.Description, modelOverride)
+		if t.taskRT == nil {
+			return nil, fmt.Errorf("background mode requires a wired TaskRuntime (call subagent.Tool.SetTaskRuntime)")
 		}
-		// Fall through to synchronous single-task execution.
+		return t.executeBackground(p.Agent, p.Task, p.Description, modelOverride)
 	}
 
 	modeCount := boolToInt(hasChain) + boolToInt(hasParallel) + boolToInt(hasSingle)

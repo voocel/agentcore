@@ -124,6 +124,20 @@ func TestTool_UnknownAgent(t *testing.T) {
 	}
 }
 
+// Background=true without a wired TaskRuntime must fail fast — silent
+// degradation to synchronous execution would violate the "return immediately,
+// notify on completion" contract callers expect from background mode.
+func TestTool_BackgroundRequiresTaskRuntime(t *testing.T) {
+	tool := New(simpleAgent("writer", "x"))
+	_, err := tool.Execute(context.Background(), json.RawMessage(`{"agent":"writer","task":"go","background":true}`))
+	if err == nil {
+		t.Fatal("expected error when background=true and TaskRuntime is missing, got nil")
+	}
+	if !strings.Contains(err.Error(), "TaskRuntime") {
+		t.Fatalf("expected error mentioning TaskRuntime, got %v", err)
+	}
+}
+
 func TestTool_SinglePropagatesFinalErrorAfterPartialOutput(t *testing.T) {
 	noop := agentcore.NewFuncTool("noop", "noop", map[string]any{
 		"type": "object", "properties": map[string]any{},

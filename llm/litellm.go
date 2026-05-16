@@ -257,11 +257,7 @@ func (l *LiteLLMAdapter) GenerateStream(ctx context.Context, messages []agentcor
 				}
 			},
 			OnToolCallEnd: func(call litellm.ToolCall) {
-				completed := agentcore.ToolCall{
-					ID:   call.ID,
-					Name: call.Function.Name,
-					Args: safeArgs(call.Function.Arguments),
-				}
+				completed := buildToolCall(call.ID, call.Function.Name, call.Function.Arguments)
 				idx := findPendingToolCallBlock(partial.Content, toolBlockIndices, call.ID)
 				if idx >= 0 {
 					partial.Content[idx] = agentcore.ToolCallBlock(completed)
@@ -474,11 +470,7 @@ func convertResponse(response *litellm.Response) agentcore.Message {
 
 	// Tool calls
 	for _, call := range response.ToolCalls {
-		content = append(content, agentcore.ToolCallBlock(agentcore.ToolCall{
-			ID:   call.ID,
-			Name: call.Function.Name,
-			Args: safeArgs(call.Function.Arguments),
-		}))
+		content = append(content, agentcore.ToolCallBlock(buildToolCall(call.ID, call.Function.Name, call.Function.Arguments)))
 	}
 
 	// Map usage
@@ -634,15 +626,50 @@ func convertToolRefContent(blocks []agentcore.ContentBlock) []litellm.MessageCon
 	return parts
 }
 
-// safeArgs returns args as json.RawMessage, defaulting to "{}" if empty or invalid JSON.
-func safeArgs(args string) json.RawMessage {
-	if args == "" {
-		return json.RawMessage("{}")
+// normalizedArgs is the parsed shape of raw LLM tool-call args.
+//   - Args is always valid JSON so the parent ToolCall stays JSON-serializable
+//     (json.RawMessage marshalling validates its bytes; invalid args here would
+//     break agent.ExportMessages → json.Marshal for persistence).
+//   - When the raw payload was malformed, Args is the "{}" placeholder, and
+//     RawText + ParseErr carry the original bytes and parser diagnostic so
+//     downstream validation can point at the true root cause (stream
+//     truncation, provider bug) instead of "missing field" against {}.
+type normalizedArgs struct {
+	Args     json.RawMessage
+	Invalid  bool
+	RawText  string
+	ParseErr string
+}
+
+func normalizeArgs(raw string) normalizedArgs {
+	if raw == "" {
+		return normalizedArgs{Args: json.RawMessage("{}")}
 	}
-	if !json.Valid([]byte(args)) {
-		return json.RawMessage("{}")
+	if json.Valid([]byte(raw)) {
+		return normalizedArgs{Args: json.RawMessage(raw)}
 	}
-	return json.RawMessage(args)
+	var probe any
+	parseErr := json.Unmarshal([]byte(raw), &probe)
+	return normalizedArgs{
+		Args:     json.RawMessage("{}"),
+		Invalid:  true,
+		RawText:  raw,
+		ParseErr: parseErr.Error(),
+	}
+}
+
+// buildToolCall constructs an agentcore.ToolCall from raw litellm fields,
+// routing malformed args into dedicated diagnostic fields (see ToolCall doc).
+func buildToolCall(id, name, rawArgs string) agentcore.ToolCall {
+	n := normalizeArgs(rawArgs)
+	return agentcore.ToolCall{
+		ID:             id,
+		Name:           name,
+		Args:           n.Args,
+		ArgsInvalid:    n.Invalid,
+		ArgsRawText:    n.RawText,
+		ArgsParseError: n.ParseErr,
+	}
 }
 
 func findPendingToolCallBlock(content []agentcore.ContentBlock, byID map[string]int, toolCallID string) int {

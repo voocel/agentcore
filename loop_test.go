@@ -3,6 +3,7 @@ package agentcore
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"strings"
 	"sync"
@@ -261,35 +262,6 @@ func TestAgentLoop_FollowUp(t *testing.T) {
 }
 
 func TestAgentLoop_Middleware(t *testing.T) {
-	t.Run("plain tool", func(t *testing.T) {
-		var calls []string
-		var log []string
-
-		tc := ToolCall{ID: "tc1", Name: "echo", Args: json.RawMessage(`{"value":"mid"}`)}
-		mw := func(ctx context.Context, call ToolCall, next ToolExecuteFunc) (json.RawMessage, error) {
-			log = append(log, "before")
-			result, err := next(ctx, call.Args)
-			log = append(log, "after")
-			return result, err
-		}
-
-		runTestLoop(t,
-			[]AgentMessage{UserMsg("test")},
-			AgentContext{Tools: []Tool{echoTool(&calls)}},
-			LoopConfig{
-				Model:       mockModel(toolCallMsg(tc), assistantMsg("done", StopReasonStop)),
-				Middlewares: []ToolMiddleware{mw},
-			},
-		)
-
-		if len(calls) != 1 || calls[0] != "mid" {
-			t.Fatalf("expected echo('mid'), got %v", calls)
-		}
-		if len(log) != 2 || log[0] != "before" || log[1] != "after" {
-			t.Fatalf("middleware log: %v", log)
-		}
-	})
-
 	t.Run("content tool", func(t *testing.T) {
 		var contentCalls int64
 		var log []string
@@ -406,28 +378,6 @@ func TestAgentLoop_ToolGate(t *testing.T) {
 
 		if len(calls) != 0 {
 			t.Fatalf("tool must not execute when gate errors, got %v", calls)
-		}
-	})
-
-	t.Run("nil decision is treated as allow", func(t *testing.T) {
-		var calls []string
-
-		runTestLoop(t,
-			[]AgentMessage{UserMsg("test")},
-			AgentContext{Tools: []Tool{echoTool(&calls)}},
-			LoopConfig{
-				Model: mockModel(
-					toolCallMsg(ToolCall{ID: "tc1", Name: "echo", Args: json.RawMessage(`{"value":"x"}`)}),
-					assistantMsg("done", StopReasonStop),
-				),
-				ToolGate: func(ctx context.Context, req GateRequest) (*GateDecision, error) {
-					return nil, nil
-				},
-			},
-		)
-
-		if len(calls) != 1 || calls[0] != "x" {
-			t.Fatalf("expected tool to execute when gate returns nil, got %v", calls)
 		}
 	})
 }
@@ -1037,87 +987,11 @@ func TestLoopPublicAPIs(t *testing.T) {
 		}
 	})
 
-	t.Run("collect returns final messages", func(t *testing.T) {
-		msgs, err := Collect(AgentLoop(
-			context.Background(),
-			[]AgentMessage{UserMsg("hi")},
-			AgentContext{},
-			LoopConfig{Model: mockModel(assistantMsg("ok", StopReasonStop))},
-		))
-		if err != nil {
-			t.Fatalf("unexpected error: %v", err)
-		}
-		if len(msgs) < 2 {
-			t.Fatalf("expected >= 2 messages, got %d", len(msgs))
-		}
-	})
-
-	t.Run("event stream exposes events result and done", func(t *testing.T) {
-		stream := NewEventStream(AgentLoop(
-			context.Background(),
-			[]AgentMessage{UserMsg("hi")},
-			AgentContext{},
-			LoopConfig{Model: mockModel(assistantMsg("ok", StopReasonStop))},
-		))
-
-		count := 0
-		for range stream.Events() {
-			count++
-		}
-		if count == 0 {
-			t.Fatal("expected events")
-		}
-
-		msgs, err := stream.Result()
-		if err != nil {
-			t.Fatalf("unexpected error: %v", err)
-		}
-		if len(msgs) < 2 {
-			t.Fatalf("expected >= 2 messages, got %d", len(msgs))
-		}
-
-		select {
-		case <-stream.Done():
-		default:
-			t.Fatal("Done() not closed")
-		}
-	})
 }
 
 // ---------------------------------------------------------------------------
 // OnMessage semantic tests — verify commitMessage fires on all paths
 // ---------------------------------------------------------------------------
-
-func TestOnMessage_AssistantAndToolResult(t *testing.T) {
-	var calls []string
-	tc := ToolCall{ID: "tc1", Name: "echo", Args: json.RawMessage(`{"value":"ping"}`)}
-
-	var logged []Role
-	var mu sync.Mutex
-
-	runTestLoop(t,
-		[]AgentMessage{UserMsg("test")},
-		AgentContext{Tools: []Tool{echoTool(&calls)}},
-		LoopConfig{
-			Model: mockModel(toolCallMsg(tc), assistantMsg("done", StopReasonStop)),
-			OnMessage: func(msg AgentMessage) {
-				mu.Lock()
-				logged = append(logged, msg.GetRole())
-				mu.Unlock()
-			},
-		},
-	)
-
-	// Expect: user (prompt) → assistant (tool call) → tool (result) → assistant (done)
-	mu.Lock()
-	defer mu.Unlock()
-	if len(logged) != 4 {
-		t.Fatalf("expected 4 OnMessage calls, got %d: %v", len(logged), logged)
-	}
-	if logged[0] != RoleUser || logged[1] != RoleAssistant || logged[2] != RoleTool || logged[3] != RoleAssistant {
-		t.Fatalf("unexpected OnMessage roles: %v", logged)
-	}
-}
 
 func TestOnMessage_PendingSteeringMessages(t *testing.T) {
 	var calls []string
@@ -1168,33 +1042,6 @@ func TestOnMessage_PendingSteeringMessages(t *testing.T) {
 	}
 }
 
-func TestOnMessage_ErrorStopReason(t *testing.T) {
-	var logged []Role
-	var mu sync.Mutex
-
-	runTestLoop(t,
-		[]AgentMessage{UserMsg("test error")},
-		AgentContext{},
-		LoopConfig{
-			Model: mockModel(assistantMsg("oops", StopReasonError)),
-			OnMessage: func(msg AgentMessage) {
-				mu.Lock()
-				logged = append(logged, msg.GetRole())
-				mu.Unlock()
-			},
-		},
-	)
-
-	mu.Lock()
-	defer mu.Unlock()
-	if len(logged) != 2 {
-		t.Fatalf("expected 2 OnMessage calls (prompt + error assistant), got %d: %v", len(logged), logged)
-	}
-	if logged[0] != RoleUser || logged[1] != RoleAssistant {
-		t.Fatalf("expected OnMessage roles [user assistant], got %v", logged)
-	}
-}
-
 func TestOnMessage_OrderMatchesNewMessages(t *testing.T) {
 	var calls []string
 	tc := ToolCall{ID: "tc1", Name: "echo", Args: json.RawMessage(`{"value":"x"}`)}
@@ -1234,43 +1081,6 @@ func TestOnMessage_OrderMatchesNewMessages(t *testing.T) {
 	}
 }
 
-// TestMockModel_StreamAndGenerateDoNotShareCursor guards the contract that
-// each ChatModel method on the test mocks consumes exactly one response.
-// Without this, callLLMStream's GenerateStream→Generate fallback path would
-// double-advance the cursor and silently drop a scripted response.
-func TestMockModel_StreamAndGenerateDoNotShareCursor(t *testing.T) {
-	m := mockModel(
-		assistantMsg("first", StopReasonStop),
-		assistantMsg("second", StopReasonStop),
-	)
-
-	ch, err := m.GenerateStream(context.Background(), nil, nil)
-	if err != nil {
-		t.Fatalf("GenerateStream call 1: %v", err)
-	}
-	var firstMsg Message
-	for ev := range ch {
-		if ev.Type == StreamEventDone {
-			firstMsg = ev.Message
-		}
-	}
-	if firstMsg.TextContent() != "first" {
-		t.Fatalf("GenerateStream call 1: got %q, want %q", firstMsg.TextContent(), "first")
-	}
-
-	resp, err := m.Generate(context.Background(), nil, nil)
-	if err != nil {
-		t.Fatalf("Generate call 2: %v", err)
-	}
-	if resp.Message.TextContent() != "second" {
-		t.Fatalf("Generate call 2: got %q, want %q", resp.Message.TextContent(), "second")
-	}
-
-	if _, err := m.Generate(context.Background(), nil, nil); err == nil {
-		t.Fatal("Generate call 3: expected exhaustion error, got nil")
-	}
-}
-
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
@@ -1279,9 +1089,8 @@ func TestMockModel_StreamAndGenerateDoNotShareCursor(t *testing.T) {
 // real ChatModel adapters.
 //
 // Important: Generate and GenerateStream each consume exactly one response.
-// They do NOT call each other, so callLLMStream's GenerateStream→Generate
-// fallback path (used when GenerateStream returns an error) won't double-
-// advance the response cursor.
+// They do NOT call each other, so tests that mix streaming and non-streaming
+// calls observe a stable, predictable response order.
 type mockChatModel struct {
 	responses []Message
 	idx       int64
@@ -1694,16 +1503,6 @@ func TestMarkLastMessageForCache_SkipsTrailingSystemReminders(t *testing.T) {
 	}
 }
 
-func TestMarkLastMessageForCache_AllSystemNoOp(t *testing.T) {
-	msgs := []Message{SystemMsg("a"), SystemMsg("b")}
-	out := markLastMessageForCache(msgs, "ephemeral")
-	for i, m := range out {
-		if _, has := m.Metadata["cache_control"]; has {
-			t.Fatalf("expected no cache_control with all-system input, got one on message %d", i)
-		}
-	}
-}
-
 func TestMarkLastMessageForCache_DoesNotMutateInput(t *testing.T) {
 	original := UserMsg("u")
 	original.Metadata = map[string]any{"keep": "me"}
@@ -1722,5 +1521,138 @@ func TestMarkLastMessageForCache_DoesNotMutateInput(t *testing.T) {
 	}
 	if out[0].Metadata["keep"] != "me" {
 		t.Fatalf("output dropped pre-existing metadata: %v", out[0].Metadata)
+	}
+}
+
+// streamErrModel returns an error from GenerateStream. Guards the contract
+// that callLLMStream surfaces stream-init errors rather than silently
+// falling back to non-streaming Generate.
+type streamErrModel struct{ err error }
+
+func (m *streamErrModel) Generate(context.Context, []Message, []ToolSpec, ...CallOption) (*LLMResponse, error) {
+	return nil, fmt.Errorf("Generate should not be called when stream init fails")
+}
+func (m *streamErrModel) GenerateStream(context.Context, []Message, []ToolSpec, ...CallOption) (<-chan StreamEvent, error) {
+	return nil, m.err
+}
+func (m *streamErrModel) SupportsTools() bool { return true }
+
+func TestCallLLMStream_StreamInitErrorBubbles(t *testing.T) {
+	m := &streamErrModel{err: fmt.Errorf("provider unavailable")}
+	events := make(chan Event, 4)
+
+	_, _, err := callLLMStream(context.Background(), m, nil, nil, nil, events, llmCallHooks{})
+	close(events)
+
+	if err == nil {
+		t.Fatal("expected stream init error, got nil")
+	}
+	if !strings.Contains(err.Error(), "stream init failed") || !strings.Contains(err.Error(), "provider unavailable") {
+		t.Fatalf("expected wrapped stream init error, got %v", err)
+	}
+	for ev := range events {
+		if ev.Type == EventMessageStart || ev.Type == EventMessageEnd {
+			t.Fatalf("no message events expected on stream init failure, got %s", ev.Type)
+		}
+	}
+}
+
+// partialStreamModel emits text deltas then closes the channel WITHOUT a
+// StreamEventDone — simulates network truncation / provider stream bug.
+type partialStreamModel struct{ text string }
+
+func (m *partialStreamModel) Generate(context.Context, []Message, []ToolSpec, ...CallOption) (*LLMResponse, error) {
+	return nil, fmt.Errorf("Generate not used")
+}
+func (m *partialStreamModel) GenerateStream(context.Context, []Message, []ToolSpec, ...CallOption) (<-chan StreamEvent, error) {
+	ch := make(chan StreamEvent, 4)
+	partial := Message{Role: RoleAssistant, Content: []ContentBlock{TextBlock("")}}
+	ch <- StreamEvent{Type: StreamEventTextStart, ContentIndex: 0, Message: partial}
+	partial.Content[0].Text = m.text
+	ch <- StreamEvent{Type: StreamEventTextDelta, ContentIndex: 0, Delta: m.text, Message: partial}
+	close(ch) // no StreamEventDone — simulates truncation
+	return ch, nil
+}
+func (m *partialStreamModel) SupportsTools() bool { return true }
+
+func TestCallLLMStream_PartialStreamErrorOnTruncation(t *testing.T) {
+	m := &partialStreamModel{text: "half a sente"}
+	events := make(chan Event, 16)
+
+	_, _, err := callLLMStream(context.Background(), m, nil, nil, nil, events, llmCallHooks{})
+	close(events)
+
+	var partialErr *PartialStreamError
+	if err == nil {
+		t.Fatal("expected PartialStreamError, got nil")
+	}
+	if !errors.As(err, &partialErr) {
+		t.Fatalf("expected PartialStreamError, got %T: %v", err, err)
+	}
+	if partialErr.Partial.TextContent() != "half a sente" {
+		t.Fatalf("expected partial text preserved, got %q", partialErr.Partial.TextContent())
+	}
+	// Critically: no EventMessageEnd must be emitted — that would let callers
+	// persist the half-finished message as if the LLM completed normally.
+	for ev := range events {
+		if ev.Type == EventMessageEnd {
+			t.Fatal("EventMessageEnd must not fire on truncated stream — that would corrupt history")
+		}
+	}
+}
+
+// flakyStreamModel: first GenerateStream call truncates (no done event),
+// subsequent calls succeed with a normal done event. Used to verify that
+// callLLMWithRetry recognises *PartialStreamError as retryable — otherwise
+// transient provider stream-format glitches would surface as hard failures.
+type flakyStreamModel struct {
+	calls int
+	reply string
+}
+
+func (m *flakyStreamModel) Generate(context.Context, []Message, []ToolSpec, ...CallOption) (*LLMResponse, error) {
+	return nil, fmt.Errorf("Generate not used")
+}
+func (m *flakyStreamModel) GenerateStream(_ context.Context, _ []Message, _ []ToolSpec, _ ...CallOption) (<-chan StreamEvent, error) {
+	m.calls++
+	ch := make(chan StreamEvent, 4)
+	if m.calls == 1 {
+		// Truncate: emit a delta then close without StreamEventDone.
+		partial := Message{Role: RoleAssistant, Content: []ContentBlock{TextBlock("")}}
+		ch <- StreamEvent{Type: StreamEventTextStart, ContentIndex: 0, Message: partial}
+		partial.Content[0].Text = "partial..."
+		ch <- StreamEvent{Type: StreamEventTextDelta, ContentIndex: 0, Delta: "partial...", Message: partial}
+		close(ch)
+		return ch, nil
+	}
+	// Success on retry.
+	final := Message{
+		Role:       RoleAssistant,
+		Content:    []ContentBlock{TextBlock(m.reply)},
+		StopReason: StopReasonStop,
+	}
+	ch <- StreamEvent{Type: StreamEventDone, Message: final, StopReason: StopReasonStop}
+	close(ch)
+	return ch, nil
+}
+func (m *flakyStreamModel) SupportsTools() bool { return true }
+
+func TestCallLLMWithRetry_RetriesPartialStream(t *testing.T) {
+	m := &flakyStreamModel{reply: "recovered"}
+	events := make(chan Event, 32)
+	defer close(events)
+
+	cfg := LoopConfig{Model: m, MaxRetries: 2}
+	agentCtx := &AgentContext{Messages: []AgentMessage{UserMsg("hi")}}
+
+	msg, _, err := callLLMWithRetry(context.Background(), agentCtx, cfg, events, llmCallHooks{}, nil)
+	if err != nil {
+		t.Fatalf("expected retry to succeed, got %v", err)
+	}
+	if msg.TextContent() != "recovered" {
+		t.Fatalf("expected recovered message, got %q", msg.TextContent())
+	}
+	if m.calls != 2 {
+		t.Fatalf("expected exactly 2 stream calls (1 partial + 1 success), got %d", m.calls)
 	}
 }

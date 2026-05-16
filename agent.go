@@ -688,6 +688,12 @@ func (a *Agent) consumeLoop(events <-chan Event) {
 		// Error — construct fallback assistant message (skip for intentional abort)
 		case EventError:
 			partial = nil // discard incomplete streaming message to prevent defer from appending it
+			// Also clear the externally-visible streaming view: listeners may
+			// call State() from this EventError callback, and a stale
+			// streamMessage would surface a never-completing partial that the
+			// agent has already abandoned. Cleared here, before listeners run
+			// (notifications fire after the lock is released below).
+			a.streamMessage = nil
 			if ev.Err != nil && !errors.Is(ev.Err, context.Canceled) {
 				a.lastError = ev.Err.Error()
 				errMsg := Message{

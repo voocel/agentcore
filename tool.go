@@ -73,10 +73,21 @@ func ReportToolProgress(ctx context.Context, progress ProgressPayload) {
 // ---------------------------------------------------------------------------
 
 // ToolCall represents a tool invocation request from the LLM.
+//
+// When the LLM emits args that don't parse as JSON (common cause: stream
+// truncation, provider format bug), Args is replaced with "{}" so the
+// surrounding Message stays JSON-serializable for persistence; the original
+// payload and parser diagnostic are preserved in ArgsRawText / ArgsParseError.
+// Downstream schema validation short-circuits on ArgsInvalid and surfaces the
+// captured raw text — pointing at the real root cause instead of running
+// "missing field" checks against the {} placeholder.
 type ToolCall struct {
-	ID   string          `json:"id"`
-	Name string          `json:"name"`
-	Args json.RawMessage `json:"args"`
+	ID             string          `json:"id"`
+	Name           string          `json:"name"`
+	Args           json.RawMessage `json:"args"`
+	ArgsInvalid    bool            `json:"args_invalid,omitempty"`
+	ArgsRawText    string          `json:"args_raw_text,omitempty"`
+	ArgsParseError string          `json:"args_parse_error,omitempty"`
 }
 
 // ToolResult represents a tool execution outcome.

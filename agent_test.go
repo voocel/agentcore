@@ -2,6 +2,7 @@ package agentcore
 
 import (
 	"context"
+	"fmt"
 	"sync"
 	"testing"
 	"time"
@@ -170,6 +171,85 @@ func TestAgentInject_IsAtomicUnderConcurrentCalls(t *testing.T) {
 		if !found {
 			t.Fatalf("expected injected message %q in history, got %v", want, texts)
 		}
+	}
+}
+
+// midStreamErrorModel emits a text delta (populating Agent.streamMessage)
+// then injects a StreamEventError so the agent surfaces EventError mid-stream.
+type midStreamErrorModel struct{}
+
+func (m *midStreamErrorModel) Generate(context.Context, []Message, []ToolSpec, ...CallOption) (*LLMResponse, error) {
+	return nil, fmt.Errorf("Generate not used")
+}
+func (m *midStreamErrorModel) GenerateStream(_ context.Context, _ []Message, _ []ToolSpec, _ ...CallOption) (<-chan StreamEvent, error) {
+	ch := make(chan StreamEvent, 4)
+	partial := Message{Role: RoleAssistant, Content: []ContentBlock{TextBlock("")}}
+	ch <- StreamEvent{Type: StreamEventTextStart, ContentIndex: 0, Message: partial}
+	partial.Content[0].Text = "half-formed..."
+	ch <- StreamEvent{Type: StreamEventTextDelta, ContentIndex: 0, Delta: "half-formed...", Message: partial}
+	ch <- StreamEvent{Type: StreamEventError, Err: fmt.Errorf("provider stream error")}
+	close(ch)
+	return ch, nil
+}
+func (m *midStreamErrorModel) SupportsTools() bool { return true }
+
+// EventError listeners must see a cleared StreamMessage when calling State().
+// Without this guarantee, the listener observes a never-completing partial
+// the agent has already abandoned — confusing UI rendering and any caller
+// that snapshots agent state at error time.
+func TestEventError_ClearsStreamMessageBeforeListeners(t *testing.T) {
+	agent := NewAgent(
+		WithModel(&midStreamErrorModel{}),
+		WithMaxRetries(0),
+	)
+
+	var (
+		mu             sync.Mutex
+		errorSnapshot  AgentState
+		sawError       bool
+		sawMidStream   bool
+		done           = make(chan struct{})
+		closeDoneOnce  sync.Once
+	)
+	agent.Subscribe(func(ev Event) {
+		switch ev.Type {
+		case EventMessageUpdate:
+			// Sanity check: streamMessage must be populated mid-stream,
+			// otherwise the EventError assertion below would be vacuous.
+			if agent.State().StreamMessage != nil {
+				mu.Lock()
+				sawMidStream = true
+				mu.Unlock()
+			}
+		case EventError:
+			mu.Lock()
+			errorSnapshot = agent.State()
+			sawError = true
+			mu.Unlock()
+		case EventAgentEnd:
+			closeDoneOnce.Do(func() { close(done) })
+		}
+	})
+
+	if err := agent.Prompt("trigger"); err != nil {
+		t.Fatalf("prompt failed: %v", err)
+	}
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for EventAgentEnd")
+	}
+
+	mu.Lock()
+	defer mu.Unlock()
+	if !sawMidStream {
+		t.Fatal("test setup broken: streamMessage was never populated mid-stream")
+	}
+	if !sawError {
+		t.Fatal("listener never received EventError")
+	}
+	if errorSnapshot.StreamMessage != nil {
+		t.Fatalf("StreamMessage must be cleared before EventError listeners run, got %+v", errorSnapshot.StreamMessage)
 	}
 }
 
