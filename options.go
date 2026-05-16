@@ -123,7 +123,7 @@ func WithMaxToolErrors(n int) AgentOption {
 }
 
 // ---------------------------------------------------------------------------
-// Hooks — message callbacks, generators, guards
+// Hooks — message callbacks
 // ---------------------------------------------------------------------------
 
 // WithOnMessage registers a callback invoked after each message is appended
@@ -133,39 +133,8 @@ func WithOnMessage(fn func(AgentMessage)) AgentOption {
 }
 
 // ---------------------------------------------------------------------------
-// Reminder / StopGuard / MaxTurns behavior — long-run stability primitives
+// StopGuard — long-run stability primitive
 // ---------------------------------------------------------------------------
-
-// WithReminderGenerator registers a per-turn reminder generator. Multiple calls
-// stack: every generator is invoked in registration order before each LLM call,
-// and their combined reminders are injected as one-turn system messages.
-// Reminders do not enter the persistent message history.
-func WithReminderGenerator(gen ReminderGenerator) AgentOption {
-	return func(a *Agent) {
-		if gen == nil {
-			return
-		}
-		a.reminderGens = append(a.reminderGens, gen)
-	}
-}
-
-// WithAttachmentGenerator registers a per-turn attachment generator. Attachments
-// are prepended to the last user message as <system-reminder> text blocks —
-// they reach the model through the conversation prefix but do NOT modify the
-// system prompt (so SB cache entries stay valid). Use for dynamic system-level
-// signals (plan mode entry/exit, one-shot notifications) that must not
-// invalidate cached system blocks.
-//
-// Multiple calls stack; same-Source attachments collapse (last write wins).
-// Attachments are NOT persisted to the agent message history.
-func WithAttachmentGenerator(gen AttachmentGenerator) AgentOption {
-	return func(a *Agent) {
-		if gen == nil {
-			return
-		}
-		a.attachmentGens = append(a.attachmentGens, gen)
-	}
-}
 
 // WithStopGuard installs a guard that decides whether the agent may stop
 // when the LLM emits end_turn without tool calls. Nil guard (default) means

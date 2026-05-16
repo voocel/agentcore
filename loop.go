@@ -218,8 +218,7 @@ func runLoop(ctx context.Context, currentCtx *AgentContext, newMessages *[]Agent
 			}
 
 			// Call LLM with retry (streaming: events emitted inside callLLM)
-			turnInfo := TurnInfo{TurnIndex: turnCount}
-			assistantMsg, callInfo, err := callLLMWithRetry(ctx, currentCtx, config, ch, hooks, turnInfo, resetTurnState)
+			assistantMsg, callInfo, err := callLLMWithRetry(ctx, currentCtx, config, ch, hooks, resetTurnState)
 			if err != nil {
 				if streamedTools != nil {
 					streamedTools.AbortAndWait()
@@ -384,12 +383,12 @@ type llmCallInfo struct {
 // retried attempt can re-execute the tool calls cleanly. Only invoked when
 // the failure path actually decides to retry (i.e. the error is retryable
 // and the attempt cap has not been reached).
-func callLLMWithRetry(ctx context.Context, agentCtx *AgentContext, config LoopConfig, ch chan<- Event, hooks llmCallHooks, turn TurnInfo, resetTurnState func()) (Message, llmCallInfo, error) {
+func callLLMWithRetry(ctx context.Context, agentCtx *AgentContext, config LoopConfig, ch chan<- Event, hooks llmCallHooks, resetTurnState func()) (Message, llmCallInfo, error) {
 	maxRetries := config.MaxRetries
 	if maxRetries <= 0 {
-		msg, info, err := callLLM(ctx, agentCtx, config, ch, hooks, turn)
+		msg, info, err := callLLM(ctx, agentCtx, config, ch, hooks)
 		if err != nil && IsContextOverflow(err) {
-			return recoverOverflow(ctx, agentCtx, config, ch, err, hooks, turn)
+			return recoverOverflow(ctx, agentCtx, config, ch, err, hooks)
 		}
 		return msg, info, err
 	}
@@ -397,7 +396,7 @@ func callLLMWithRetry(ctx context.Context, agentCtx *AgentContext, config LoopCo
 	var lastErr error
 	var lastInfo llmCallInfo
 	for attempt := 0; attempt <= maxRetries; attempt++ {
-		msg, info, err := callLLM(ctx, agentCtx, config, ch, hooks, turn)
+		msg, info, err := callLLM(ctx, agentCtx, config, ch, hooks)
 		if err == nil {
 			return msg, info, nil
 		}
@@ -406,7 +405,7 @@ func callLLMWithRetry(ctx context.Context, agentCtx *AgentContext, config LoopCo
 
 		// Context overflow: compact and retry once (not a normal retry)
 		if IsContextOverflow(err) {
-			return recoverOverflow(ctx, agentCtx, config, ch, err, hooks, turn)
+			return recoverOverflow(ctx, agentCtx, config, ch, err, hooks)
 		}
 
 		// Once streamed tool calls have already completed, retrying this turn
@@ -453,7 +452,7 @@ func callLLMWithRetry(ctx context.Context, agentCtx *AgentContext, config LoopCo
 // recoverOverflow attempts to compact the context via the ContextManager and
 // retry the LLM call. If no ContextManager is configured, the original error
 // is returned.
-func recoverOverflow(ctx context.Context, agentCtx *AgentContext, config LoopConfig, ch chan<- Event, originalErr error, hooks llmCallHooks, turn TurnInfo) (Message, llmCallInfo, error) {
+func recoverOverflow(ctx context.Context, agentCtx *AgentContext, config LoopConfig, ch chan<- Event, originalErr error, hooks llmCallHooks) (Message, llmCallInfo, error) {
 	if config.ContextManager == nil {
 		return Message{}, llmCallInfo{}, fmt.Errorf("context overflow (no compaction configured): %w", originalErr)
 	}
@@ -481,7 +480,7 @@ func recoverOverflow(ctx context.Context, agentCtx *AgentContext, config LoopCon
 			return Message{}, llmCallInfo{}, fmt.Errorf("overflow recovery commit failed: %w", err)
 		}
 	}
-	return callLLM(ctx, agentCtx, config, ch, hooks, turn)
+	return callLLM(ctx, agentCtx, config, ch, hooks)
 }
 
 // IsContextOverflow reports whether the error indicates a context window overflow.
@@ -509,7 +508,7 @@ func retryDelay(err error, attempt int) time.Duration {
 }
 
 // callLLM applies the two-stage pipeline and calls the model.
-func callLLM(ctx context.Context, agentCtx *AgentContext, config LoopConfig, ch chan<- Event, hooks llmCallHooks, turn TurnInfo) (Message, llmCallInfo, error) {
+func callLLM(ctx context.Context, agentCtx *AgentContext, config LoopConfig, ch chan<- Event, hooks llmCallHooks) (Message, llmCallInfo, error) {
 	messages := agentCtx.Messages
 
 	// Stage 1: ContextManager / TransformContext
@@ -560,28 +559,6 @@ func callLLM(ctx context.Context, agentCtx *AgentContext, config LoopConfig, ch 
 	}
 	if len(prefix) > 0 {
 		llmMessages = append(prefix, llmMessages...)
-	}
-
-	// Append per-turn reminders at the END of the message list. Reminders
-	// change every turn; placing them at the tail keeps the preceding
-	// constant-prefix chain (system prompt + growing history) intact for
-	// prefix caches. Anthropic adapters extract system messages in order
-	// regardless of position, so block-level cache markers stay correct.
-	if len(config.ReminderGens) > 0 {
-		if rm := reminderSystemMessages(collectReminders(ctx, config.ReminderGens, turn)); len(rm) > 0 {
-			llmMessages = append(llmMessages, rm...)
-		}
-	}
-
-	// Prepend per-turn attachments to the last user message's content. Unlike
-	// reminders (which sit at the tail outside the cache marker), attachments
-	// live inside the conversation prefix — they deliver dynamic system-level
-	// signals (e.g. plan mode entry/exit) WITHOUT mutating the system prompt,
-	// so SB1/SB2/SB3 cache entries stay valid.
-	if len(config.AttachmentGens) > 0 {
-		if atts := collectAttachments(ctx, config.AttachmentGens, turn); len(atts) > 0 {
-			llmMessages = injectAttachments(llmMessages, atts)
-		}
 	}
 
 	// Place a single cache write breakpoint on the last non-system message when
