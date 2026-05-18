@@ -4,9 +4,16 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"time"
 
 	"github.com/voocel/agentcore"
 	"github.com/voocel/litellm"
+)
+
+// Re-exports so callers do not need to import litellm directly.
+type (
+	ProviderConfig   = litellm.ProviderConfig
+	ResilienceConfig = litellm.ResilienceConfig
 )
 
 // LiteLLMAdapter adapts litellm to the agentcore.ChatModel interface.
@@ -16,7 +23,9 @@ type LiteLLMAdapter struct {
 	model  string
 }
 
-// NewLiteLLMAdapter creates an adapter from a litellm Client.
+// NewLiteLLMAdapter wraps an existing litellm.Client as a ChatModel. Use this
+// when you need to reuse a Client or inject a custom Provider instance; for
+// the common case prefer NewModel.
 func NewLiteLLMAdapter(model string, client *litellm.Client) *LiteLLMAdapter {
 	modelInfo := ModelInfo{
 		Name:     model,
@@ -48,43 +57,77 @@ func NewLiteLLMAdapter(model string, client *litellm.Client) *LiteLLMAdapter {
 	}
 }
 
-// newProviderAdapter is the shared constructor for all provider adapters.
-func newProviderAdapter(provider, model, apiKey string, baseURL ...string) (*LiteLLMAdapter, error) {
-	cfg := litellm.ProviderConfig{APIKey: apiKey}
-	if len(baseURL) > 0 {
-		cfg.BaseURL = baseURL[0]
+// modelConfig collects optional knobs for NewModel.
+type modelConfig struct {
+	apiKey        string
+	baseURL       string
+	timeout       time.Duration
+	streamIdle    time.Duration
+	streamIdleSet bool // distinguishes "unset" from explicit 0 (disable watchdog)
+	resilience    *ResilienceConfig
+}
+
+// ModelOption configures NewModel.
+type ModelOption func(*modelConfig)
+
+func WithAPIKey(key string) ModelOption  { return func(c *modelConfig) { c.apiKey = key } }
+func WithBaseURL(url string) ModelOption { return func(c *modelConfig) { c.baseURL = url } }
+
+// WithRequestTimeout sets the per-request timeout (default 10m).
+func WithRequestTimeout(d time.Duration) ModelOption {
+	return func(c *modelConfig) { c.timeout = d }
+}
+
+// WithStreamIdleTimeout aborts a streaming response if no chunk arrives within
+// the window (default 120s). Pass 0 to disable the watchdog explicitly.
+func WithStreamIdleTimeout(d time.Duration) ModelOption {
+	return func(c *modelConfig) {
+		c.streamIdle = d
+		c.streamIdleSet = true
 	}
-	client, err := litellm.NewWithProvider(provider, cfg)
+}
+
+// WithResilience replaces the entire resilience config; later With* options
+// may still override specific fields.
+func WithResilience(rc ResilienceConfig) ModelOption {
+	return func(c *modelConfig) { c.resilience = &rc }
+}
+
+// NewModel constructs a ChatModel by provider name. The provider must be
+// registered in litellm (builtin or via litellm.RegisterProvider).
+func NewModel(provider, model string, opts ...ModelOption) (*LiteLLMAdapter, error) {
+	cfg := modelConfig{}
+	for _, opt := range opts {
+		opt(&cfg)
+	}
+
+	pcfg := ProviderConfig{
+		APIKey:  cfg.apiKey,
+		BaseURL: cfg.baseURL,
+		Timeout: cfg.timeout,
+	}
+	if cfg.resilience != nil {
+		pcfg.Resilience = *cfg.resilience
+	}
+	if cfg.streamIdleSet {
+		if cfg.resilience == nil {
+			pcfg.Resilience = litellm.DefaultResilienceConfig()
+		}
+		pcfg.Resilience.StreamIdleTimeout = cfg.streamIdle
+	}
+
+	client, err := litellm.NewWithProvider(provider, pcfg)
 	if err != nil {
-		return nil, fmt.Errorf("%s: %w", provider, err)
+		return nil, fmt.Errorf("llm: %s: %w", provider, err)
 	}
 	return NewLiteLLMAdapter(model, client), nil
 }
 
-// NewOpenAIModel creates an OpenAI adapter.
-func NewOpenAIModel(model, apiKey string, baseURL ...string) (*LiteLLMAdapter, error) {
-	return newProviderAdapter("openai", model, apiKey, baseURL...)
-}
+// IsProviderRegistered reports whether the provider name is known to litellm.
+func IsProviderRegistered(name string) bool { return litellm.IsProviderRegistered(name) }
 
-// NewAnthropicModel creates an Anthropic adapter.
-func NewAnthropicModel(model, apiKey string, baseURL ...string) (*LiteLLMAdapter, error) {
-	return newProviderAdapter("anthropic", model, apiKey, baseURL...)
-}
-
-// NewGeminiModel creates a Gemini adapter.
-func NewGeminiModel(model, apiKey string, baseURL ...string) (*LiteLLMAdapter, error) {
-	return newProviderAdapter("gemini", model, apiKey, baseURL...)
-}
-
-// NewOpenRouterModel creates an OpenRouter adapter.
-func NewOpenRouterModel(model, apiKey string, baseURL ...string) (*LiteLLMAdapter, error) {
-	return newProviderAdapter("openrouter", model, apiKey, baseURL...)
-}
-
-// NewDeepSeekModel creates a DeepSeek adapter.
-func NewDeepSeekModel(model, apiKey string, baseURL ...string) (*LiteLLMAdapter, error) {
-	return newProviderAdapter("deepseek", model, apiKey, baseURL...)
-}
+// RegisteredProviders returns all provider names known to litellm (builtin + custom).
+func RegisteredProviders() []string { return litellm.ListRegisteredProviders() }
 
 // ProviderName returns the provider name (e.g. "openai", "anthropic").
 // Implements agentcore.ProviderNamer for per-provider API key resolution.

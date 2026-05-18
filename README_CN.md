@@ -56,7 +56,7 @@ import (
 )
 
 func main() {
-    model, err := llm.NewOpenAIModel("gpt-5-mini", os.Getenv("OPENAI_API_KEY"))
+    model, err := llm.NewModel("openai", "gpt-5-mini", llm.WithAPIKey(os.Getenv("OPENAI_API_KEY")))
     if err != nil {
         panic(err)
     }
@@ -115,7 +115,7 @@ import (
     "github.com/voocel/agentcore/tools"
 )
 
-model, _ := llm.NewOpenAIModel("gpt-5-mini", apiKey)
+model, _ := llm.NewModel("openai", "gpt-5-mini", llm.WithAPIKey(apiKey))
 
 scout := subagent.Config{
     Name:         "scout",
@@ -237,12 +237,12 @@ agent.Subscribe(func(ev agentcore.Event) {
 如果需要运行时换模型，可以用 `SwappableModel` 包一层。切换会在下一次调用生效。`subagent.Config.Model` 会在每次子 Agent 运行开始时重新解引用，所以同一个包装器对主 Agent 和子 Agent 都生效。
 
 ```go
-defaultModel, _ := llm.NewOpenAIModel("gpt-5-mini", apiKey)
+defaultModel, _ := llm.NewModel("openai", "gpt-5-mini", llm.WithAPIKey(apiKey))
 sw := agentcore.NewSwappableModel(defaultModel)
 
 agent := agentcore.NewAgent(agentcore.WithModel(sw))
 
-nextModel, _ := llm.NewOpenAIModel("gpt-5", apiKey)
+nextModel, _ := llm.NewModel("openai", "gpt-5", llm.WithAPIKey(apiKey))
 sw.Swap(nextModel) // 下一轮开始使用新模型
 ```
 

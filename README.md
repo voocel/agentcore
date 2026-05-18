@@ -56,7 +56,7 @@ import (
 )
 
 func main() {
-    model, err := llm.NewOpenAIModel("gpt-5-mini", os.Getenv("OPENAI_API_KEY"))
+    model, err := llm.NewModel("openai", "gpt-5-mini", llm.WithAPIKey(os.Getenv("OPENAI_API_KEY")))
     if err != nil {
         panic(err)
     }
@@ -116,7 +116,7 @@ import (
     "github.com/voocel/agentcore/tools"
 )
 
-model, _ := llm.NewOpenAIModel("gpt-5-mini", apiKey)
+model, _ := llm.NewModel("openai", "gpt-5-mini", llm.WithAPIKey(apiKey))
 
 scout := subagent.Config{
     Name:         "scout",
@@ -239,12 +239,12 @@ agent.Subscribe(func(ev agentcore.Event) {
 When a model needs to change at runtime, wrap it with `SwappableModel`. The swap takes effect on the next call. `subagent.Config.Model` is resolved at the start of each sub-agent run, so the same wrapper also works for sub-agents.
 
 ```go
-defaultModel, _ := llm.NewOpenAIModel("gpt-5-mini", apiKey)
+defaultModel, _ := llm.NewModel("openai", "gpt-5-mini", llm.WithAPIKey(apiKey))
 sw := agentcore.NewSwappableModel(defaultModel)
 
 agent := agentcore.NewAgent(agentcore.WithModel(sw))
 
-nextModel, _ := llm.NewOpenAIModel("gpt-5", apiKey)
+nextModel, _ := llm.NewModel("openai", "gpt-5", llm.WithAPIKey(apiKey))
 sw.Swap(nextModel) // next turn uses the new model
 ```
 
