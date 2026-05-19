@@ -4,5 +4,5 @@ go 1.25.0
 
 require (
 	github.com/voocel/litellm v1.6.10
-	golang.org/x/image v0.39.0
+	golang.org/x/image v0.40.0
 )

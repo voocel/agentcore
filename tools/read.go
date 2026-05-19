@@ -15,6 +15,7 @@ import (
 	"path/filepath"
 	"sort"
 	"strings"
+	"time"
 
 	_ "image/gif"
 
@@ -40,11 +41,21 @@ const (
 // ReadTool reads file contents with optional offset and limit.
 // Supports directory listings and image files. Text output is streamed and
 // truncated by line count / byte size. Binary files are rejected.
+//
+// Successful reads record a stamp on the shared FileReadState. Write and
+// Edit tools constructed with the same state enforce read-before-write and
+// detect stale writes.
 type ReadTool struct {
-	WorkDir string
+	WorkDir   string
+	readState *FileReadState
 }
 
-func NewRead(workDir string) *ReadTool { return &ReadTool{WorkDir: workDir} }
+func NewRead(workDir string, state *FileReadState) *ReadTool {
+	if state == nil {
+		panic("tools.NewRead: FileReadState is required (must be shared with Write/Edit)")
+	}
+	return &ReadTool{WorkDir: workDir, readState: state}
+}
 
 func (t *ReadTool) Name() string                              { return "read" }
 func (t *ReadTool) Label() string                              { return "Read File" }
@@ -82,10 +93,11 @@ type readArgs struct {
 }
 
 type resolvedRead struct {
-	path   string
-	offset int
-	limit  int
-	info   os.FileInfo
+	path    string
+	offset  int
+	limit   int
+	info    os.FileInfo
+	partial bool // user explicitly passed offset or limit
 }
 
 // Execute returns a text-only result (for backward compatibility / middleware).
@@ -99,6 +111,7 @@ func (t *ReadTool) Execute(ctx context.Context, args json.RawMessage) (json.RawM
 	if err != nil {
 		return nil, err
 	}
+	t.recordRead(a)
 	return json.Marshal(result)
 }
 
@@ -112,7 +125,11 @@ func (t *ReadTool) ExecuteContent(ctx context.Context, args json.RawMessage) ([]
 
 	if !a.info.IsDir() {
 		if mime := detectImageMIME(a.path); mime != "" {
-			return t.readImage(a.path, mime)
+			blocks, err := t.readImage(a.path, mime)
+			if err == nil {
+				t.recordRead(a)
+			}
+			return blocks, err
 		}
 	}
 
@@ -120,6 +137,7 @@ func (t *ReadTool) ExecuteContent(ctx context.Context, args json.RawMessage) ([]
 	if err != nil {
 		return nil, err
 	}
+	t.recordRead(a)
 	return []agentcore.ContentBlock{agentcore.TextBlock(result)}, nil
 }
 
@@ -141,6 +159,7 @@ func (t *ReadTool) parseArgs(args json.RawMessage) (resolvedRead, error) {
 		return resolvedRead{}, fmt.Errorf("read %s: %w", p, err)
 	}
 
+	partial := a.Offset > 0 || a.Limit > 0
 	offset := a.Offset
 	if offset <= 0 {
 		offset = 1
@@ -151,11 +170,26 @@ func (t *ReadTool) parseArgs(args json.RawMessage) (resolvedRead, error) {
 	}
 
 	return resolvedRead{
-		path:   p,
-		offset: offset,
-		limit:  limit,
-		info:   info,
+		path:    p,
+		offset:  offset,
+		limit:   limit,
+		info:    info,
+		partial: partial,
 	}, nil
+}
+
+// recordRead writes the read timestamp to FileReadState. Skipped for
+// directories. Files are keyed by absolute path so write/edit (which also
+// use ResolvePath) hit the same bucket.
+func (t *ReadTool) recordRead(a resolvedRead) {
+	if a.info == nil || a.info.IsDir() {
+		return
+	}
+	t.readState.Set(a.path, FileReadStamp{
+		ReadAt:  time.Now(),
+		Mtime:   a.info.ModTime(),
+		Partial: a.partial,
+	})
 }
 
 func (t *ReadTool) readTextual(ctx context.Context, a resolvedRead) (string, error) {

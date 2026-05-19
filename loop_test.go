@@ -382,6 +382,92 @@ func TestAgentLoop_ToolGate(t *testing.T) {
 	})
 }
 
+// validatorTool implements Tool + Validator. Track invocations to confirm
+// Validate is called and Execute is short-circuited on failure.
+type validatorTool struct {
+	validateCalls int
+	executeCalls  int
+	result        ValidationResult
+}
+
+func (t *validatorTool) Name() string        { return "vtool" }
+func (t *validatorTool) Description() string { return "tool with input validator" }
+func (t *validatorTool) Schema() map[string]any {
+	return map[string]any{
+		"type":       "object",
+		"properties": map[string]any{"x": map[string]any{"type": "string"}},
+		"required":   []string{"x"},
+	}
+}
+func (t *validatorTool) Validate(_ context.Context, _ json.RawMessage) ValidationResult {
+	t.validateCalls++
+	return t.result
+}
+func (t *validatorTool) Execute(_ context.Context, _ json.RawMessage) (json.RawMessage, error) {
+	t.executeCalls++
+	return json.RawMessage(`"ok"`), nil
+}
+
+func TestAgentLoop_ValidatorShortCircuit(t *testing.T) {
+	t.Run("OK=false skips execute and surfaces message as tool_result", func(t *testing.T) {
+		vt := &validatorTool{result: ValidationResult{
+			OK:        false,
+			Message:   "needs read first",
+			ErrorCode: 2,
+		}}
+
+		events := runTestLoop(t,
+			[]AgentMessage{UserMsg("test")},
+			AgentContext{Tools: []Tool{vt}},
+			LoopConfig{
+				Model: mockModel(
+					toolCallMsg(ToolCall{ID: "tc1", Name: "vtool", Args: json.RawMessage(`{"x":"y"}`)}),
+					assistantMsg("done", StopReasonStop),
+				),
+			},
+		)
+
+		if vt.validateCalls != 1 {
+			t.Fatalf("validate must run once, got %d", vt.validateCalls)
+		}
+		if vt.executeCalls != 0 {
+			t.Fatalf("execute must be skipped, got %d calls", vt.executeCalls)
+		}
+		end, ok := findEvent(events, EventToolExecEnd)
+		if !ok {
+			t.Fatal("expected EventToolExecEnd")
+		}
+		if !end.IsError {
+			t.Fatal("validate failure must surface as IsError=true")
+		}
+		if !strings.Contains(string(end.Result), "needs read first") {
+			t.Fatalf("expected message in result, got %s", string(end.Result))
+		}
+	})
+
+	t.Run("OK=true allows execute to run", func(t *testing.T) {
+		vt := &validatorTool{result: ValidationResult{OK: true}}
+
+		runTestLoop(t,
+			[]AgentMessage{UserMsg("test")},
+			AgentContext{Tools: []Tool{vt}},
+			LoopConfig{
+				Model: mockModel(
+					toolCallMsg(ToolCall{ID: "tc1", Name: "vtool", Args: json.RawMessage(`{"x":"y"}`)}),
+					assistantMsg("done", StopReasonStop),
+				),
+			},
+		)
+
+		if vt.validateCalls != 1 {
+			t.Fatalf("validate calls: want 1, got %d", vt.validateCalls)
+		}
+		if vt.executeCalls != 1 {
+			t.Fatalf("execute calls: want 1, got %d", vt.executeCalls)
+		}
+	})
+}
+
 func TestAgentLoop_PreviewAndProgress(t *testing.T) {
 	for _, tc := range []struct {
 		name              string

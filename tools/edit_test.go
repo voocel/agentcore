@@ -18,7 +18,7 @@ func TestEditFuzzyMatchTrailingUnicodeSpace(t *testing.T) {
 		t.Fatalf("write fixture: %v", err)
 	}
 
-	tool := NewEdit(dir)
+	tool := NewEdit(dir, NewFileReadState())
 	args, err := json.Marshal(map[string]any{
 		"file_path": "test.txt",
 		"old_string": "line\n",
@@ -51,7 +51,7 @@ func TestEditFuzzyDoesNotChangeUnrelatedSameLineText(t *testing.T) {
 		t.Fatalf("write fixture: %v", err)
 	}
 
-	tool := NewEdit(dir)
+	tool := NewEdit(dir, NewFileReadState())
 	args, err := json.Marshal(map[string]any{
 		"file_path": "test.txt",
 		"old_string": "target='old'",
@@ -85,7 +85,7 @@ func TestEditPreviewFuzzyNoMutation(t *testing.T) {
 		t.Fatalf("write fixture: %v", err)
 	}
 
-	tool := NewEdit(dir)
+	tool := NewEdit(dir, NewFileReadState())
 	args, err := json.Marshal(map[string]any{
 		"file_path": "test.txt",
 		"old_string": "target='old'",
@@ -129,7 +129,7 @@ func TestEditIndentAwareMatch(t *testing.T) {
 		t.Fatalf("write fixture: %v", err)
 	}
 
-	tool := NewEdit(dir)
+	tool := NewEdit(dir, NewFileReadState())
 	args, err := json.Marshal(map[string]any{
 		"file_path": "test.txt",
 		"old_string": "if true {\n\tprintln(\"old\")\n}",
@@ -163,7 +163,7 @@ func TestEditIndentAwareRequiresUniqueMatch(t *testing.T) {
 		t.Fatalf("write fixture: %v", err)
 	}
 
-	tool := NewEdit(dir)
+	tool := NewEdit(dir, NewFileReadState())
 	args, err := json.Marshal(map[string]any{
 		"file_path": "test.txt",
 		"old_string": "if true {\n\tprintln(\"old\")\n}",
@@ -188,7 +188,7 @@ func TestEditFailureIncludesClosestMatchHint(t *testing.T) {
 		t.Fatalf("write fixture: %v", err)
 	}
 
-	tool := NewEdit(dir)
+	tool := NewEdit(dir, NewFileReadState())
 	args, err := json.Marshal(map[string]any{
 		"file_path": "test.txt",
 		"old_string": "if true {\n\tprintln(\"old\")\n}",

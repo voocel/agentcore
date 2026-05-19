@@ -147,6 +147,33 @@ type Previewer interface {
 	Preview(ctx context.Context, args json.RawMessage) (json.RawMessage, error)
 }
 
+// ValidationResult is the verdict from a Validator.
+//
+// A failure (OK=false) is surfaced to the LLM as a normal tool_result with
+// IsError=true. The intent is "input is structurally legal but semantically
+// wrong" — e.g. write before read, mtime drift, deny rule. The LLM reads
+// Message and self-corrects (typically by issuing the right tool first and
+// retrying), without prompting the user.
+//
+// ErrorCode is optional, intended for stable identification by tests and
+// prompts; it is not interpreted by the agent core.
+type ValidationResult struct {
+	OK        bool
+	Message   string
+	ErrorCode int
+}
+
+// Validator is an optional interface for tools that want to short-circuit
+// before Preview / ToolGate / Execute when the input is structurally legal
+// but semantically wrong. Validators MUST NOT prompt the user, MUST NOT
+// mutate persistent state, and SHOULD be cheap (read-only lookups, stat).
+//
+// Returning OK=false produces a tool_result the LLM can act on; returning
+// OK=true continues the normal pipeline.
+type Validator interface {
+	Validate(ctx context.Context, args json.RawMessage) ValidationResult
+}
+
 // ---------------------------------------------------------------------------
 // ToolGate — pluggable approval / policy hook
 // ---------------------------------------------------------------------------

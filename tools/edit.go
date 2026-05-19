@@ -8,16 +8,26 @@ import (
 	"strings"
 	"unicode"
 
+	"github.com/voocel/agentcore"
 	"github.com/voocel/agentcore/schema"
 )
 
 // EditTool performs exact string replacement in a file.
 // Supports line ending normalization, fuzzy matching, and returns unified diff.
+//
+// Validate enforces read-before-edit and detects stale writes using the
+// shared FileReadState (same instance ReadTool writes to).
 type EditTool struct {
-	WorkDir string
+	WorkDir   string
+	readState *FileReadState
 }
 
-func NewEdit(workDir string) *EditTool { return &EditTool{WorkDir: workDir} }
+func NewEdit(workDir string, state *FileReadState) *EditTool {
+	if state == nil {
+		panic("tools.NewEdit: FileReadState is required (must be shared with Read/Write)")
+	}
+	return &EditTool{WorkDir: workDir, readState: state}
+}
 
 func (t *EditTool) Name() string                              { return "edit" }
 func (t *EditTool) Label() string                              { return "Edit File" }
@@ -60,6 +70,47 @@ type editResult struct {
 }
 
 // parseAndMatch reads the file, finds the match, and computes the replacement.
+// Validate enforces read-before-edit and detects stale writes. Unlike Write,
+// edit always requires an existing file — a non-existent path fails.
+// Error codes match WriteTool.Validate.
+func (t *EditTool) Validate(_ context.Context, args json.RawMessage) agentcore.ValidationResult {
+	var a editArgs
+	if err := json.Unmarshal(args, &a); err != nil {
+		return agentcore.ValidationResult{OK: false, Message: "invalid args: " + err.Error()}
+	}
+	path := ResolvePath(t.WorkDir, a.FilePath)
+
+	info, err := os.Stat(path)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return agentcore.ValidationResult{OK: false, Message: "file not found: " + path}
+		}
+		return agentcore.ValidationResult{OK: false, Message: "stat " + path + ": " + err.Error()}
+	}
+	if info.IsDir() {
+		return agentcore.ValidationResult{OK: false, Message: "path is a directory: " + path}
+	}
+
+	stamp, ok := t.readState.Get(path)
+	if !ok || stamp.Partial {
+		return agentcore.ValidationResult{
+			OK:        false,
+			ErrorCode: 2,
+			Message:   "File has not been read yet. Read it first before editing.",
+		}
+	}
+	// Compare against the mtime recorded at read time, not just "after ReadAt".
+	// Catches mtime regressions too (e.g. git checkout of an older version).
+	if !info.ModTime().Equal(stamp.Mtime) {
+		return agentcore.ValidationResult{
+			OK:        false,
+			ErrorCode: 3,
+			Message:   "File has been modified since read, either by the user or by a linter. Read it again before attempting to edit it.",
+		}
+	}
+	return agentcore.ValidationResult{OK: true}
+}
+
 func (t *EditTool) parseAndMatch(args json.RawMessage) (*editResult, error) {
 	var a editArgs
 	if err := json.Unmarshal(args, &a); err != nil {

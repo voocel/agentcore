@@ -61,13 +61,15 @@ func main() {
         panic(err)
     }
 
+    // 共享的 FileReadState，让 Write/Edit 能够强制 read-before-write。
+    fileState := tools.NewFileReadState()
     agent := agentcore.NewAgent(
         agentcore.WithModel(model),
         agentcore.WithSystemPrompt("你是一个编程助手。"),
         agentcore.WithTools(
-            tools.NewRead("."),
-            tools.NewWrite("."),
-            tools.NewEdit("."),
+            tools.NewRead(".", fileState),
+            tools.NewWrite(".", fileState),
+            tools.NewEdit(".", fileState),
             tools.NewBash("."),
         ),
     )
@@ -117,12 +119,16 @@ import (
 
 model, _ := llm.NewModel("openai", "gpt-5-mini", llm.WithAPIKey(apiKey))
 
+// 每个子 Agent 独立的 FileReadState — 各自有独立的 read 历史。
+scoutState := tools.NewFileReadState()
+workerState := tools.NewFileReadState()
+
 scout := subagent.Config{
     Name:         "scout",
     Description:  "快速代码侦察",
     Model:        model,
     SystemPrompt: "快速探索代码库并汇报发现。简洁明了。",
-    Tools:        []agentcore.Tool{tools.NewRead("."), tools.NewBash(".")},
+    Tools:        []agentcore.Tool{tools.NewRead(".", scoutState), tools.NewBash(".")},
     MaxTurns:     5,
 }
 
@@ -131,7 +137,7 @@ worker := subagent.Config{
     Description:  "通用执行者",
     Model:        model,
     SystemPrompt: "执行分配给你的任务。",
-    Tools:        []agentcore.Tool{tools.NewRead("."), tools.NewWrite("."), tools.NewEdit("."), tools.NewBash(".")},
+    Tools:        []agentcore.Tool{tools.NewRead(".", workerState), tools.NewWrite(".", workerState), tools.NewEdit(".", workerState), tools.NewBash(".")},
 }
 
 agent := agentcore.NewAgent(

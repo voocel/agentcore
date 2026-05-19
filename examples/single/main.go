@@ -22,13 +22,17 @@ func main() {
 		os.Exit(1)
 	}
 
+	// Shared file read state — Read records stamps that Write/Edit use to
+	// enforce read-before-write and detect stale writes.
+	fileState := tools.NewFileReadState()
+
 	agent := agentcore.NewAgent(
 		agentcore.WithModel(model),
 		agentcore.WithSystemPrompt("You are a helpful coding assistant. Use the provided tools to help users."),
 		agentcore.WithTools(
-			tools.NewRead("."),
-			tools.NewWrite("."),
-			tools.NewEdit("."),
+			tools.NewRead(".", fileState),
+			tools.NewWrite(".", fileState),
+			tools.NewEdit(".", fileState),
 			tools.NewBash("."),
 		),
 		agentcore.WithMaxTurns(20),

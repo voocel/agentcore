@@ -8,15 +8,25 @@ import (
 	"path/filepath"
 	"strings"
 
+	"github.com/voocel/agentcore"
 	"github.com/voocel/agentcore/schema"
 )
 
 // WriteTool writes content to a file, creating directories as needed.
+//
+// Validate enforces read-before-write and detects stale writes using the
+// shared FileReadState (same instance ReadTool writes to).
 type WriteTool struct {
-	WorkDir string
+	WorkDir   string
+	readState *FileReadState
 }
 
-func NewWrite(workDir string) *WriteTool { return &WriteTool{WorkDir: workDir} }
+func NewWrite(workDir string, state *FileReadState) *WriteTool {
+	if state == nil {
+		panic("tools.NewWrite: FileReadState is required (must be shared with Read/Edit)")
+	}
+	return &WriteTool{WorkDir: workDir, readState: state}
+}
 
 func (t *WriteTool) Name() string                              { return "write" }
 func (t *WriteTool) Label() string                              { return "Write File" }
@@ -104,6 +114,50 @@ func (t *WriteTool) Preview(_ context.Context, args json.RawMessage) (json.RawMe
 		"diff":               diff,
 		"first_changed_line": firstLine,
 	})
+}
+
+// Validate enforces read-before-write and detects stale writes.
+//
+// Error codes (stable for tests):
+//   - 2: existing file has not been read this session, or only a partial
+//     slice was read.
+//   - 3: file was modified after the last read.
+func (t *WriteTool) Validate(_ context.Context, args json.RawMessage) agentcore.ValidationResult {
+	var a writeArgs
+	if err := json.Unmarshal(args, &a); err != nil {
+		return agentcore.ValidationResult{OK: false, Message: "invalid args: " + err.Error()}
+	}
+	path := ResolvePath(t.WorkDir, a.FilePath)
+
+	info, err := os.Stat(path)
+	if os.IsNotExist(err) {
+		return agentcore.ValidationResult{OK: true}
+	}
+	if err != nil {
+		return agentcore.ValidationResult{OK: false, Message: "stat " + path + ": " + err.Error()}
+	}
+	if info.IsDir() {
+		return agentcore.ValidationResult{OK: false, Message: "path is a directory: " + path}
+	}
+
+	stamp, ok := t.readState.Get(path)
+	if !ok || stamp.Partial {
+		return agentcore.ValidationResult{
+			OK:        false,
+			ErrorCode: 2,
+			Message:   "File has not been read yet. Read it first before writing to it.",
+		}
+	}
+	// Compare against the mtime recorded at read time, not just "after ReadAt".
+	// Catches mtime regressions too (e.g. git checkout of an older version).
+	if !info.ModTime().Equal(stamp.Mtime) {
+		return agentcore.ValidationResult{
+			OK:        false,
+			ErrorCode: 3,
+			Message:   "File has been modified since read, either by the user or by a linter. Read it again before attempting to write it.",
+		}
+	}
+	return agentcore.ValidationResult{OK: true}
 }
 
 func (t *WriteTool) Execute(_ context.Context, args json.RawMessage) (json.RawMessage, error) {

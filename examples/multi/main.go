@@ -28,6 +28,12 @@ func main() {
 		os.Exit(1)
 	}
 
+	// One file read state per agent. Sub-agents get their own independent
+	// state since they have their own conversation history.
+	mainState := tools.NewFileReadState()
+	scoutState := tools.NewFileReadState()
+	reviewerState := tools.NewFileReadState()
+
 	// Define sub-agent configurations (like pi's .md agent files)
 	scout := subagent.Config{
 		Name:         "scout",
@@ -35,7 +41,7 @@ func main() {
 		Model:        scoutModel,
 		SystemPrompt: "You are a scout agent. Quickly explore the codebase and report what you find. Be concise.",
 		Tools: []agentcore.Tool{
-			tools.NewRead("."),
+			tools.NewRead(".", scoutState),
 			tools.NewBash("."),
 		},
 		MaxTurns: 5,
@@ -47,7 +53,7 @@ func main() {
 		Model:        mainModel,
 		SystemPrompt: "You are a code reviewer. Review the code and provide constructive feedback on quality, style, and correctness.",
 		Tools: []agentcore.Tool{
-			tools.NewRead("."),
+			tools.NewRead(".", reviewerState),
 			tools.NewBash("."),
 		},
 		MaxTurns: 5,
@@ -63,9 +69,9 @@ func main() {
 				"You can use chain mode to scout first, then review based on findings.",
 		),
 		agentcore.WithTools(
-			tools.NewRead("."),
-			tools.NewWrite("."),
-			tools.NewEdit("."),
+			tools.NewRead(".", mainState),
+			tools.NewWrite(".", mainState),
+			tools.NewEdit(".", mainState),
 			tools.NewBash("."),
 			subagent.New(scout, reviewer),
 		),

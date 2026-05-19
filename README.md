@@ -61,13 +61,15 @@ func main() {
         panic(err)
     }
 
+    // Shared FileReadState so Write/Edit can enforce read-before-write.
+    fileState := tools.NewFileReadState()
     agent := agentcore.NewAgent(
         agentcore.WithModel(model),
         agentcore.WithSystemPrompt("You are a helpful coding assistant."),
         agentcore.WithTools(
-            tools.NewRead("."),
-            tools.NewWrite("."),
-            tools.NewEdit("."),
+            tools.NewRead(".", fileState),
+            tools.NewWrite(".", fileState),
+            tools.NewEdit(".", fileState),
             tools.NewBash("."),
         ),
     )
@@ -118,12 +120,16 @@ import (
 
 model, _ := llm.NewModel("openai", "gpt-5-mini", llm.WithAPIKey(apiKey))
 
+// Each sub-agent gets its own FileReadState — independent read history.
+scoutState := tools.NewFileReadState()
+workerState := tools.NewFileReadState()
+
 scout := subagent.Config{
     Name:         "scout",
     Description:  "Fast codebase reconnaissance",
     Model:        model,
     SystemPrompt: "Quickly explore and report findings. Be concise.",
-    Tools:        []agentcore.Tool{tools.NewRead("."), tools.NewBash(".")},
+    Tools:        []agentcore.Tool{tools.NewRead(".", scoutState), tools.NewBash(".")},
     MaxTurns:     5,
 }
 
@@ -132,7 +138,7 @@ worker := subagent.Config{
     Description:  "General-purpose executor",
     Model:        model,
     SystemPrompt: "Implement tasks given to you.",
-    Tools:        []agentcore.Tool{tools.NewRead("."), tools.NewWrite("."), tools.NewEdit("."), tools.NewBash(".")},
+    Tools:        []agentcore.Tool{tools.NewRead(".", workerState), tools.NewWrite(".", workerState), tools.NewEdit(".", workerState), tools.NewBash(".")},
 }
 
 agent := agentcore.NewAgent(

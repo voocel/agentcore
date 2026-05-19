@@ -795,6 +795,38 @@ func executeSingleToolCall(ctx context.Context, tools []Tool, call ToolCall, con
 			IsError:    true,
 		}
 	} else {
+		// Stage 1: business-level input validation. Distinct from schema
+		// validation above — Validators check semantics (write-before-read,
+		// mtime drift, ...) using state the tool was constructed with.
+		// Failures are surfaced as a normal tool_result with IsError=true so
+		// the LLM can self-correct without prompting the user. Validators
+		// MUST NOT prompt or mutate persistent state.
+		if v, ok := tool.(Validator); ok {
+			vr := v.Validate(ctx, call.Args)
+			if !vr.OK {
+				msg := vr.Message
+				if msg == "" {
+					msg = "tool input validation failed"
+				}
+				content, _ := json.Marshal(msg)
+				result = ToolResult{
+					ToolCallID: call.ID,
+					ToolName:   call.Name,
+					Content:    content,
+					IsError:    true,
+				}
+				emit(ch, Event{
+					Type:      EventToolExecEnd,
+					ToolID:    call.ID,
+					Tool:      call.Name,
+					ToolLabel: label,
+					Result:    content,
+					IsError:   true,
+				})
+				return result
+			}
+		}
+
 		var preview json.RawMessage
 
 		// Preview: if tool supports it, compute and emit preview before execution.
