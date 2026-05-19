@@ -14,24 +14,25 @@ import (
 
 // WriteTool writes content to a file, creating directories as needed.
 //
-// Validate enforces read-before-write and detects stale writes using the
-// shared FileReadState (same instance ReadTool writes to).
+// Validate enforces read-before-write and detects stale writes when state is
+// non-nil.
 type WriteTool struct {
 	WorkDir   string
 	readState *FileReadState
 }
 
+// NewWrite creates a write tool rooted at workDir.
+//
+// Pass the same non-nil FileReadState to NewRead, NewWrite, and NewEdit to
+// enable read-before-write/edit validation. Pass nil to disable this tracking.
 func NewWrite(workDir string, state *FileReadState) *WriteTool {
-	if state == nil {
-		panic("tools.NewWrite: FileReadState is required (must be shared with Read/Edit)")
-	}
 	return &WriteTool{WorkDir: workDir, readState: state}
 }
 
-func (t *WriteTool) Name() string                              { return "write" }
-func (t *WriteTool) Label() string                              { return "Write File" }
-func (t *WriteTool) ReadOnly(_ json.RawMessage) bool            { return false }
-func (t *WriteTool) ConcurrencySafe(_ json.RawMessage) bool     { return false }
+func (t *WriteTool) Name() string                                 { return "write" }
+func (t *WriteTool) Label() string                                { return "Write File" }
+func (t *WriteTool) ReadOnly(_ json.RawMessage) bool              { return false }
+func (t *WriteTool) ConcurrencySafe(_ json.RawMessage) bool       { return false }
 func (t *WriteTool) ActivityDescription(_ json.RawMessage) string { return "Writing file" }
 func (t *WriteTool) Description() string {
 	return `Writes a file to the local filesystem.
@@ -123,6 +124,10 @@ func (t *WriteTool) Preview(_ context.Context, args json.RawMessage) (json.RawMe
 //     slice was read.
 //   - 3: file was modified after the last read.
 func (t *WriteTool) Validate(_ context.Context, args json.RawMessage) agentcore.ValidationResult {
+	if t.readState == nil {
+		return agentcore.ValidationResult{OK: true}
+	}
+
 	var a writeArgs
 	if err := json.Unmarshal(args, &a); err != nil {
 		return agentcore.ValidationResult{OK: false, Message: "invalid args: " + err.Error()}

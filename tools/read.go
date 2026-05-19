@@ -42,25 +42,26 @@ const (
 // Supports directory listings and image files. Text output is streamed and
 // truncated by line count / byte size. Binary files are rejected.
 //
-// Successful reads record a stamp on the shared FileReadState. Write and
-// Edit tools constructed with the same state enforce read-before-write and
-// detect stale writes.
+// Successful reads record a stamp when state is non-nil. Write and Edit tools
+// constructed with the same state enforce read-before-write and detect stale
+// writes.
 type ReadTool struct {
 	WorkDir   string
 	readState *FileReadState
 }
 
+// NewRead creates a read tool rooted at workDir.
+//
+// Pass the same non-nil FileReadState to NewRead, NewWrite, and NewEdit to
+// enable read-before-write/edit validation. Pass nil to disable this tracking.
 func NewRead(workDir string, state *FileReadState) *ReadTool {
-	if state == nil {
-		panic("tools.NewRead: FileReadState is required (must be shared with Write/Edit)")
-	}
 	return &ReadTool{WorkDir: workDir, readState: state}
 }
 
-func (t *ReadTool) Name() string                              { return "read" }
-func (t *ReadTool) Label() string                              { return "Read File" }
-func (t *ReadTool) ReadOnly(_ json.RawMessage) bool            { return true }
-func (t *ReadTool) ConcurrencySafe(_ json.RawMessage) bool     { return true }
+func (t *ReadTool) Name() string                                 { return "read" }
+func (t *ReadTool) Label() string                                { return "Read File" }
+func (t *ReadTool) ReadOnly(_ json.RawMessage) bool              { return true }
+func (t *ReadTool) ConcurrencySafe(_ json.RawMessage) bool       { return true }
 func (t *ReadTool) ActivityDescription(_ json.RawMessage) string { return "Reading file" }
 func (t *ReadTool) Description() string {
 	return fmt.Sprintf(
@@ -182,7 +183,7 @@ func (t *ReadTool) parseArgs(args json.RawMessage) (resolvedRead, error) {
 // directories. Files are keyed by absolute path so write/edit (which also
 // use ResolvePath) hit the same bucket.
 func (t *ReadTool) recordRead(a resolvedRead) {
-	if a.info == nil || a.info.IsDir() {
+	if t.readState == nil || a.info == nil || a.info.IsDir() {
 		return
 	}
 	t.readState.Set(a.path, FileReadStamp{

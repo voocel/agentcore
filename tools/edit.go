@@ -15,24 +15,25 @@ import (
 // EditTool performs exact string replacement in a file.
 // Supports line ending normalization, fuzzy matching, and returns unified diff.
 //
-// Validate enforces read-before-edit and detects stale writes using the
-// shared FileReadState (same instance ReadTool writes to).
+// Validate enforces read-before-edit and detects stale writes when state is
+// non-nil.
 type EditTool struct {
 	WorkDir   string
 	readState *FileReadState
 }
 
+// NewEdit creates an edit tool rooted at workDir.
+//
+// Pass the same non-nil FileReadState to NewRead, NewWrite, and NewEdit to
+// enable read-before-write/edit validation. Pass nil to disable this tracking.
 func NewEdit(workDir string, state *FileReadState) *EditTool {
-	if state == nil {
-		panic("tools.NewEdit: FileReadState is required (must be shared with Read/Write)")
-	}
 	return &EditTool{WorkDir: workDir, readState: state}
 }
 
-func (t *EditTool) Name() string                              { return "edit" }
-func (t *EditTool) Label() string                              { return "Edit File" }
-func (t *EditTool) ReadOnly(_ json.RawMessage) bool            { return false }
-func (t *EditTool) ConcurrencySafe(_ json.RawMessage) bool     { return false }
+func (t *EditTool) Name() string                                 { return "edit" }
+func (t *EditTool) Label() string                                { return "Edit File" }
+func (t *EditTool) ReadOnly(_ json.RawMessage) bool              { return false }
+func (t *EditTool) ConcurrencySafe(_ json.RawMessage) bool       { return false }
 func (t *EditTool) ActivityDescription(_ json.RawMessage) string { return "Editing file" }
 func (t *EditTool) Description() string {
 	return `Performs exact string replacements in files.
@@ -69,11 +70,14 @@ type editResult struct {
 	newContent string
 }
 
-// parseAndMatch reads the file, finds the match, and computes the replacement.
 // Validate enforces read-before-edit and detects stale writes. Unlike Write,
 // edit always requires an existing file — a non-existent path fails.
 // Error codes match WriteTool.Validate.
 func (t *EditTool) Validate(_ context.Context, args json.RawMessage) agentcore.ValidationResult {
+	if t.readState == nil {
+		return agentcore.ValidationResult{OK: true}
+	}
+
 	var a editArgs
 	if err := json.Unmarshal(args, &a); err != nil {
 		return agentcore.ValidationResult{OK: false, Message: "invalid args: " + err.Error()}
