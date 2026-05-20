@@ -121,7 +121,7 @@ func (a *Agent) PromptMessages(msgs ...AgentMessage) error {
 	a.mu.Lock()
 	if a.isRunning {
 		a.mu.Unlock()
-		return fmt.Errorf("agent is already running; use Steer() or FollowUp() to queue messages")
+		return fmt.Errorf("%w; use Steer() or FollowUp() to queue messages", ErrAlreadyRunning)
 	}
 	a.startPromptRunLocked(msgs)
 	return nil
@@ -133,11 +133,11 @@ func (a *Agent) Continue() error {
 	a.mu.Lock()
 	if a.isRunning {
 		a.mu.Unlock()
-		return fmt.Errorf("agent is already running")
+		return ErrAlreadyRunning
 	}
 	if len(a.messages) == 0 {
 		a.mu.Unlock()
-		return fmt.Errorf("no messages to continue from")
+		return ErrNoMessages
 	}
 
 	// If last message is assistant, try to dequeue pending messages as new prompt
@@ -154,7 +154,7 @@ func (a *Agent) Continue() error {
 			return nil
 		}
 		a.mu.Unlock()
-		return fmt.Errorf("cannot continue from assistant message without queued messages")
+		return ErrBadContinuation
 	}
 
 	a.startContinueRunLocked()
@@ -252,7 +252,7 @@ func (a *Agent) SetMessages(msgs []AgentMessage) error {
 	a.mu.Lock()
 	defer a.mu.Unlock()
 	if a.isRunning {
-		return fmt.Errorf("cannot set messages while agent is running")
+		return fmt.Errorf("cannot set messages: %w", ErrAlreadyRunning)
 	}
 	a.messages = copyMessages(msgs)
 	a.syncContextManagerLocked()

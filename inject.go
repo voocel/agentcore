@@ -28,7 +28,7 @@ type InjectResult struct {
 // delivered on the next run.
 func (a *Agent) Inject(msg AgentMessage) (InjectResult, error) {
 	if msg == nil {
-		return InjectResult{}, fmt.Errorf("inject message is nil")
+		return InjectResult{}, ErrInjectNilMessage
 	}
 
 	a.mu.Lock()
@@ -49,7 +49,7 @@ func (a *Agent) Inject(msg AgentMessage) (InjectResult, error) {
 		return InjectResult{Disposition: InjectQueued}, nil
 	}
 	if err := a.Continue(); err != nil {
-		return InjectResult{Disposition: InjectQueued}, fmt.Errorf("inject: idle resume failed: %w", err)
+		return InjectResult{Disposition: InjectQueued}, fmt.Errorf("inject idle resume failed: %w", err)
 	}
 	return InjectResult{Disposition: InjectResumedIdleRun}, nil
 }

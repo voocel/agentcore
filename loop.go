@@ -8,7 +8,6 @@ import (
 	"maps"
 	"math"
 	"slices"
-	"sort"
 	"strings"
 	"time"
 
@@ -65,7 +64,7 @@ func AgentLoopContinue(ctx context.Context, agentCtx AgentContext, config LoopCo
 	if len(agentCtx.Messages) == 0 {
 		go func() {
 			defer close(ch)
-			emitError(ch, fmt.Errorf("cannot continue: no messages in context"), &RunSummary{
+			emitError(ch, ErrNoMessages, &RunSummary{
 				EndReason: EndReasonError,
 			})
 		}()
@@ -175,7 +174,7 @@ func runLoop(ctx context.Context, currentCtx *AgentContext, newMessages *[]Agent
 			}
 
 			if turnCount >= maxTurns {
-				emit(ch, Event{Type: EventError, Err: fmt.Errorf("max turns (%d) reached", maxTurns)})
+				emit(ch, Event{Type: EventError, Err: &MaxTurnsError{Limit: maxTurns}})
 				emit(ch, Event{Type: EventAgentEnd, NewMessages: *newMessages, Summary: buildSummary(turnCount, EndReasonMaxTurns)})
 				return
 			}
@@ -351,7 +350,7 @@ func runLoop(ctx context.Context, currentCtx *AgentContext, newMessages *[]Agent
 				Message:   lastAssistantMsg,
 			})
 			if decision.Escalate {
-				emit(ch, Event{Type: EventError, Err: fmt.Errorf("stop guard escalated: run terminated")})
+				emit(ch, Event{Type: EventError, Err: ErrStopGuard})
 				emit(ch, Event{Type: EventAgentEnd, NewMessages: *newMessages, Summary: buildSummary(turnCount, EndReasonError)})
 				return
 			}
@@ -461,7 +460,7 @@ func callLLMWithRetry(ctx context.Context, agentCtx *AgentContext, config LoopCo
 // is returned.
 func recoverOverflow(ctx context.Context, agentCtx *AgentContext, config LoopConfig, ch chan<- Event, originalErr error, hooks llmCallHooks) (Message, llmCallInfo, error) {
 	if config.ContextManager == nil {
-		return Message{}, llmCallInfo{}, fmt.Errorf("context overflow (no compaction configured): %w", originalErr)
+		return Message{}, llmCallInfo{}, &ContextOverflowError{Cause: fmt.Errorf("no compaction configured: %w", originalErr)}
 	}
 
 	emit(ch, Event{
@@ -476,23 +475,18 @@ func recoverOverflow(ctx context.Context, agentCtx *AgentContext, config LoopCon
 
 	recovery, err := config.ContextManager.RecoverOverflow(ctx, agentCtx.Messages, originalErr)
 	if err != nil {
-		return Message{}, llmCallInfo{}, fmt.Errorf("overflow recovery compaction failed: %w", err)
+		return Message{}, llmCallInfo{}, &ContextOverflowError{Cause: fmt.Errorf("compaction failed: %w", err)}
 	}
 	if len(recovery.View) == 0 {
-		return Message{}, llmCallInfo{}, fmt.Errorf("overflow recovery returned empty prompt view")
+		return Message{}, llmCallInfo{}, &ContextOverflowError{Cause: errors.New("compaction returned empty prompt view")}
 	}
 	agentCtx.Messages = recovery.View
 	if recovery.ShouldCommit && len(recovery.CommitMessages) > 0 && config.CommitContext != nil {
 		if err := config.CommitContext(recovery.CommitMessages, recovery.Usage); err != nil {
-			return Message{}, llmCallInfo{}, fmt.Errorf("overflow recovery commit failed: %w", err)
+			return Message{}, llmCallInfo{}, &ContextOverflowError{Cause: fmt.Errorf("commit failed: %w", err)}
 		}
 	}
 	return callLLM(ctx, agentCtx, config, ch, hooks)
-}
-
-// IsContextOverflow reports whether the error indicates a context window overflow.
-func IsContextOverflow(err error) bool {
-	return litellm.IsContextOverflowError(err)
 }
 
 // retryDelay calculates the wait duration using exponential backoff.
@@ -580,7 +574,7 @@ func callLLM(ctx context.Context, agentCtx *AgentContext, config LoopConfig, ch 
 	}
 
 	if config.Model == nil {
-		return Message{}, llmCallInfo{}, fmt.Errorf("no model configured")
+		return Message{}, llmCallInfo{}, ErrNoModel
 	}
 
 	// Build per-call options
@@ -620,18 +614,6 @@ func markLastMessageForCache(messages []Message, cacheControl string) []Message 
 	md["cache_control"] = cacheControl
 	out[idx].Metadata = md
 	return out
-}
-
-// PartialStreamError indicates a stream closed without a terminal done event.
-// The Partial field carries any content received before truncation; callers
-// can inspect it (e.g. to log diagnostics) but should NOT persist it as a
-// completed message — the stream did not finish cleanly.
-type PartialStreamError struct {
-	Partial Message
-}
-
-func (e *PartialStreamError) Error() string {
-	return "llm stream closed without done event"
 }
 
 // callLLMStream uses GenerateStream and emits real-time events.
@@ -1106,8 +1088,8 @@ func buildToolSpecs(tools []Tool) []ToolSpec {
 func validateToolArgs(tool Tool, call ToolCall) error {
 	if call.ArgsInvalid {
 		return fmt.Errorf(
-			"InputValidationError: %s received malformed JSON arguments: %s\nraw args: %s",
-			tool.Name(), call.ArgsParseError, call.ArgsRawText,
+			"%w: %s received malformed JSON arguments: %s\nraw args: %s",
+			ErrToolValidation, tool.Name(), call.ArgsParseError, call.ArgsRawText,
 		)
 	}
 
@@ -1122,16 +1104,17 @@ func validateToolArgs(tool Tool, call ToolCall) error {
 	}
 	var parsed map[string]any
 	if err := json.Unmarshal(args, &parsed); err != nil {
-		return fmt.Errorf("InputValidationError: %s received invalid JSON arguments: %v", tool.Name(), err)
+		return fmt.Errorf("%w: %s received invalid JSON arguments: %v",
+			ErrToolValidation, tool.Name(), err)
 	}
 
-	var issues []validationIssue
+	var issues []ValidationIssue
 
 	if reqSlice, ok := schema["required"]; ok {
 		if required, ok := reqSlice.([]string); ok {
 			for _, field := range required {
 				if _, exists := parsed[field]; !exists {
-					issues = append(issues, validationIssue{kind: issueMissing, path: field})
+					issues = append(issues, ValidationIssue{Kind: IssueMissing, Path: field})
 				}
 			}
 		}
@@ -1158,11 +1141,11 @@ func validateToolArgs(tool Tool, call ToolCall) error {
 				continue
 			}
 			if received, mismatch := typeMismatch(val, expectedType); mismatch {
-				issues = append(issues, validationIssue{
-					kind:     issueType,
-					path:     key,
-					expected: expectedType,
-					received: received,
+				issues = append(issues, ValidationIssue{
+					Kind:     IssueType,
+					Path:     key,
+					Expected: expectedType,
+					Received: received,
 				})
 			}
 		}
@@ -1171,52 +1154,7 @@ func validateToolArgs(tool Tool, call ToolCall) error {
 	if len(issues) == 0 {
 		return nil
 	}
-	return fmt.Errorf("%s", formatInputValidationError(tool.Name(), issues))
-}
-
-const (
-	issueMissing = "missing"
-	issueType    = "type"
-)
-
-type validationIssue struct {
-	kind     string
-	path     string
-	expected string
-	received string
-}
-
-// formatInputValidationError renders all collected issues as a single multi-line
-// block. Missing params come first (the most fundamental error), then type
-// mismatches; within each group, paths are sorted alphabetically for stable
-// output across map-iteration orders.
-func formatInputValidationError(toolName string, issues []validationIssue) string {
-	sort.SliceStable(issues, func(i, j int) bool {
-		if issues[i].kind != issues[j].kind {
-			return issues[i].kind == issueMissing
-		}
-		return issues[i].path < issues[j].path
-	})
-
-	lines := make([]string, 0, len(issues))
-	for _, it := range issues {
-		switch it.kind {
-		case issueMissing:
-			lines = append(lines, fmt.Sprintf("The required parameter `%s` is missing", it.path))
-		case issueType:
-			lines = append(lines, fmt.Sprintf(
-				"The parameter `%s` type is expected as `%s` but provided as `%s`",
-				it.path, it.expected, it.received,
-			))
-		}
-	}
-
-	noun := "issue"
-	if len(lines) > 1 {
-		noun = "issues"
-	}
-	header := fmt.Sprintf("InputValidationError: %s failed due to the following %s:", toolName, noun)
-	return header + "\n" + strings.Join(lines, "\n")
+	return &ToolValidationError{ToolName: tool.Name(), Issues: issues}
 }
 
 // typeMismatch reports whether val conflicts with the JSON Schema type. When it

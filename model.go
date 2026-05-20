@@ -3,7 +3,6 @@ package agentcore
 import (
 	"context"
 	"encoding/json"
-	"fmt"
 	"sync"
 )
 
@@ -305,7 +304,7 @@ func (m *SwappableModel) Current() ChatModel {
 func (m *SwappableModel) Generate(ctx context.Context, messages []Message, tools []ToolSpec, opts ...CallOption) (*LLMResponse, error) {
 	model := m.Current()
 	if model == nil {
-		return nil, fmt.Errorf("no model configured")
+		return nil, ErrNoModel
 	}
 	return model.Generate(ctx, messages, tools, opts...)
 }
@@ -313,7 +312,7 @@ func (m *SwappableModel) Generate(ctx context.Context, messages []Message, tools
 func (m *SwappableModel) GenerateStream(ctx context.Context, messages []Message, tools []ToolSpec, opts ...CallOption) (<-chan StreamEvent, error) {
 	model := m.Current()
 	if model == nil {
-		return nil, fmt.Errorf("no model configured")
+		return nil, ErrNoModel
 	}
 	return model.GenerateStream(ctx, messages, tools, opts...)
 }
