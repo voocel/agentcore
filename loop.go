@@ -416,6 +416,15 @@ func callLLMWithRetry(ctx context.Context, agentCtx *AgentContext, config LoopCo
 			return Message{}, info, err
 		}
 
+		// User cancellation is never retryable: the next attempt would just
+		// rediscover ctx.Done(), and emitting EventRetry in that window surfaces
+		// confusing "retry (1/N)" messages to users who already aborted. Aligns
+		// with IsFailoverEligible (errors.go) and litellm/resilience.go, which
+		// both treat context.Canceled as terminal.
+		if errors.Is(err, context.Canceled) {
+			return Message{}, info, err
+		}
+
 		// PartialStreamError (stream closed without done) is treated as retryable:
 		// it most often signals a transient network/provider stream-format issue
 		// that a fresh request can recover from. The HasCompletedToolCalls guard
