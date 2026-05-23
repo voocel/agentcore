@@ -223,7 +223,7 @@ func (t *Tool) Execute(ctx context.Context, args json.RawMessage) (json.RawMessa
 		if t.taskRT == nil {
 			return nil, fmt.Errorf("background mode requires a wired TaskRuntime (call subagent.Tool.SetTaskRuntime)")
 		}
-		return t.executeBackground(p.Agent, p.Task, p.Description, modelOverride)
+		return t.executeBackground(ctx, p.Agent, p.Task, p.Description, modelOverride)
 	}
 
 	modeCount := boolToInt(hasChain) + boolToInt(hasParallel) + boolToInt(hasSingle)
@@ -244,7 +244,7 @@ func (t *Tool) Execute(ctx context.Context, args json.RawMessage) (json.RawMessa
 // executeBackground launches a sub-agent in a detached goroutine and returns
 // immediately. When the sub-agent finishes, a notification is sent via
 // notifyFn (typically Agent.FollowUp).
-func (t *Tool) executeBackground(agentName, taskStr, description string, modelOverride agentcore.ChatModel) (json.RawMessage, error) {
+func (t *Tool) executeBackground(callerCtx context.Context, agentName, taskStr, description string, modelOverride agentcore.ChatModel) (json.RawMessage, error) {
 	if _, ok := t.agents[agentName]; !ok {
 		available := make([]string, 0, len(t.agents))
 		for name := range t.agents {
@@ -261,12 +261,32 @@ func (t *Tool) executeBackground(agentName, taskStr, description string, modelOv
 			"error": "background mode requires a TaskRuntime; call SetTaskRuntime before use",
 		})
 	}
+
+	// Depth guard: refuse to spawn beyond MaxAgentDepth so a runaway recursion
+	// (e.g. a future team member accidentally given a spawn channel and looping)
+	// can't burn through tokens before someone notices. callerCtx carries the
+	// caller's depth via task.DepthFromContext — 0 when called from the main
+	// agent loop, n inside a depth-n sub-agent.
+	childDepth := task.DepthFromContext(callerCtx) + 1
+	if childDepth > task.MaxAgentDepth {
+		return json.Marshal(map[string]any{
+			"error": fmt.Sprintf("agent nesting depth %d exceeds max %d — refusing to spawn", childDepth, task.MaxAgentDepth),
+		})
+	}
+
 	taskID := rt.NextID("bg")
 	if description == "" {
 		description = truncate(taskStr, 80)
 	}
 
+	// Detach from caller ctx on purpose: background tasks outlive the parent
+	// agent's current turn. Session-level shutdown is handled by
+	// task.Runtime.StopAll() (wired in Runtime.Close), which invokes this
+	// cancel func — so a "zombie bg goroutine after process exit" is impossible.
 	bgCtx, cancel := context.WithCancel(context.Background())
+	// Thread the child's depth into bgCtx so any spawn the child itself makes
+	// will see the correct parent depth when reading DepthFromContext.
+	bgCtx = task.WithDepth(bgCtx, childDepth)
 
 	entry := &task.Entry{
 		ID:          taskID,
@@ -276,6 +296,7 @@ func (t *Tool) executeBackground(agentName, taskStr, description string, modelOv
 		Description: description,
 		Status:      task.Running,
 		StartedAt:   time.Now(),
+		Depth:       childDepth,
 	}
 	entry.SetCancel(cancel)
 	rt.Register(entry)

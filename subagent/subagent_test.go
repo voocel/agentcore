@@ -291,6 +291,67 @@ func (m *fakeNamedModel) GenerateStream(ctx context.Context, messages []agentcor
 
 func (m *fakeNamedModel) SupportsTools() bool { return true }
 
+// Background spawn must refuse to nest beyond task.MaxAgentDepth so a future
+// peer-spawn channel (added with team support) can't trigger runaway
+// recursion. We simulate "the caller is already at depth N" by threading the
+// depth into ctx, then asserting the spawn either succeeds with childDepth=N+1
+// or rejects when N+1 > MaxAgentDepth.
+func TestTool_BackgroundRespectsMaxAgentDepth(t *testing.T) {
+	tool := New(simpleAgent("writer", "ok"))
+	tool.SetTaskRuntime(task.NewRuntime())
+
+	cases := []struct {
+		callerDepth  int
+		wantError    bool
+		wantBgDepth  int // entry.Depth on success path
+	}{
+		{callerDepth: 0, wantError: false, wantBgDepth: 1},                     // main agent
+		{callerDepth: task.MaxAgentDepth - 1, wantError: false, wantBgDepth: 5}, // last legal level
+		{callerDepth: task.MaxAgentDepth, wantError: true},                      // childDepth = 6, rejected
+		{callerDepth: task.MaxAgentDepth + 5, wantError: true},                  // way past
+	}
+
+	for _, tc := range cases {
+		ctx := task.WithDepth(context.Background(), tc.callerDepth)
+		raw, err := tool.Execute(ctx, json.RawMessage(`{"agent":"writer","task":"go","background":true}`))
+		if err != nil {
+			t.Fatalf("callerDepth=%d: unexpected execute error: %v", tc.callerDepth, err)
+		}
+		var resp map[string]any
+		if err := json.Unmarshal(raw, &resp); err != nil {
+			t.Fatalf("callerDepth=%d: parse: %v (%s)", tc.callerDepth, err, raw)
+		}
+		if tc.wantError {
+			errMsg, _ := resp["error"].(string)
+			if !strings.Contains(errMsg, "depth") {
+				t.Errorf("callerDepth=%d: want depth error, got %v", tc.callerDepth, resp)
+			}
+			continue
+		}
+		taskID, _ := resp["task_id"].(string)
+		if taskID == "" {
+			t.Fatalf("callerDepth=%d: missing task_id in success response: %v", tc.callerDepth, resp)
+		}
+		// Wait briefly for the registered entry to appear with its depth set.
+		// Registration is synchronous inside executeBackground, so a single
+		// Get() should suffice — but guard with a short retry to make the
+		// test resilient to scheduler timing.
+		var entry *task.Entry
+		for range 20 {
+			if e := tool.taskRT.Get(taskID); e != nil {
+				entry = e
+				break
+			}
+		}
+		if entry == nil {
+			t.Fatalf("callerDepth=%d: entry never appeared in runtime", tc.callerDepth)
+		}
+		if entry.Depth != tc.wantBgDepth {
+			t.Errorf("callerDepth=%d: entry.Depth = %d, want %d", tc.callerDepth, entry.Depth, tc.wantBgDepth)
+		}
+	}
+}
+
 // Verifies the parent→child wiring end-to-end: a message queued via
 // task.Runtime.AppendPending while the background sub-agent is running must
 // reach the sub-agent's next LLM call. The chain under test is:

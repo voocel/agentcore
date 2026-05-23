@@ -493,6 +493,22 @@ func (a *Agent) BuildLLMMessages() ([]Message, error) {
 	return llmMessages, nil
 }
 
+// BuildLLMTools returns the ToolSpec list this agent would send to the LLM on
+// its next turn — the exact same conversion buildToolSpecs runs inside the
+// agent loop, including DeferFilter handling.
+//
+// Side-channel callers (the /btw side-question path, prompt suggestion) need
+// this to keep their request's `tools` field byte-identical to the main
+// agent's last request — Anthropic's prompt cache rejects any prefix
+// difference, and `tools` precedes the system-block cache breakpoint. Without
+// this method, those callers send `tools: nil` and miss the system cache.
+func (a *Agent) BuildLLMTools() []ToolSpec {
+	a.mu.Lock()
+	tools := a.tools
+	a.mu.Unlock()
+	return buildToolSpecs(tools)
+}
+
 // SetTools replaces the tool set. Takes effect on the next turn.
 func (a *Agent) SetTools(tools ...Tool) {
 	a.mu.Lock()

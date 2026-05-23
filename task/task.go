@@ -4,6 +4,7 @@
 package task
 
 import (
+	"context"
 	"fmt"
 	"slices"
 	"strconv"
@@ -32,6 +33,37 @@ const (
 	TypeSubAgent Type = "subagent"
 )
 
+// MaxAgentDepth caps how deep sub-agents may nest. The main agent is depth 0;
+// a sub-agent it spawns is depth 1; a sub-agent inside that would be depth 2.
+// Today the subagent tool is filtered out of every sub-agent's pool, so depth
+// is structurally capped at 1 — this constant is defense in depth for when
+// team support lands and peer agents gain a spawn channel.
+//
+// 5 mirrors what CC tracks in queryTracking.depth — a value high enough to
+// permit legitimate fan-out but low enough to catch runaway recursion before
+// it burns through tokens.
+const MaxAgentDepth = 5
+
+// depthKey is the ctx key used to thread an agent's depth into the goroutine
+// running it. Sub-agent spawn paths read the parent's depth from ctx, increment
+// it, and pass the new ctx into the child's loop.
+type depthKey struct{}
+
+// DepthFromContext returns the current agent's depth — 0 for the main agent,
+// n+1 inside a depth-n sub-agent. Unset (top-level) ctx returns 0.
+func DepthFromContext(ctx context.Context) int {
+	if v, ok := ctx.Value(depthKey{}).(int); ok {
+		return v
+	}
+	return 0
+}
+
+// WithDepth threads `depth` into ctx so a sub-agent spawned via this ctx can
+// read its caller's depth and reject overly deep nesting.
+func WithDepth(ctx context.Context, depth int) context.Context {
+	return context.WithValue(ctx, depthKey{}, depth)
+}
+
 // Entry is the unified representation of any background task.
 // Both shell tools and sub-agent tools register entries through a shared
 // Runtime.
@@ -46,6 +78,7 @@ type Entry struct {
 	Error       string
 	ExitCode    int    // shell: process exit code
 	ToolCount   int    // number of tool calls executed
+	Depth       int    // nesting depth: 1 for tasks spawned by the main agent; n+1 inside a depth-n task. See MaxAgentDepth.
 	cancel      func() // unexported: only Stop()/StopAll() should use this
 
 	// Shell-specific
