@@ -501,6 +501,27 @@ func (t *Tool) runAgent(ctx context.Context, agentName, taskStr string, modelOve
 		ContextManager:     contextManager,
 		ConvertToLLM:       cfg.ConvertToLLM,
 	}
+
+	// Drain parent→child messages at every steering tick so a SendToSubAgent
+	// call mid-execution gets seen on the next turn rather than after the
+	// agent decides to stop. Foreground runs have no task entry to drain from,
+	// so this is only wired in the background path. Matches CC's
+	// getAgentPendingMessageAttachments injection model.
+	if bg != nil && bg.rt != nil {
+		taskID := bg.taskID
+		rt := bg.rt
+		loopCfg.GetSteeringMessages = func() []agentcore.AgentMessage {
+			drained := rt.DrainPending(taskID)
+			if len(drained) == 0 {
+				return nil
+			}
+			msgs := make([]agentcore.AgentMessage, 0, len(drained))
+			for _, m := range drained {
+				msgs = append(msgs, agentcore.UserMsg(m))
+			}
+			return msgs
+		}
+	}
 	if len(cfg.StopAfterTools) > 0 {
 		stopSet := make(map[string]struct{}, len(cfg.StopAfterTools))
 		for _, name := range cfg.StopAfterTools {

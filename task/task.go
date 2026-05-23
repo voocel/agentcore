@@ -58,6 +58,13 @@ type Entry struct {
 	Result    string // final assistant text from the sub-agent
 	TokensIn  int
 	TokensOut int
+
+	// pendingMessages queues parent→child messages delivered to the sub-agent
+	// at the next steering tick. Guarded by Runtime.mu (not a per-entry mutex)
+	// so copyEntry can keep its `cp := *e` pattern without copying a lock.
+	// Drain is called once per turn at most — Runtime.mu contention is a
+	// non-issue at that rate.
+	pendingMessages []string
 }
 
 // IsTerminal reports whether a task has reached a terminal state.
@@ -169,9 +176,57 @@ func (r *Runtime) Update(id string, fn func(e *Entry)) bool {
 	return true
 }
 
+// AppendStatus enumerates the outcomes of AppendPending. We return a status
+// instead of (bool, error) because the caller (a tool) needs to format three
+// distinct user-visible messages: "queued", "not found", and "task already
+// finished" — each implies a different follow-up.
+type AppendStatus int
+
+const (
+	AppendOK       AppendStatus = iota // message queued
+	AppendNotFound                     // no entry with that ID
+	AppendTerminal                     // entry exists but already in terminal state
+)
+
+// AppendPending queues a message for delivery to a sub-agent's next steering
+// tick. Returns the outcome so the caller can choose its error wording.
+//
+// Terminal tasks are NOT auto-resumed here — CC does that via resumeAgent on
+// disk transcripts, which is a stage 6 capability. Today the parent agent
+// gets AppendTerminal back and reports the failure to the user.
+func (r *Runtime) AppendPending(id, msg string) AppendStatus {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	e, ok := r.tasks[id]
+	if !ok {
+		return AppendNotFound
+	}
+	if e.Status.IsTerminal() {
+		return AppendTerminal
+	}
+	e.pendingMessages = append(e.pendingMessages, msg)
+	return AppendOK
+}
+
+// DrainPending returns and clears the queued messages for the given task.
+// Returns nil when there is nothing queued so callers can short-circuit.
+// Called from the sub-agent loop's steering hook — see subagent.runAgent.
+func (r *Runtime) DrainPending(id string) []string {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	e, ok := r.tasks[id]
+	if !ok || len(e.pendingMessages) == 0 {
+		return nil
+	}
+	out := e.pendingMessages
+	e.pendingMessages = nil
+	return out
+}
+
 func copyEntry(e *Entry) *Entry {
 	cp := *e
-	cp.cancel = nil // snapshots don't carry cancel
+	cp.cancel = nil          // snapshots don't carry cancel
+	cp.pendingMessages = nil // snapshots don't carry the live queue
 	return &cp
 }
 

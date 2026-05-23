@@ -7,8 +7,10 @@ import (
 	"strings"
 	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/voocel/agentcore"
+	"github.com/voocel/agentcore/task"
 )
 
 // mockModel returns the responses one at a time. Generate and GenerateStream
@@ -288,3 +290,104 @@ func (m *fakeNamedModel) GenerateStream(ctx context.Context, messages []agentcor
 }
 
 func (m *fakeNamedModel) SupportsTools() bool { return true }
+
+// Verifies the parent→child wiring end-to-end: a message queued via
+// task.Runtime.AppendPending while the background sub-agent is running must
+// reach the sub-agent's next LLM call. The chain under test is:
+//
+//	AppendPending → Runtime.pendingMessages
+//	             → loopCfg.GetSteeringMessages (bound in runAgent)
+//	             → injected as UserMsg before turn 2
+//
+// If any link breaks, the second LLM call won't see "follow-up steered".
+func TestTool_BackgroundDrainsPendingMessagesIntoNextTurn(t *testing.T) {
+	rt := task.NewRuntime()
+
+	// The injecting tool needs to know its own task ID to call AppendPending.
+	// We hand it off via a buffered channel — the main goroutine writes after
+	// Execute returns; the tool reads when the first turn invokes it.
+	taskIDCh := make(chan string, 1)
+	const steeringMsg = "follow-up steered"
+
+	injectTool := agentcore.NewFuncTool("inject", "queues a pending message", map[string]any{
+		"type": "object", "properties": map[string]any{},
+	}, func(ctx context.Context, _ json.RawMessage) (json.RawMessage, error) {
+		select {
+		case id := <-taskIDCh:
+			rt.AppendPending(id, steeringMsg)
+			taskIDCh <- id // re-fill for any subsequent tool call
+		case <-time.After(time.Second):
+			return nil, errors.New("taskID channel never received")
+		}
+		return json.Marshal("ok")
+	})
+
+	var sawSteering atomic.Bool
+	cfg := Config{
+		Name:        "writer",
+		Description: "writer",
+		Tools:       []agentcore.Tool{injectTool},
+		Model: newSequential(func(i int, req *agentcore.LLMRequest) (*agentcore.LLMResponse, error) {
+			switch i {
+			case 0:
+				return &agentcore.LLMResponse{Message: agentcore.Message{
+					Role: agentcore.RoleAssistant,
+					Content: []agentcore.ContentBlock{
+						agentcore.ToolCallBlock(agentcore.ToolCall{
+							ID: "tc1", Name: "inject", Args: json.RawMessage(`{}`),
+						}),
+					},
+					StopReason: agentcore.StopReasonToolUse,
+				}}, nil
+			default:
+				// Inspect the prompt at the second LLM call: the steering
+				// message should have been injected before this turn.
+				for _, msg := range req.Messages {
+					if msg.Role == agentcore.RoleUser && strings.Contains(msg.TextContent(), steeringMsg) {
+						sawSteering.Store(true)
+						break
+					}
+				}
+				return &agentcore.LLMResponse{Message: agentcore.Message{
+					Role:       agentcore.RoleAssistant,
+					Content:    []agentcore.ContentBlock{agentcore.TextBlock("done")},
+					StopReason: agentcore.StopReasonStop,
+				}}, nil
+			}
+		}),
+		MaxTurns: 5,
+	}
+
+	tool := New(cfg)
+	tool.SetTaskRuntime(rt)
+
+	raw, err := tool.Execute(context.Background(), json.RawMessage(`{"agent":"writer","task":"start","background":true}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var resp map[string]any
+	if err := json.Unmarshal(raw, &resp); err != nil {
+		t.Fatalf("parse background response: %v", err)
+	}
+	taskID, _ := resp["task_id"].(string)
+	if taskID == "" {
+		t.Fatalf("missing task_id in background response: %s", string(raw))
+	}
+	taskIDCh <- taskID
+
+	// Wait for the background goroutine to reach a terminal state.
+	deadline := time.Now().Add(3 * time.Second)
+	for time.Now().Before(deadline) {
+		if e := rt.Get(taskID); e != nil && e.Status.IsTerminal() {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+
+	if e := rt.Get(taskID); e == nil || !e.Status.IsTerminal() {
+		t.Fatalf("background task did not finish in time: %+v", e)
+	}
+	if !sawSteering.Load() {
+		t.Fatal("steering message was not injected into the second LLM call — wiring is broken")
+	}
+}
