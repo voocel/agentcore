@@ -4,10 +4,10 @@
 package task
 
 import (
-	"encoding/json"
 	"fmt"
 	"slices"
 	"strconv"
+	"strings"
 	"sync"
 	"time"
 
@@ -21,6 +21,7 @@ const (
 	Running   Status = "running"
 	Completed Status = "completed"
 	Failed    Status = "failed"
+	Killed    Status = "killed"
 )
 
 // Type distinguishes the origin of a background task.
@@ -54,8 +55,14 @@ type Entry struct {
 	// SubAgent-specific
 	Agent     string
 	Prompt    string // original task prompt
+	Result    string // final assistant text from the sub-agent
 	TokensIn  int
 	TokensOut int
+}
+
+// IsTerminal reports whether a task has reached a terminal state.
+func (s Status) IsTerminal() bool {
+	return s == Completed || s == Failed || s == Killed
 }
 
 // SetCancel sets the cancellation function for this task entry.
@@ -176,18 +183,34 @@ func copyEntry(e *Entry) *Entry {
 // by ToAgentMessage().
 const CompletedTag = "background-task-completed"
 
-// Notification is the JSON payload delivered to the calling agent when a
-// background task finishes.
+// Usage summarises a sub-agent's resource consumption for the notification.
+type Usage struct {
+	TotalTokens int
+	ToolUses    int
+	DurationMs  int64
+}
+
+// Notification is the payload delivered to the calling agent when a
+// background task finishes. The parent agent receives this wrapped as XML so
+// it can both react immediately to <result> and read <output-file> on demand.
 type Notification struct {
-	TaskID      string `json:"task_id"`
-	Type        Type   `json:"type"`
-	Status      Status `json:"status"`
-	Description string `json:"description,omitempty"`
-	OutputFile  string `json:"output_file,omitempty"`
-	Error       string `json:"error,omitempty"`
-	ExitCode    *int   `json:"exit_code,omitempty"`
-	Command     string `json:"command,omitempty"`
-	Agent       string `json:"agent,omitempty"`
+	TaskID      string
+	Type        Type
+	Status      Status
+	Description string
+
+	// SubAgent
+	Agent  string
+	Result string // final assistant text — lets parent continue without IO
+	Usage  *Usage
+
+	// Shell
+	Command  string
+	ExitCode *int
+
+	// Common
+	OutputFile string // disk path to the full transcript / log
+	Error      string
 }
 
 // NotificationFromEntry converts a task entry into a notification payload.
@@ -204,20 +227,103 @@ func NotificationFromEntry(e *Entry) Notification {
 		Error:       e.Error,
 		Command:     e.Command,
 		Agent:       e.Agent,
+		Result:      e.Result,
 	}
 	if e.Type == TypeShell && e.Status != Running {
 		exitCode := e.ExitCode
 		n.ExitCode = &exitCode
 	}
+	if e.Type == TypeSubAgent && e.Status.IsTerminal() {
+		n.Usage = &Usage{
+			TotalTokens: e.TokensIn + e.TokensOut,
+			ToolUses:    e.ToolCount,
+			DurationMs:  durationMs(e.StartedAt, e.EndedAt),
+		}
+	}
 	return n
 }
 
-// ToAgentMessage wraps the notification as a user-role AgentMessage that the
-// parent agent can consume as a follow-up.
-func (n Notification) ToAgentMessage() agentcore.AgentMessage {
-	data, err := json.Marshal(n)
-	if err != nil {
-		return agentcore.UserMsg(fmt.Sprintf("<%s>\n{\"task_id\":%q,\"status\":\"failed\",\"error\":%q}\n</%s>", CompletedTag, n.TaskID, err.Error(), CompletedTag))
+func durationMs(start, end time.Time) int64 {
+	if start.IsZero() || end.IsZero() {
+		return 0
 	}
-	return agentcore.UserMsg(fmt.Sprintf("<%s>\n%s\n</%s>", CompletedTag, string(data), CompletedTag))
+	return end.Sub(start).Milliseconds()
+}
+
+// ToAgentMessage wraps the notification as a user-role AgentMessage that the
+// parent agent can consume as a follow-up. The XML is hand-formatted with
+// nested elements (instead of JSON-in-XML) because LLMs parse structured XML
+// reliably and the format mirrors patterns Claude already recognises.
+func (n Notification) ToAgentMessage() agentcore.AgentMessage {
+	var b strings.Builder
+	fmt.Fprintf(&b, "<%s>\n", CompletedTag)
+	fmt.Fprintf(&b, "<task-id>%s</task-id>\n", n.TaskID)
+	fmt.Fprintf(&b, "<type>%s</type>\n", n.Type)
+	fmt.Fprintf(&b, "<status>%s</status>\n", n.Status)
+	fmt.Fprintf(&b, "<summary>%s</summary>\n", summarise(n))
+
+	if n.Agent != "" {
+		fmt.Fprintf(&b, "<agent>%s</agent>\n", n.Agent)
+	}
+	if n.Command != "" {
+		fmt.Fprintf(&b, "<command>%s</command>\n", n.Command)
+	}
+	if n.ExitCode != nil {
+		fmt.Fprintf(&b, "<exit-code>%d</exit-code>\n", *n.ExitCode)
+	}
+	if n.Error != "" {
+		fmt.Fprintf(&b, "<error>%s</error>\n", n.Error)
+	}
+	if n.Result != "" {
+		fmt.Fprintf(&b, "<result>%s</result>\n", n.Result)
+	}
+	if n.Usage != nil {
+		fmt.Fprintf(&b, "<usage><total-tokens>%d</total-tokens><tool-uses>%d</tool-uses><duration-ms>%d</duration-ms></usage>\n",
+			n.Usage.TotalTokens, n.Usage.ToolUses, n.Usage.DurationMs)
+	}
+	if n.OutputFile != "" {
+		fmt.Fprintf(&b, "<output-file>%s</output-file>\n", n.OutputFile)
+	}
+	fmt.Fprintf(&b, "</%s>", CompletedTag)
+	return agentcore.UserMsg(b.String())
+}
+
+func summarise(n Notification) string {
+	label := n.Description
+	if label == "" {
+		switch n.Type {
+		case TypeSubAgent:
+			label = n.Agent
+		case TypeShell:
+			label = n.Command
+		}
+	}
+	noun := "Task"
+	if n.Type == TypeSubAgent {
+		noun = fmt.Sprintf("Agent %q", label)
+		label = ""
+	}
+	switch n.Status {
+	case Completed:
+		if label != "" {
+			return fmt.Sprintf("%s %q completed", noun, label)
+		}
+		return noun + " completed"
+	case Failed:
+		reason := n.Error
+		if reason == "" {
+			reason = "unknown error"
+		}
+		if label != "" {
+			return fmt.Sprintf("%s %q failed: %s", noun, label, reason)
+		}
+		return fmt.Sprintf("%s failed: %s", noun, reason)
+	case Killed:
+		if label != "" {
+			return fmt.Sprintf("%s %q was stopped", noun, label)
+		}
+		return noun + " was stopped"
+	default:
+		return string(n.Status)
+	}
 }

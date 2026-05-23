@@ -292,22 +292,28 @@ func (t *Tool) executeBackground(agentName, taskStr, description string, modelOv
 			}
 		}
 
-		_, _, u, err := t.runAgent(bgCtx, agentName, taskStr, modelOverride, &bgRunOpts{taskID: taskID, rt: rt, outFile: outFile})
+		output, _, u, err := t.runAgent(bgCtx, agentName, taskStr, modelOverride, &bgRunOpts{taskID: taskID, rt: rt, outFile: outFile})
 		if outFile != nil {
 			outFile.Close()
 		}
 
 		rt.Update(taskID, func(e *task.Entry) {
 			e.EndedAt = time.Now()
-			if err != nil {
+			e.Result = output
+			switch {
+			case err != nil && bgCtx.Err() != nil:
+				// Cancellation observed: this was an explicit Stop, not a failure.
+				e.Status = task.Killed
+			case err != nil:
 				e.Status = task.Failed
 				e.Error = err.Error()
-			} else {
+			default:
 				e.Status = task.Completed
 			}
 			if u != nil {
 				e.TokensIn = u.Input
 				e.TokensOut = u.Output
+				e.ToolCount = u.Tools
 			}
 		})
 		t.notify(taskID)
