@@ -157,7 +157,7 @@ func (l *LiteLLMAdapter) Generate(ctx context.Context, messages []agentcore.Mess
 
 	msg := convertResponse(ltResp)
 	if msg.Usage != nil {
-		msg.Usage.Cost = CalculateCost(l.Info().Pricing, msg.Usage)
+		msg.Usage.Cost = CalculateCost(pricingForUsage(l.Info().Pricing, msg.Usage), msg.Usage)
 	}
 	return &agentcore.LLMResponse{Message: msg}, nil
 }
@@ -326,16 +326,19 @@ func (l *LiteLLMAdapter) GenerateStream(ctx context.Context, messages []agentcor
 		}
 
 		// Map usage from collected response.
-		if resp != nil && (resp.Usage.TotalTokens > 0 || resp.Usage.PromptTokens > 0) {
+		if resp != nil && resp.Usage.HasTokens() {
 			u := resp.Usage
+			provider, model := responseUsageModel(resp)
 			partial.Usage = &agentcore.Usage{
+				Provider:    provider,
+				Model:       model,
 				Input:       u.PromptTokens,
 				Output:      u.CompletionTokens,
 				CacheRead:   u.CacheReadInputTokens,
 				CacheWrite:  u.CacheCreationInputTokens,
 				TotalTokens: u.TotalTokens,
 			}
-			partial.Usage.Cost = CalculateCost(l.Info().Pricing, partial.Usage)
+			partial.Usage.Cost = CalculateCost(pricingForUsage(l.Info().Pricing, partial.Usage), partial.Usage)
 		}
 		if resp != nil {
 			partial.StopReason = mapStopReason(resp.FinishReason)
@@ -518,8 +521,11 @@ func convertResponse(response *litellm.Response) agentcore.Message {
 
 	// Map usage
 	var usage *agentcore.Usage
-	if response.Usage.TotalTokens > 0 {
+	if response.Usage.HasTokens() {
+		provider, model := responseUsageModel(response)
 		usage = &agentcore.Usage{
+			Provider:    provider,
+			Model:       model,
 			Input:       response.Usage.PromptTokens,
 			Output:      response.Usage.CompletionTokens,
 			CacheRead:   response.Usage.CacheReadInputTokens,
@@ -533,6 +539,37 @@ func convertResponse(response *litellm.Response) agentcore.Message {
 		Content:    content,
 		StopReason: mapStopReason(response.FinishReason),
 		Usage:      usage,
+	}
+}
+
+func responseUsageModel(response *litellm.Response) (provider, model string) {
+	if response == nil {
+		return "", ""
+	}
+	provider = response.Usage.Provider
+	model = response.Usage.Model
+	if provider == "" {
+		provider = response.Provider
+	}
+	if model == "" {
+		model = response.Model
+	}
+	return provider, model
+}
+
+func pricingForUsage(fallback *ModelPricing, usage *agentcore.Usage) *ModelPricing {
+	if usage == nil || usage.Model == "" {
+		return fallback
+	}
+	pricing, ok := litellm.GetModelPricing(usage.Model)
+	if !ok {
+		return fallback
+	}
+	return &ModelPricing{
+		InputPerToken:      pricing.InputCostPerToken,
+		OutputPerToken:     pricing.OutputCostPerToken,
+		CacheReadPerToken:  pricing.CacheReadCostPerToken,
+		CacheWritePerToken: pricing.CacheWriteCostPerToken,
 	}
 }
 

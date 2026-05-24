@@ -62,12 +62,13 @@ type Config struct {
 	StopGuardFactory func(agentName, task string) agentcore.StopGuard
 }
 
-// params is the JSON schema input for the subagent tool. Four mutually
+// params is the JSON schema input for the subagent tool. Five mutually
 // exclusive modes:
 //   - Single: Agent + Task
 //   - Parallel: Tasks array
 //   - Chain: Chain array with {previous} placeholder
 //   - Background: Single + Background=true
+//   - Team spawn: Agent + Task + TeamName (long-lived teammate)
 type params struct {
 	Agent       string      `json:"agent,omitempty"`
 	Task        string      `json:"task,omitempty"`
@@ -76,6 +77,14 @@ type params struct {
 	Background  bool        `json:"background,omitempty"`
 	Description string      `json:"description,omitempty"`
 	Model       string      `json:"model,omitempty"`
+
+	// Team-spawn parameters. TeamName is the switch: when non-empty the
+	// subagent tool delegates to the configured TeamSpawner instead of
+	// running a one-shot loop. Name is the teammate's identifier inside the
+	// team (defaults to Agent if omitted). Color is an optional UI hint.
+	TeamName string `json:"team_name,omitempty"`
+	Name     string `json:"name,omitempty"`
+	Color    string `json:"color,omitempty"`
 }
 
 type taskItem struct {
@@ -110,6 +119,50 @@ type usage struct {
 	Tools      int     `json:"tools"`
 }
 
+// TeamSpawnRequest is the contract between the subagent tool and the
+// codebot-side team spawner. The subagent tool builds this from its params
+// after validating the requested agent definition exists; the spawner is
+// responsible for the actual goroutine launch, tool augmentation
+// (e.g. injecting send_message), and team registry bookkeeping.
+type TeamSpawnRequest struct {
+	// Config is the resolved sub-agent definition the teammate runs as.
+	// Spawner reads SystemPrompt, Tools, Model, MaxTurns etc. from here.
+	Config Config
+
+	// Name is the teammate's identifier inside the team (routing key for
+	// send_message). May equal Config.Name when the LLM did not specify one.
+	Name string
+
+	// TeamName is the active team's name; spawner validates against registry.
+	TeamName string
+
+	// InitialPrompt is the leader's first message to the teammate.
+	InitialPrompt string
+
+	// Description is an optional one-line summary for transcripts/UI.
+	Description string
+
+	// Color is an optional UI color assigned to this teammate.
+	Color string
+
+	// Model is non-nil when the LLM requested an override; nil means the
+	// spawner should fall back to Config.Model.
+	Model agentcore.ChatModel
+}
+
+// TeamSpawnResult is what the spawner returns synchronously. The teammate
+// itself runs in the background; callers terminate it via task.Runtime.Stop
+// (by TaskID) or by the team's shutdown protocol.
+type TeamSpawnResult struct {
+	TaskID  string
+	AgentID string // "name@team"
+}
+
+// TeamSpawner is the function shape codebot installs via SetTeamSpawner.
+// Kept as a function rather than an interface because the subagent tool only
+// needs one method and call sites are simpler with a closure.
+type TeamSpawner func(ctx context.Context, req TeamSpawnRequest) (*TeamSpawnResult, error)
+
 // Tool implements agentcore.Tool. The main agent calls this tool to delegate
 // tasks to specialized sub-agents with isolated contexts.
 type Tool struct {
@@ -118,6 +171,7 @@ type Tool struct {
 	createModel     func(name string) (agentcore.ChatModel, error)                 // resolves model name to ChatModel at runtime
 	bgOutputFactory func(taskID, agentName string) (io.WriteCloser, string, error) // creates output writer for background tasks
 	taskRT          *task.Runtime                                                  // shared background task registry
+	teamSpawner     TeamSpawner                                                    // routes team-mode calls; nil means team spawn is rejected
 }
 
 // New creates a subagent tool from a set of agent configs.
@@ -148,6 +202,14 @@ func (t *Tool) SetCreateModel(fn func(name string) (agentcore.ChatModel, error))
 	t.createModel = fn
 }
 
+// SetTeamSpawner installs the closure that handles team-spawn mode. Without
+// it, calls that set team_name are rejected with a clear error so the LLM
+// learns the feature is unavailable rather than silently downgrading to a
+// regular subagent run.
+func (t *Tool) SetTeamSpawner(fn TeamSpawner) {
+	t.teamSpawner = fn
+}
+
 // SetBgOutputFactory sets the factory that creates output writers for
 // background tasks. The factory receives the task ID and agent name and
 // returns a writer, file path, and error.
@@ -166,7 +228,8 @@ func (t *Tool) Description() string {
 	return fmt.Sprintf(
 		"Delegate tasks to specialized subagents with isolated context. "+
 			"Modes: single (agent+task), parallel (tasks array), chain (sequential with {previous} placeholder), "+
-			"background (agent+task+background=true, returns immediately and notifies on completion). "+
+			"background (agent+task+background=true, returns immediately and notifies on completion), "+
+			"team (agent+task+team_name spawns a long-lived teammate that communicates via send_message). "+
 			"Available agents: %s",
 		strings.Join(names, ", "),
 	)
@@ -182,13 +245,16 @@ func (t *Tool) Schema() map[string]any {
 		schema.Property("task", schema.String("Task description")).Required(),
 	)
 	return schema.Object(
-		schema.Property("agent", schema.Enum("Name of the agent to invoke (single/background mode)", agentNames...)),
-		schema.Property("task", schema.String("Task to delegate (single/background mode)")),
+		schema.Property("agent", schema.Enum("Name of the agent to invoke (single/background/team mode)", agentNames...)),
+		schema.Property("task", schema.String("Task to delegate (single/background/team mode)")),
 		schema.Property("tasks", schema.Array("Array of {agent, task} for parallel execution", taskItem)),
 		schema.Property("chain", schema.Array("Array of {agent, task} for sequential execution. Use {previous} in task to reference prior output.", taskItem)),
 		schema.Property("background", schema.Bool("Set true to run in background. Returns immediately; a notification is sent when the task completes.")),
-		schema.Property("description", schema.String("Short description of the background task (shown in notifications).")),
+		schema.Property("description", schema.String("Short description of the background/team task (shown in notifications and listings).")),
 		schema.Property("model", schema.String("Optional model override for this call (e.g. model ID or alias). If not set, uses the agent's default model.")),
+		schema.Property("team_name", schema.String("Name of the active team. When set, spawns a long-lived teammate instead of running a one-shot subagent.")),
+		schema.Property("name", schema.String("Teammate name inside the team (defaults to the agent's name). Must be unique and not 'team-lead'.")),
+		schema.Property("color", schema.String("Optional UI color tag for the teammate.")),
 	)
 }
 
@@ -211,6 +277,20 @@ func (t *Tool) Execute(ctx context.Context, args json.RawMessage) (json.RawMessa
 	hasChain := len(p.Chain) > 0
 	hasParallel := len(p.Tasks) > 0
 	hasSingle := p.Agent != "" && p.Task != ""
+
+	// Team-spawn mode: long-lived teammate. Mutually exclusive with the
+	// other modes — Background and team_name together is ambiguous, and
+	// parallel/chain are conceptually one-shot. Check this BEFORE Background
+	// so a user calling with both keys gets the team-mode error path.
+	if p.TeamName != "" {
+		if p.Background || hasChain || hasParallel {
+			return json.Marshal("team_name is mutually exclusive with background/tasks/chain")
+		}
+		if !hasSingle {
+			return json.Marshal("team mode requires agent + task")
+		}
+		return t.executeTeamSpawn(ctx, p, modelOverride)
+	}
 
 	// Background mode: single task running in a detached goroutine.
 	// Requires a wired TaskRuntime — no silent degradation to sync, because
@@ -239,6 +319,53 @@ func (t *Tool) Execute(ctx context.Context, args json.RawMessage) (json.RawMessa
 	default:
 		return t.executeSingle(ctx, p.Agent, p.Task, modelOverride)
 	}
+}
+
+// executeTeamSpawn delegates to the installed TeamSpawner. The subagent tool
+// validates the requested agent definition exists and prepares a TeamSpawnRequest
+// from params; the spawner owns the actual goroutine launch, tool-set
+// augmentation (e.g. add send_message), and registry bookkeeping. This split
+// keeps agentcore/subagent unaware of team-specific tools while still routing
+// team spawn through one user-facing surface.
+func (t *Tool) executeTeamSpawn(ctx context.Context, p params, modelOverride agentcore.ChatModel) (json.RawMessage, error) {
+	if t.teamSpawner == nil {
+		return json.Marshal("team spawn is not configured in this environment")
+	}
+	cfg, ok := t.agents[p.Agent]
+	if !ok {
+		available := make([]string, 0, len(t.agents))
+		for name := range t.agents {
+			available = append(available, name)
+		}
+		return json.Marshal(map[string]any{
+			"error": fmt.Sprintf("unknown agent %q, available: %s", p.Agent, strings.Join(available, ", ")),
+		})
+	}
+	name := p.Name
+	if name == "" {
+		name = cfg.Name
+	}
+
+	req := TeamSpawnRequest{
+		Config:        cfg,
+		Name:          name,
+		TeamName:      p.TeamName,
+		InitialPrompt: p.Task,
+		Description:   p.Description,
+		Color:         p.Color,
+		Model:         modelOverride,
+	}
+	res, err := t.teamSpawner(ctx, req)
+	if err != nil {
+		return json.Marshal(map[string]any{"error": err.Error()})
+	}
+	return json.Marshal(map[string]any{
+		"task_id":  res.TaskID,
+		"agent_id": res.AgentID,
+		"status":   "running",
+		"message": fmt.Sprintf("Teammate %q (agent=%s) spawned in team %q. Send messages with send_message.",
+			res.AgentID, p.Agent, p.TeamName),
+	})
 }
 
 // executeBackground launches a sub-agent in a detached goroutine and returns
@@ -526,8 +653,7 @@ func (t *Tool) runAgent(ctx context.Context, agentName, taskStr string, modelOve
 	// Drain parent→child messages at every steering tick so a SendToSubAgent
 	// call mid-execution gets seen on the next turn rather than after the
 	// agent decides to stop. Foreground runs have no task entry to drain from,
-	// so this is only wired in the background path. Matches CC's
-	// getAgentPendingMessageAttachments injection model.
+	// so this is only wired in the background path.
 	if bg != nil && bg.rt != nil {
 		taskID := bg.taskID
 		rt := bg.rt

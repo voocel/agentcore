@@ -31,7 +31,21 @@ type Type string
 const (
 	TypeShell    Type = "shell"
 	TypeSubAgent Type = "subagent"
+	TypeTeammate Type = "teammate"
 )
+
+// Identity is the team-aware identity carried by a teammate Entry.
+// nil for non-teammate entries (shell, subagent). Lives in this package
+// rather than agentcore/team to avoid a task↔team import cycle: team needs
+// to read/store Entry.Identity, and task needs to recognise teammate-typed
+// entries for lifecycle handling.
+type Identity struct {
+	AgentID         string // "researcher@my-team"
+	AgentName       string // "researcher"
+	TeamName        string
+	Color           string
+	ParentSessionID string
+}
 
 // MaxAgentDepth caps how deep sub-agents may nest. The main agent is depth 0;
 // a sub-agent it spawns is depth 1; a sub-agent inside that would be depth 2.
@@ -39,9 +53,8 @@ const (
 // is structurally capped at 1 — this constant is defense in depth for when
 // team support lands and peer agents gain a spawn channel.
 //
-// 5 mirrors what CC tracks in queryTracking.depth — a value high enough to
-// permit legitimate fan-out but low enough to catch runaway recursion before
-// it burns through tokens.
+// 5 is high enough to permit legitimate fan-out but low enough to catch
+// runaway recursion before it burns through tokens.
 const MaxAgentDepth = 5
 
 // depthKey is the ctx key used to thread an agent's depth into the goroutine
@@ -85,18 +98,27 @@ type Entry struct {
 	PID     int
 	Command string
 
-	// SubAgent-specific
+	// SubAgent-specific (also used by teammate, which shares the underlying runAgent loop)
 	Agent     string
 	Prompt    string // original task prompt
 	Result    string // final assistant text from the sub-agent
 	TokensIn  int
 	TokensOut int
 
+	// Teammate-specific. Identity is non-nil iff Type == TypeTeammate.
+	// IsIdle flips true between turns when the teammate is waiting in its mailbox
+	// channel for the next message.
+	Identity *Identity
+	IsIdle   bool
+
 	// pendingMessages queues parent→child messages delivered to the sub-agent
 	// at the next steering tick. Guarded by Runtime.mu (not a per-entry mutex)
 	// so copyEntry can keep its `cp := *e` pattern without copying a lock.
 	// Drain is called once per turn at most — Runtime.mu contention is a
 	// non-issue at that rate.
+	//
+	// Note: teammates do NOT use pendingMessages — they use the team mailbox
+	// channel for delivery (see agentcore/team). This field stays subagent-only.
 	pendingMessages []string
 }
 
@@ -224,9 +246,9 @@ const (
 // AppendPending queues a message for delivery to a sub-agent's next steering
 // tick. Returns the outcome so the caller can choose its error wording.
 //
-// Terminal tasks are NOT auto-resumed here — CC does that via resumeAgent on
-// disk transcripts, which is a stage 6 capability. Today the parent agent
-// gets AppendTerminal back and reports the failure to the user.
+// Terminal tasks are NOT auto-resumed here — resuming from disk transcripts
+// is a later capability. Today the parent agent gets AppendTerminal back and
+// reports the failure to the user.
 func (r *Runtime) AppendPending(id, msg string) AppendStatus {
 	r.mu.Lock()
 	defer r.mu.Unlock()

@@ -131,8 +131,12 @@ func (c *Cost) Add(other *Cost) {
 //   - CacheRead: tokens served from prompt cache (Anthropic: cache_read_input_tokens)
 //   - CacheWrite: tokens written to prompt cache (Anthropic: cache_creation_input_tokens)
 //   - TotalTokens: provider-reported total, typically Input + Output
+//   - Provider/Model: actual provider/model that produced this call, if reported
 //   - Cost: monetary cost computed from model pricing (nil if pricing unavailable)
 type Usage struct {
+	Provider string `json:"provider,omitempty"`
+	Model    string `json:"model,omitempty"`
+
 	Input       int   `json:"input"`
 	Output      int   `json:"output"`
 	CacheRead   int   `json:"cache_read"`
