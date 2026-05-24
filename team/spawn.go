@@ -114,6 +114,7 @@ func Spawn(parentCtx context.Context, cfg SpawnConfig) (*SpawnResult, error) {
 			TaskRT:        cfg.TaskRT,
 			TaskID:        taskID,
 			Execute:       cfg.Execute,
+			Protocol:      cfg.Protocol,
 		})
 
 		cfg.TaskRT.Update(taskID, func(e *task.Entry) {

@@ -147,3 +147,48 @@ func TestRegistry_DeleteTeamClosesAllMailboxes(t *testing.T) {
 		t.Errorf("Second DeleteTeam = %v, want ErrNoTeam", err)
 	}
 }
+
+func TestRegistry_RenameTeamSucceedsOnEmptyTeam(t *testing.T) {
+	r := NewRegistry()
+	_ = r.CreateTeam("default", "first description", "leader")
+
+	if err := r.RenameTeam("alpha", "auth refactor"); err != nil {
+		t.Fatalf("RenameTeam: %v", err)
+	}
+
+	ctx := r.Team()
+	if ctx == nil || ctx.Name != "alpha" || ctx.Description != "auth refactor" {
+		t.Errorf("Team() = %+v, want name=alpha desc='auth refactor'", ctx)
+	}
+
+	// Empty newName must not wipe the existing name.
+	if err := r.RenameTeam("", "updated desc"); err != nil {
+		t.Fatalf("RenameTeam desc-only: %v", err)
+	}
+	ctx = r.Team()
+	if ctx.Name != "alpha" || ctx.Description != "updated desc" {
+		t.Errorf("desc-only rename clobbered name: %+v", ctx)
+	}
+}
+
+func TestRegistry_RenameTeamRejectsWithMembers(t *testing.T) {
+	r := NewRegistry()
+	_ = r.CreateTeam("default", "", "leader")
+	_ = r.RegisterAgent("researcher", "t1")
+
+	err := r.RenameTeam("alpha", "")
+	if !errors.Is(err, ErrTeamHasMembers) {
+		t.Errorf("RenameTeam with teammate = %v, want ErrTeamHasMembers", err)
+	}
+	if ctx := r.Team(); ctx.Name != "default" {
+		t.Errorf("name changed despite error: %q", ctx.Name)
+	}
+}
+
+func TestRegistry_RenameTeamNoTeam(t *testing.T) {
+	r := NewRegistry()
+	err := r.RenameTeam("alpha", "")
+	if !errors.Is(err, ErrNoTeam) {
+		t.Errorf("RenameTeam with no team = %v, want ErrNoTeam", err)
+	}
+}

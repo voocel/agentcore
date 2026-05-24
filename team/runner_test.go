@@ -649,6 +649,56 @@ func TestSpawn_RegistersEntryAndStartsLoop(t *testing.T) {
 	}
 }
 
+// Regression: Spawn must forward cfg.Protocol to Run, otherwise teammate
+// goroutines fall back to default no-op hooks and the application's
+// EncodeIdle / FormatPrompt / etc. silently never fire.
+func TestSpawn_ForwardsProtocolHooks(t *testing.T) {
+	reg := NewRegistry()
+	if err := reg.CreateTeam("alpha", "", "leader-1"); err != nil {
+		t.Fatalf("CreateTeam: %v", err)
+	}
+	rt := task.NewRuntime()
+	exec := newStubExecutor()
+	exec.respond = func(int, []agentcore.AgentMessage) ([]agentcore.AgentMessage, error) {
+		return []agentcore.AgentMessage{assistantMsg("ack")}, nil
+	}
+
+	// Sentinel hook: if Run actually receives it, the leader mailbox gets a
+	// uniquely identifiable envelope after the first turn.
+	const sentinel = "SPAWN_PROTOCOL_OK"
+	hooks := ProtocolHooks{
+		EncodeIdle: func(string, string) string { return sentinel },
+	}
+
+	res, err := Spawn(context.Background(), SpawnConfig{
+		AgentName: "researcher",
+		Registry:  reg,
+		TaskRT:    rt,
+		Execute:   exec.Execute,
+		Protocol:  hooks,
+	})
+	if err != nil {
+		t.Fatalf("Spawn: %v", err)
+	}
+	defer rt.Stop(res.TaskID)
+
+	exec.waitForCalls(t, 1, time.Second)
+
+	leaderBox := reg.Mailbox(TeamLeadName)
+	deadline := time.After(time.Second)
+	for leaderBox.Len() == 0 {
+		select {
+		case <-deadline:
+			t.Fatal("leader mailbox empty: Spawn did not forward EncodeIdle hook to Run")
+		case <-time.After(5 * time.Millisecond):
+		}
+	}
+	msgs := leaderBox.Drain()
+	if msgs[0].Text != sentinel {
+		t.Errorf("got envelope %q, want sentinel %q — Spawn dropped Protocol on the floor", msgs[0].Text, sentinel)
+	}
+}
+
 func TestSpawn_RejectsBeforeTeamCreate(t *testing.T) {
 	reg := NewRegistry()
 	rt := task.NewRuntime()

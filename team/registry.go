@@ -15,6 +15,10 @@ var (
 	ErrAgentExists  = errors.New("team: agent name already registered")
 	ErrUnknownAgent = errors.New("team: unknown agent")
 	ErrReservedName = errors.New("team: agent name is reserved")
+	// ErrTeamHasMembers is returned by RenameTeam when teammates are already
+	// registered: their agentIds were minted as `name@oldteam` and renaming
+	// would silently invalidate them. Callers should dismiss teammates first.
+	ErrTeamHasMembers = errors.New("team: cannot rename while teammates are registered")
 )
 
 // Context is a snapshot of the active team's metadata. Returned by Team() so
@@ -68,6 +72,35 @@ func (r *Registry) CreateTeam(name, description, leaderTaskID string) error {
 	}
 	r.mailboxes[TeamLeadName] = NewMailbox()
 	r.nameToTask[TeamLeadName] = leaderTaskID
+	return nil
+}
+
+// RenameTeam updates the active team's display name and (if non-empty)
+// description. Mailboxes and agent registrations are untouched — only
+// Context fields change. Returns:
+//   - ErrNoTeam if no team is active
+//   - ErrTeamHasMembers if any teammate is registered (their agentIds would
+//     break, since agentId == name@team is captured at Spawn time)
+//
+// Renaming with an empty newName is a no-op for the name but still applies
+// the description update — callers wanting to only refresh the description
+// can pass "" for newName.
+func (r *Registry) RenameTeam(newName, newDescription string) error {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.team == nil {
+		return ErrNoTeam
+	}
+	// nameToTask always contains the leader; any extra entry is a teammate.
+	if len(r.nameToTask) > 1 {
+		return ErrTeamHasMembers
+	}
+	if newName != "" {
+		r.team.Name = newName
+	}
+	if newDescription != "" {
+		r.team.Description = newDescription
+	}
 	return nil
 }
 
