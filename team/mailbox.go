@@ -10,6 +10,11 @@ import (
 // ErrClosed is returned by Send and Wait once the mailbox is closed.
 var ErrClosed = errors.New("team: mailbox closed")
 
+// ErrTimeout is returned by WaitFor when the per-call timeout elapses before
+// a message arrives. Distinct from ctx.Err() so the caller can branch on
+// "tick fired, do periodic work" without misclassifying parent cancellation.
+var ErrTimeout = errors.New("team: mailbox wait timed out")
+
 // Message is one envelope delivered through a mailbox. Text may be plain
 // content (peer DM) or a JSON-encoded structured message (see protocol.go).
 // Mailbox itself stays protocol-agnostic — callers decide how to interpret
@@ -83,8 +88,9 @@ func (m *Mailbox) Len() int {
 	return len(m.queue)
 }
 
-// Wait blocks until at least one message is available, the mailbox is closed,
-// or ctx is cancelled. The for-loop guards against spurious wakes (the wake
+// Wait blocks indefinitely until at least one message is available, the
+// mailbox is closed, or ctx is cancelled. Convenience wrapper over WaitFor
+// with no timeout. The for-loop guards against spurious wakes (the wake
 // channel could fire just as Drain emptied the queue from another goroutine).
 //
 // Returns:
@@ -92,6 +98,21 @@ func (m *Mailbox) Len() int {
 //   - ErrClosed if the mailbox was closed
 //   - ctx.Err() if the context cancelled first
 func (m *Mailbox) Wait(ctx context.Context) error {
+	return m.WaitFor(ctx, 0)
+}
+
+// WaitFor is Wait with a per-call deadline: returns ErrTimeout when timeout
+// elapses before a message arrives. timeout <= 0 disables the timeout (same
+// behavior as Wait). Used by runner-side periodic pollers (e.g. work-stealing
+// hooks) that want to wake up every N to do bookkeeping without missing real
+// incoming messages.
+func (m *Mailbox) WaitFor(ctx context.Context, timeout time.Duration) error {
+	var deadline <-chan time.Time
+	if timeout > 0 {
+		timer := time.NewTimer(timeout)
+		defer timer.Stop()
+		deadline = timer.C
+	}
 	for {
 		m.mu.Lock()
 		if m.closed {
@@ -109,6 +130,8 @@ func (m *Mailbox) Wait(ctx context.Context) error {
 			// loop back to recheck queue under lock
 		case <-ctx.Done():
 			return ctx.Err()
+		case <-deadline:
+			return ErrTimeout
 		}
 	}
 }

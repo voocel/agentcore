@@ -241,3 +241,50 @@ func TestMailbox_WaitDrainLoop(t *testing.T) {
 		t.Errorf("received %d, want %d", got, total)
 	}
 }
+
+// WaitFor is the periodic-poll primitive used by runners with IdleClaim.
+// These tests pin the three returnable outcomes: ErrTimeout (deadline hit
+// first), nil (a message arrived inside the window), ctx.Err() (parent
+// cancellation). Without these the periodic re-check path would silently
+// misbehave if any of those cases got conflated.
+
+func TestMailbox_WaitForReturnsErrTimeoutWhenEmpty(t *testing.T) {
+	mb := NewMailbox()
+	start := time.Now()
+	err := mb.WaitFor(context.Background(), 30*time.Millisecond)
+	elapsed := time.Since(start)
+	if !errors.Is(err, ErrTimeout) {
+		t.Fatalf("err = %v, want ErrTimeout", err)
+	}
+	if elapsed < 25*time.Millisecond {
+		t.Errorf("returned too soon (%v); timer wasn't honoured", elapsed)
+	}
+}
+
+func TestMailbox_WaitForReturnsNilWhenMessageArrives(t *testing.T) {
+	mb := NewMailbox()
+	go func() {
+		time.Sleep(5 * time.Millisecond)
+		_ = mb.Send(Message{From: "alice", Text: "hi"})
+	}()
+	err := mb.WaitFor(context.Background(), 100*time.Millisecond)
+	if err != nil {
+		t.Fatalf("WaitFor err = %v, want nil", err)
+	}
+	if len(mb.Drain()) != 1 {
+		t.Errorf("expected 1 message in queue after WaitFor returns nil")
+	}
+}
+
+func TestMailbox_WaitForRespectsContextCancel(t *testing.T) {
+	mb := NewMailbox()
+	ctx, cancel := context.WithCancel(context.Background())
+	go func() {
+		time.Sleep(5 * time.Millisecond)
+		cancel()
+	}()
+	err := mb.WaitFor(ctx, time.Second)
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("err = %v, want context.Canceled", err)
+	}
+}

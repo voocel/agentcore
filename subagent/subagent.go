@@ -31,8 +31,16 @@ type Config struct {
 	// on the next sub-agent run.
 	Model        agentcore.ChatModel
 	SystemPrompt string
-	Tools        []agentcore.Tool
-	MaxTurns     int
+	// SystemPromptMode is a host-interpreted hint controlling how
+	// SystemPrompt composes with the host's base prompt. agentcore does
+	// NOT consume this field — the team spawner / executor on the host
+	// side reads it to assemble AgentContext.SystemBlocks. Kept as a
+	// plain string at the boundary so agentcore stays agnostic to enum
+	// values that only matter inside one host; empty / unrecognized
+	// values fall back to the host's default mode.
+	SystemPromptMode string
+	Tools            []agentcore.Tool
+	MaxTurns         int
 
 	// MaxRetries caps the LLM call retry count for retryable errors within
 	// this sub-agent's loop. 0 (default) disables retry entirely.

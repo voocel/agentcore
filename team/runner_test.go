@@ -3,8 +3,10 @@ package team
 import (
 	"context"
 	"errors"
+	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -758,6 +760,169 @@ func TestSpawn_RejectsDuplicateName(t *testing.T) {
 
 	// Clean up the first teammate
 	rt.Stop(res1.TaskID)
+}
+
+// IdleClaim is the work-stealing hook. When set, the runner consults it at
+// every turn boundary before blocking on the mailbox; a non-empty
+// synthPrompt becomes the next turn's input directly, bypassing the
+// mailbox altogether. These tests pin the contract so a future refactor
+// can't silently break pull-mode delivery.
+
+func TestRun_IdleClaim_FeedsSyntheticPromptWithoutMailbox(t *testing.T) {
+	h := newHarness(t)
+	h.exec.respond = func(idx int, _ []agentcore.AgentMessage) ([]agentcore.AgentMessage, error) {
+		return []agentcore.AgentMessage{assistantMsg("done-" + strings.Repeat("x", idx+1))}, nil
+	}
+
+	hooks := makeTestHooks().hooks
+	var claimCalls int32
+	hooks.IdleClaim = func(ctx context.Context) (string, bool) {
+		// Each invocation hands out one synthetic prompt, then nothing.
+		// Without a fallback the runner would loop forever, so we let the
+		// test stop it via cancel after observing N turns.
+		n := atomic.AddInt32(&claimCalls, 1)
+		if n <= 2 {
+			return "CLAIMED-" + strconv.Itoa(int(n)), true
+		}
+		// Block subsequent calls so the runner parks on the mailbox and
+		// we can shutdown cleanly via cancel.
+		return "", false
+	}
+
+	h.startWithHooks(t, "kickoff", hooks)
+	h.exec.waitForCalls(t, 3, time.Second)
+	if err := h.stop(t, 2*time.Second); err != nil {
+		t.Fatalf("Run exited with %v", err)
+	}
+
+	calls := h.exec.Calls()
+	if len(calls) < 3 {
+		t.Fatalf("got %d Execute calls, want >= 3", len(calls))
+	}
+	// Call 0 is the initial prompt (passed through FormatPrompt). Calls 1
+	// and 2 are the synthetic claim prompts — they must show up verbatim,
+	// NOT wrapped by FormatPrompt (the hook returns the final text).
+	turn2User := lastUserText(calls[1])
+	turn3User := lastUserText(calls[2])
+	if turn2User != "CLAIMED-1" {
+		t.Errorf("turn 2 user text = %q, want CLAIMED-1 verbatim", turn2User)
+	}
+	if turn3User != "CLAIMED-2" {
+		t.Errorf("turn 3 user text = %q, want CLAIMED-2 verbatim", turn3User)
+	}
+}
+
+func TestRun_IdleClaim_FalseFallsBackToMailbox(t *testing.T) {
+	h := newHarness(t)
+	h.exec.respond = func(idx int, _ []agentcore.AgentMessage) ([]agentcore.AgentMessage, error) {
+		return []agentcore.AgentMessage{assistantMsg("ok")}, nil
+	}
+
+	hooks := makeTestHooks().hooks
+	hooks.IdleClaim = func(ctx context.Context) (string, bool) {
+		return "", false // never have work
+	}
+	h.startWithHooks(t, "kickoff", hooks)
+	h.exec.waitForCalls(t, 1, time.Second)
+
+	// Deliver via mailbox; runner should pick it up despite IdleClaim
+	// being wired (because IdleClaim returned ok=false).
+	if err := h.reg.Mailbox("researcher").Send(Message{From: TeamLeadName, Text: "from-mb"}); err != nil {
+		t.Fatalf("Send: %v", err)
+	}
+	h.exec.waitForCalls(t, 2, time.Second)
+	if err := h.stop(t, 2*time.Second); err != nil {
+		t.Fatalf("Run exited with %v", err)
+	}
+
+	calls := h.exec.Calls()
+	if got := lastUserText(calls[1]); !strings.Contains(got, "from-mb") {
+		t.Errorf("turn 2 user text = %q, want it to carry the mailbox message", got)
+	}
+}
+
+// Regression: when a push assignment lands in the mailbox right before the
+// runner re-enters awaitNextInput, IdleClaim must NOT preempt it. Otherwise
+// `task_update owner=X` (push mode) would race the auto-pull poll and the
+// push payload could be silently deferred to a later turn.
+func TestRun_IdleClaim_MailboxBeatsClaimWhenBothReady(t *testing.T) {
+	h := newHarness(t)
+
+	// Pre-fill the mailbox BEFORE Run starts so the very first
+	// awaitNextInput call sees Len() > 0. The InitialPrompt absorbs the
+	// first Execute, and the second Execute must consume the queued mb
+	// message — NOT the IdleClaim pull.
+	if err := h.reg.Mailbox("researcher").Send(Message{From: TeamLeadName, Text: "PUSH-WINS"}); err != nil {
+		t.Fatalf("Send: %v", err)
+	}
+	hooks := makeTestHooks().hooks
+	hooks.IdleClaim = func(ctx context.Context) (string, bool) {
+		return "PULLED", true // always ready; should still lose to a queued mb message
+	}
+
+	h.exec.respond = func(int, []agentcore.AgentMessage) ([]agentcore.AgentMessage, error) {
+		return []agentcore.AgentMessage{assistantMsg("ok")}, nil
+	}
+	h.startWithHooks(t, "kickoff", hooks)
+	h.exec.waitForCalls(t, 2, time.Second)
+	if err := h.stop(t, 2*time.Second); err != nil {
+		t.Fatalf("Run exited with %v", err)
+	}
+
+	// Turn 2's input must come from the mailbox, not the always-ready
+	// IdleClaim. Subsequent turns (after the mailbox drains) legitimately
+	// fall through to IdleClaim — we only pin the priority on the conflict
+	// turn itself.
+	calls := h.exec.Calls()
+	if got := lastUserText(calls[1]); !strings.Contains(got, "PUSH-WINS") {
+		t.Fatalf("turn 2 user text = %q, want it to carry PUSH-WINS (mailbox-first)", got)
+	}
+}
+
+func TestRun_IdleClaim_IntervalPollsWhileMailboxEmpty(t *testing.T) {
+	h := newHarness(t)
+	h.exec.respond = func(idx int, _ []agentcore.AgentMessage) ([]agentcore.AgentMessage, error) {
+		return []agentcore.AgentMessage{assistantMsg("ok")}, nil
+	}
+
+	hooks := makeTestHooks().hooks
+	var armed int32
+	hooks.IdleClaim = func(ctx context.Context) (string, bool) {
+		if atomic.LoadInt32(&armed) == 1 {
+			return "DELAYED-WORK", true
+		}
+		return "", false
+	}
+	hooks.IdleClaimInterval = 20 * time.Millisecond
+
+	h.startWithHooks(t, "kickoff", hooks)
+	h.exec.waitForCalls(t, 1, time.Second)
+
+	// Arm the hook AFTER the runner has parked. The next interval tick
+	// should pull DELAYED-WORK without any mailbox traffic.
+	atomic.StoreInt32(&armed, 1)
+	h.exec.waitForCalls(t, 2, time.Second)
+	if err := h.stop(t, 2*time.Second); err != nil {
+		t.Fatalf("Run exited with %v", err)
+	}
+
+	calls := h.exec.Calls()
+	if got := lastUserText(calls[1]); got != "DELAYED-WORK" {
+		t.Errorf("turn 2 user text = %q, want DELAYED-WORK", got)
+	}
+}
+
+// lastUserText extracts the text of the trailing user message from the slice
+// the executor received, regardless of how many history entries precede it.
+func lastUserText(msgs []agentcore.AgentMessage) string {
+	if len(msgs) == 0 {
+		return ""
+	}
+	last := msgs[len(msgs)-1]
+	if last == nil || last.GetRole() != agentcore.RoleUser {
+		return ""
+	}
+	return last.TextContent()
 }
 
 func TestSpawn_DepthRecordedOnEntry(t *testing.T) {

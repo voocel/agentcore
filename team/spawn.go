@@ -46,6 +46,14 @@ type SpawnConfig struct {
 	// it directly but it's recorded on the Entry so MaxAgentDepth checks at
 	// callsites can verify before calling Spawn.
 	Depth int
+
+	// OnExit, if non-nil, is invoked once the teammate goroutine is about to
+	// return — AFTER the Entry has been updated to its terminal status and
+	// the name has been unregistered. The err argument is whatever Run
+	// returned (nil on graceful completion, context.Canceled on shutdown,
+	// or a propagated error). Callers use this to release per-agent
+	// resources (event hubs, transcripts, etc.) without polling the runtime.
+	OnExit func(err error)
 }
 
 // SpawnResult is returned synchronously after the teammate is registered and
@@ -136,6 +144,10 @@ func Spawn(parentCtx context.Context, cfg SpawnConfig) (*SpawnResult, error) {
 		// team was torn down first (DeleteTeam closed our mailbox); that's
 		// fine — the resource was already reclaimed.
 		_ = cfg.Registry.UnregisterAgent(cfg.AgentName)
+
+		if cfg.OnExit != nil {
+			cfg.OnExit(err)
+		}
 	}()
 
 	return &SpawnResult{

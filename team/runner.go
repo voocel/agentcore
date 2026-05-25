@@ -47,6 +47,28 @@ type ProtocolHooks struct {
 	// PickPriority chooses which queued message to process next. Returns the
 	// queue index. Default: 0 (FIFO).
 	PickPriority func(queue []Message) int
+
+	// IdleClaim is the work-stealing hook. Run consults it (a) at every
+	// turn boundary before blocking on the mailbox and (b) every
+	// IdleClaimInterval while parked on it. When the hook returns
+	// ok=true, its synthPrompt is fed directly to the next turn — no
+	// Message is allocated, no fake sender is recorded, and the queue
+	// stays untouched.
+	//
+	// ctx carries the teammate identity via WithIdentity so applications
+	// can branch by who is asking. Returning ok=false (or leaving this
+	// nil) falls back to mailbox-only behavior. synthPrompt SHOULD be the
+	// final text the model will see — the runner does NOT re-wrap it
+	// through FormatPrompt, since there is no Message envelope to format.
+	IdleClaim func(ctx context.Context) (synthPrompt string, ok bool)
+
+	// IdleClaimInterval is the periodic re-check cadence used while a
+	// teammate is parked on the mailbox. Zero (the default) means
+	// IdleClaim is only consulted once per turn boundary; the teammate
+	// then blocks until a real message arrives. Set this when the
+	// application expects work to appear in the claim source without any
+	// mailbox traffic to wake the teammate up.
+	IdleClaimInterval time.Duration
 }
 
 // RunConfig configures one teammate's long-lived loop. All fields except Now
@@ -185,13 +207,23 @@ func Run(ctx context.Context, cfg RunConfig) error {
 			}
 		}
 
-		// 3. Get next prompt
+		// 3. Get next prompt. When the local queue is empty we either wait
+		// on the mailbox or, if IdleClaim is wired, attempt to pull a
+		// synthetic prompt from the application (work-stealing). A
+		// successful pull short-circuits the mailbox path entirely — no
+		// Message is fabricated, the queue stays untouched, and the
+		// synthPrompt becomes the next turn's input as-is.
 		if len(localQueue) == 0 {
-			if err := mailbox.Wait(ctx); err != nil {
+			synth, err := awaitNextInput(identityCtx, mailbox, hooks)
+			if err != nil {
 				if errors.Is(err, ErrClosed) || errors.Is(err, context.Canceled) {
 					return nil
 				}
 				return err
+			}
+			if synth != "" {
+				currentPrompt = synth
+				continue
 			}
 			localQueue = mailbox.Drain()
 			if len(localQueue) == 0 {
@@ -212,6 +244,55 @@ func Run(ctx context.Context, cfg RunConfig) error {
 		}
 
 		currentPrompt = hooks.FormatPrompt(chosen)
+	}
+}
+
+// awaitNextInput is the central wait helper for the runner's main loop. It
+// returns one of three outcomes:
+//
+//  1. (synthPrompt, nil) — IdleClaim pulled a task; caller uses the prompt
+//     directly and skips Drain.
+//  2. ("",          nil) — A real message arrived in the mailbox; caller
+//     should Drain + PickPriority.
+//  3. ("",          err) — ctx cancelled or mailbox closed; caller returns.
+//
+// When IdleClaim is unwired (or returns ok=false) and IdleClaimInterval is
+// zero, this collapses to plain mailbox.Wait — the pre-IdleClaim behavior,
+// byte-for-byte. Periodic IdleClaim re-checks during the wait are only
+// armed when both IdleClaim and IdleClaimInterval are set.
+func awaitNextInput(ctx context.Context, mailbox *Mailbox, hooks ProtocolHooks) (string, error) {
+	// Mailbox-first priority: a queued message (leader push, shutdown
+	// request, peer DM) MUST be processed before the teammate pulls its
+	// own next task via IdleClaim. Otherwise a push assignment racing the
+	// IdleClaim poll would be silently deferred to the next turn.
+	if mailbox.Len() > 0 {
+		return "", nil
+	}
+	tryClaim := func() (string, bool) {
+		if hooks.IdleClaim == nil {
+			return "", false
+		}
+		return hooks.IdleClaim(ctx)
+	}
+	if prompt, ok := tryClaim(); ok && prompt != "" {
+		return prompt, nil
+	}
+	if hooks.IdleClaim == nil || hooks.IdleClaimInterval <= 0 {
+		return "", mailbox.Wait(ctx)
+	}
+	for {
+		err := mailbox.WaitFor(ctx, hooks.IdleClaimInterval)
+		switch {
+		case err == nil:
+			return "", nil // mailbox has something
+		case errors.Is(err, ErrTimeout):
+			if prompt, ok := tryClaim(); ok && prompt != "" {
+				return prompt, nil
+			}
+			// no work yet, keep polling
+		default:
+			return "", err
+		}
 	}
 }
 
