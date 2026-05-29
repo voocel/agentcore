@@ -103,6 +103,7 @@ type ValidationIssue struct {
 	Path     string
 	Expected string // for IssueType only
 	Received string // for IssueType only
+	Hint     string // optional fix hint, appended to the rendered message
 }
 
 const (
@@ -235,15 +236,22 @@ func formatValidationIssues(toolName string, issues []ValidationIssue) string {
 
 	lines := make([]string, 0, len(issues))
 	for _, it := range issues {
+		var line string
 		switch it.Kind {
 		case IssueMissing:
-			lines = append(lines, fmt.Sprintf("The required parameter `%s` is missing", it.Path))
+			line = fmt.Sprintf("The required parameter `%s` is missing", it.Path)
 		case IssueType:
-			lines = append(lines, fmt.Sprintf(
+			line = fmt.Sprintf(
 				"The parameter `%s` type is expected as `%s` but provided as `%s`",
 				it.Path, it.Expected, it.Received,
-			))
+			)
+		default:
+			continue
 		}
+		if it.Hint != "" {
+			line += ". " + it.Hint
+		}
+		lines = append(lines, line)
 	}
 
 	noun := "issue"

@@ -1149,12 +1149,13 @@ func validateToolArgs(tool Tool, call ToolCall) error {
 			if expectedType == "" {
 				continue
 			}
-			if received, mismatch := typeMismatch(val, expectedType); mismatch {
+			if received, hint, mismatch := typeMismatch(val, expectedType); mismatch {
 				issues = append(issues, ValidationIssue{
 					Kind:     IssueType,
 					Path:     key,
 					Expected: expectedType,
 					Received: received,
+					Hint:     hint,
 				})
 			}
 		}
@@ -1168,37 +1169,62 @@ func validateToolArgs(tool Tool, call ToolCall) error {
 
 // typeMismatch reports whether val conflicts with the JSON Schema type. When it
 // does, the returned name is the user-facing JSON type name of the actual value
-// ("string" / "integer" / "number" / "boolean" / "array" / "object").
-func typeMismatch(val any, expected string) (string, bool) {
+// ("string" / "integer" / "number" / "boolean" / "array" / "object"). The hint
+// is non-empty only for known LLM mistake patterns — currently the
+// "JSON-encoded literal passed as a string" mistake that weaker models repeat
+// across turns without nudging.
+func typeMismatch(val any, expected string) (received string, hint string, mismatch bool) {
 	switch expected {
 	case "string":
 		if _, ok := val.(string); ok {
-			return "", false
+			return "", "", false
 		}
 	case "integer":
 		if f, ok := val.(float64); ok && f == float64(int64(f)) {
-			return "", false
+			return "", "", false
 		}
 	case "number":
 		if _, ok := val.(float64); ok {
-			return "", false
+			return "", "", false
 		}
 	case "boolean":
 		if _, ok := val.(bool); ok {
-			return "", false
+			return "", "", false
 		}
 	case "array":
 		if _, ok := val.([]any); ok {
-			return "", false
+			return "", "", false
 		}
 	case "object":
 		if _, ok := val.(map[string]any); ok {
-			return "", false
+			return "", "", false
 		}
 	default:
-		return "", false
+		return "", "", false
 	}
-	return jsonTypeName(val), true
+	return jsonTypeName(val), mismatchHint(val, expected), true
+}
+
+// mismatchHint catches the single most common LLM mistake: serializing an
+// array/object to a JSON string and passing the string. The hint nudges the
+// model to drop the surrounding quotes on the next turn. Other mismatches get
+// no hint to keep the error message terse.
+func mismatchHint(val any, expected string) string {
+	if expected != "array" && expected != "object" {
+		return ""
+	}
+	s, ok := val.(string)
+	if !ok {
+		return ""
+	}
+	trimmed := strings.TrimSpace(s)
+	if expected == "array" && strings.HasPrefix(trimmed, "[") {
+		return `Looks like a JSON-encoded array — pass the value directly (e.g. ["a","b"]), not wrapped in quotes.`
+	}
+	if expected == "object" && strings.HasPrefix(trimmed, "{") {
+		return `Looks like a JSON-encoded object — pass the value directly (e.g. {"k":"v"}), not wrapped in quotes.`
+	}
+	return ""
 }
 
 // jsonTypeName returns the JSON Schema type name for val.
