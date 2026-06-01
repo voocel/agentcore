@@ -341,6 +341,80 @@ func TestRun_HistoryAccumulatesAcrossTurns(t *testing.T) {
 	}
 }
 
+// History seeds the conversation: the first Execute must receive the resumed
+// transcript as a prefix, with the InitialPrompt appended as the new user
+// turn. This is the resume primitive — a restarted teammate continues with
+// its prior context instead of starting blank.
+func TestRun_HistorySeedsFirstTurnPrefix(t *testing.T) {
+	h := newHarness(t)
+	seed := []agentcore.AgentMessage{
+		agentcore.UserMsg("earlier question"),
+		assistantMsg("earlier answer"),
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	h.cancel = cancel
+	go func() {
+		h.runErr <- Run(ctx, RunConfig{
+			Identity:      h.identity,
+			InitialPrompt: "continue please",
+			History:       seed,
+			Registry:      h.reg,
+			TaskRT:        h.rt,
+			TaskID:        h.taskID,
+			Execute:       h.exec.Execute,
+		})
+	}()
+	defer h.stop(t, time.Second)
+
+	h.exec.waitForCalls(t, 1, time.Second)
+
+	first := h.exec.Calls()[0]
+	if len(first) != 3 {
+		t.Fatalf("first turn should be seed(2) + prompt(1) = 3 messages, got %d: %+v", len(first), first)
+	}
+	if first[0].GetRole() != agentcore.RoleUser || first[0].TextContent() != "earlier question" {
+		t.Errorf("history[0] = (%v, %q), want (user, 'earlier question')", first[0].GetRole(), first[0].TextContent())
+	}
+	if first[1].GetRole() != agentcore.RoleAssistant || first[1].TextContent() != "earlier answer" {
+		t.Errorf("history[1] = (%v, %q), want (assistant, 'earlier answer')", first[1].GetRole(), first[1].TextContent())
+	}
+	if first[2].GetRole() != agentcore.RoleUser || first[2].TextContent() != "continue please" {
+		t.Errorf("prompt = (%v, %q), want (user, 'continue please')", first[2].GetRole(), first[2].TextContent())
+	}
+}
+
+// Seeding History must not alias the caller's slice: the runner appends to its
+// own history each turn, and a second turn's growth must not mutate or grow
+// into the caller's backing array.
+func TestRun_HistorySeedIsCopied(t *testing.T) {
+	h := newHarness(t)
+	h.exec.respond = func(idx int, _ []agentcore.AgentMessage) ([]agentcore.AgentMessage, error) {
+		return []agentcore.AgentMessage{assistantMsg("ack")}, nil
+	}
+	// Over-capacity slice so an un-copied append would write into seed[1:].
+	seed := make([]agentcore.AgentMessage, 1, 8)
+	seed[0] = agentcore.UserMsg("seed-msg")
+	ctx, cancel := context.WithCancel(context.Background())
+	h.cancel = cancel
+	go func() {
+		h.runErr <- Run(ctx, RunConfig{
+			Identity:      h.identity,
+			InitialPrompt: "go",
+			History:       seed,
+			Registry:      h.reg,
+			TaskRT:        h.rt,
+			TaskID:        h.taskID,
+			Execute:       h.exec.Execute,
+		})
+	}()
+	defer h.stop(t, time.Second)
+
+	h.exec.waitForCalls(t, 1, time.Second)
+	if len(seed) != 1 || seed[0].TextContent() != "seed-msg" {
+		t.Errorf("caller's History slice was mutated: len=%d head=%q", len(seed), seed[0].TextContent())
+	}
+}
+
 // With default hooks, EncodeIdle returns "" and no idle notification is sent.
 // The leader's mailbox should stay empty after a teammate turn.
 func TestRun_NoIdleNotificationWithDefaultHooks(t *testing.T) {

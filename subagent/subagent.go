@@ -156,6 +156,12 @@ type TeamSpawnRequest struct {
 	// Model is non-nil when the LLM requested an override; nil means the
 	// spawner should fall back to Config.Model.
 	Model agentcore.ChatModel
+
+	// History, if non-empty, seeds the teammate's conversation before its
+	// first turn — the spawner forwards it to team.SpawnConfig.History. The
+	// LLM never sets this; a harness populates it when resuming a teammate
+	// with its prior transcript after a restart. nil ⇒ fresh teammate.
+	History []agentcore.AgentMessage
 }
 
 // TeamSpawnResult is what the spawner returns synchronously. The teammate
@@ -216,6 +222,15 @@ func (t *Tool) SetCreateModel(fn func(name string) (agentcore.ChatModel, error))
 // regular subagent run.
 func (t *Tool) SetTeamSpawner(fn TeamSpawner) {
 	t.teamSpawner = fn
+}
+
+// AgentConfig returns the registered sub-agent definition for name, or
+// (zero, false) if none is registered. Exposed read-only so a harness can
+// rebuild a TeamSpawnRequest when resuming a teammate by its agent type
+// without re-deriving the config from scratch.
+func (t *Tool) AgentConfig(name string) (Config, bool) {
+	cfg, ok := t.agents[name]
+	return cfg, ok
 }
 
 // SetBgOutputFactory sets the factory that creates output writers for

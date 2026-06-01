@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"time"
 
+	"github.com/voocel/agentcore"
 	"github.com/voocel/agentcore/task"
 )
 
@@ -18,6 +19,14 @@ type SpawnConfig struct {
 
 	// InitialPrompt is the leader's first message to the teammate.
 	InitialPrompt string
+
+	// History, if non-empty, seeds the teammate's conversation with prior
+	// messages before the first turn — the first Execute receives History
+	// as the prefix of its input, with InitialPrompt appended as the new
+	// user turn. Used by a harness to resume a teammate with its earlier
+	// transcript after a restart; nil means a fresh teammate. Pure
+	// mechanism: Spawn/Run still do no I/O of their own.
+	History []agentcore.AgentMessage
 
 	// Description is an optional one-line summary shown in transcripts/UI.
 	Description string
@@ -117,6 +126,7 @@ func Spawn(parentCtx context.Context, cfg SpawnConfig) (*SpawnResult, error) {
 		err := Run(runCtx, RunConfig{
 			Identity:      identity,
 			InitialPrompt: cfg.InitialPrompt,
+			History:       cfg.History,
 			Description:   cfg.Description,
 			Registry:      cfg.Registry,
 			TaskRT:        cfg.TaskRT,

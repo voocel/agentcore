@@ -84,6 +84,12 @@ type RunConfig struct {
 	// — the same path as every subsequent inbound message.
 	InitialPrompt string
 
+	// History seeds the running conversation before the first turn. When
+	// non-empty the first Execute receives History as the prefix of its
+	// input (History + the InitialPrompt user message). nil ⇒ fresh
+	// teammate. Used to resume a teammate with its prior transcript.
+	History []agentcore.AgentMessage
+
 	// Description is an optional short summary attached as Message.Summary
 	// on the synthetic initial-prompt Message. Format hooks may surface it
 	// (e.g. as an XML `summary=` attribute) or ignore it.
@@ -144,7 +150,9 @@ func Run(ctx context.Context, cfg RunConfig) error {
 
 	identityCtx := WithIdentity(ctx, cfg.Identity)
 
-	var history []agentcore.AgentMessage
+	// Seed history with any resumed transcript; a fresh teammate gets nil.
+	// Copied so the caller's slice isn't aliased as we append per turn.
+	history := append([]agentcore.AgentMessage(nil), cfg.History...)
 	currentPrompt := hooks.FormatPrompt(Message{
 		From:    TeamLeadName,
 		Text:    cfg.InitialPrompt,

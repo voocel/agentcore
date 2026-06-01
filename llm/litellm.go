@@ -65,6 +65,7 @@ type modelConfig struct {
 	streamIdle    time.Duration
 	streamIdleSet bool // distinguishes "unset" from explicit 0 (disable watchdog)
 	resilience    *ResilienceConfig
+	clientOpts    []litellm.ClientOption
 }
 
 // ModelOption configures NewModel.
@@ -93,6 +94,13 @@ func WithResilience(rc ResilienceConfig) ModelOption {
 	return func(c *modelConfig) { c.resilience = &rc }
 }
 
+// WithClientOptions forwards litellm ClientOptions (e.g. litellm.WithHook) to
+// the underlying client, letting callers attach observability or other
+// cross-cutting behaviour without this package importing those concerns.
+func WithClientOptions(opts ...litellm.ClientOption) ModelOption {
+	return func(c *modelConfig) { c.clientOpts = append(c.clientOpts, opts...) }
+}
+
 // NewModel constructs a ChatModel by provider name. The provider must be
 // registered in litellm (builtin or via litellm.RegisterProvider).
 func NewModel(provider, model string, opts ...ModelOption) (*LiteLLMAdapter, error) {
@@ -116,7 +124,7 @@ func NewModel(provider, model string, opts ...ModelOption) (*LiteLLMAdapter, err
 		pcfg.Resilience.StreamIdleTimeout = cfg.streamIdle
 	}
 
-	client, err := litellm.NewWithProvider(provider, pcfg)
+	client, err := litellm.NewWithProvider(provider, pcfg, cfg.clientOpts...)
 	if err != nil {
 		return nil, fmt.Errorf("llm: %s: %w", provider, err)
 	}
