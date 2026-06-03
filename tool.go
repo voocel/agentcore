@@ -88,6 +88,9 @@ type ToolCall struct {
 	ArgsInvalid    bool            `json:"args_invalid,omitempty"`
 	ArgsRawText    string          `json:"args_raw_text,omitempty"`
 	ArgsParseError string          `json:"args_parse_error,omitempty"`
+	// ThoughtSignature is an opaque provider reasoning signature (Gemini 3) that
+	// must be persisted and replayed verbatim across turns. Empty when absent.
+	ThoughtSignature string `json:"thought_signature,omitempty"`
 }
 
 // ToolResult represents a tool execution outcome.

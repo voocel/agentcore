@@ -308,7 +308,7 @@ func (l *LiteLLMAdapter) GenerateStream(ctx context.Context, messages []agentcor
 				}
 			},
 			OnToolCallEnd: func(call litellm.ToolCall) {
-				completed := buildToolCall(call.ID, call.Function.Name, call.Function.Arguments)
+				completed := buildToolCall(call.ID, call.Function.Name, call.Function.Arguments, call.ThoughtSignature)
 				idx := findPendingToolCallBlock(partial.Content, toolBlockIndices, call.ID)
 				if idx >= 0 {
 					partial.Content[idx] = agentcore.ToolCallBlock(completed)
@@ -501,6 +501,7 @@ func convertSingleMessage(msg agentcore.Message) litellm.Message {
 					Name:      call.Name,
 					Arguments: string(call.Args),
 				},
+				ThoughtSignature: call.ThoughtSignature,
 			}
 		}
 	}
@@ -524,7 +525,7 @@ func convertResponse(response *litellm.Response) agentcore.Message {
 
 	// Tool calls
 	for _, call := range response.ToolCalls {
-		content = append(content, agentcore.ToolCallBlock(buildToolCall(call.ID, call.Function.Name, call.Function.Arguments)))
+		content = append(content, agentcore.ToolCallBlock(buildToolCall(call.ID, call.Function.Name, call.Function.Arguments, call.ThoughtSignature)))
 	}
 
 	// Map usage
@@ -748,15 +749,16 @@ func normalizeArgs(raw string) normalizedArgs {
 
 // buildToolCall constructs an agentcore.ToolCall from raw litellm fields,
 // routing malformed args into dedicated diagnostic fields (see ToolCall doc).
-func buildToolCall(id, name, rawArgs string) agentcore.ToolCall {
+func buildToolCall(id, name, rawArgs, thoughtSignature string) agentcore.ToolCall {
 	n := normalizeArgs(rawArgs)
 	return agentcore.ToolCall{
-		ID:             id,
-		Name:           name,
-		Args:           n.Args,
-		ArgsInvalid:    n.Invalid,
-		ArgsRawText:    n.RawText,
-		ArgsParseError: n.ParseErr,
+		ID:               id,
+		Name:             name,
+		Args:             n.Args,
+		ArgsInvalid:      n.Invalid,
+		ArgsRawText:      n.RawText,
+		ArgsParseError:   n.ParseErr,
+		ThoughtSignature: thoughtSignature,
 	}
 }
 

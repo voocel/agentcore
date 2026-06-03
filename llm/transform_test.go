@@ -215,7 +215,7 @@ func TestNormalizeArgs_InvalidArgsRoutedToDiagnostics(t *testing.T) {
 // "unexpected end of JSON input" — breaking session persistence whenever a
 // provider truncated a streaming tool_call.
 func TestBuildToolCall_InvalidArgsMessageStaysJSONSerializable(t *testing.T) {
-	tc := buildToolCall("call_x", "edit", `{"path":"/tmp/file`)
+	tc := buildToolCall("call_x", "edit", `{"path":"/tmp/file`, "")
 	if !tc.ArgsInvalid {
 		t.Fatalf("expected ArgsInvalid=true, got %+v", tc)
 	}
