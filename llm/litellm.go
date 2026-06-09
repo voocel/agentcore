@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"maps"
 	"time"
 
 	"github.com/voocel/agentcore"
@@ -21,6 +22,7 @@ type LiteLLMAdapter struct {
 	*BaseModel
 	client *litellm.Client
 	model  string
+	extra  map[string]any // model-level Extra merged into every request
 }
 
 // NewLiteLLMAdapter wraps an existing litellm.Client as a ChatModel. Use this
@@ -66,6 +68,7 @@ type modelConfig struct {
 	streamIdleSet bool // distinguishes "unset" from explicit 0 (disable watchdog)
 	resilience    *ResilienceConfig
 	clientOpts    []litellm.ClientOption
+	extra         map[string]any
 }
 
 // ModelOption configures NewModel.
@@ -101,6 +104,26 @@ func WithClientOptions(opts ...litellm.ClientOption) ModelOption {
 	return func(c *modelConfig) { c.clientOpts = append(c.clientOpts, opts...) }
 }
 
+// WithExtra sets model-level, provider-specific request parameters merged into
+// every request's Extra map (e.g. min_p, presence_penalty, or provider keys like
+// chat_template_kwargs). OpenAI-compatible providers pass these through verbatim
+// into the request body — the extra_body convention. Per-call Extra entries
+// (e.g. session_id) are added alongside, not overwritten.
+func WithExtra(extra map[string]any) ModelOption {
+	return func(c *modelConfig) { c.extra = extra }
+}
+
+// cloneExtra copies the model-level extra map so per-call mutations (e.g.
+// session_id) never leak back into the shared model config across requests.
+func cloneExtra(m map[string]any) map[string]any {
+	if len(m) == 0 {
+		return nil
+	}
+	c := make(map[string]any, len(m))
+	maps.Copy(c, m)
+	return c
+}
+
 // NewModel constructs a ChatModel by provider name. The provider must be
 // registered in litellm (builtin or via litellm.RegisterProvider).
 func NewModel(provider, model string, opts ...ModelOption) (*LiteLLMAdapter, error) {
@@ -128,7 +151,9 @@ func NewModel(provider, model string, opts ...ModelOption) (*LiteLLMAdapter, err
 	if err != nil {
 		return nil, fmt.Errorf("llm: %s: %w", provider, err)
 	}
-	return NewLiteLLMAdapter(model, client), nil
+	adapter := NewLiteLLMAdapter(model, client)
+	adapter.extra = cfg.extra
+	return adapter, nil
 }
 
 // IsProviderRegistered reports whether the provider name is known to litellm.
@@ -153,6 +178,7 @@ func (l *LiteLLMAdapter) Generate(ctx context.Context, messages []agentcore.Mess
 		Messages:    llmMessages,
 		Temperature: &cfg.Temperature,
 		MaxTokens:   &cfg.MaxTokens,
+		Extra:       cloneExtra(l.extra),
 	}
 
 	applyCallConfig(ltReq, opts)
@@ -181,6 +207,7 @@ func (l *LiteLLMAdapter) GenerateStream(ctx context.Context, messages []agentcor
 		Messages:    llmMessages,
 		Temperature: &cfg.Temperature,
 		MaxTokens:   &cfg.MaxTokens,
+		Extra:       cloneExtra(l.extra),
 	}
 
 	applyCallConfig(request, opts)
