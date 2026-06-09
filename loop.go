@@ -8,6 +8,7 @@ import (
 	"maps"
 	"math"
 	"slices"
+	"strconv"
 	"strings"
 	"time"
 
@@ -777,7 +778,7 @@ func executeSingleToolCall(ctx context.Context, tools []Tool, call ToolCall, con
 			Content:    errContent,
 			IsError:    true,
 		}
-	} else if err := validateToolArgs(tool, call); err != nil {
+	} else if fixed, err := validateToolArgs(tool, call); err != nil {
 		errContent, _ := json.Marshal(err.Error())
 		result = ToolResult{
 			ToolCallID: call.ID,
@@ -786,6 +787,13 @@ func executeSingleToolCall(ctx context.Context, tools []Tool, call ToolCall, con
 			IsError:    true,
 		}
 	} else {
+		// Schema validation may have coerced trivially mis-typed args (e.g. a
+		// stringified number or JSON array) into clean values; run the tool with
+		// the corrected payload so downstream Validators and the tool itself see
+		// well-typed input.
+		if fixed != nil {
+			call.Args = fixed
+		}
 		// Stage 1: business-level input validation. Distinct from schema
 		// validation above — Validators check semantics (write-before-read,
 		// mtime drift, ...) using state the tool was constructed with.
@@ -1094,9 +1102,9 @@ func buildToolSpecs(tools []Tool) []ToolSpec {
 // are skipped and the captured diagnostic is surfaced directly — running
 // schema validation against the "{}" placeholder would otherwise mislead the
 // model with a "missing field" error.
-func validateToolArgs(tool Tool, call ToolCall) error {
+func validateToolArgs(tool Tool, call ToolCall) (json.RawMessage, error) {
 	if call.ArgsInvalid {
-		return fmt.Errorf(
+		return nil, fmt.Errorf(
 			"%w: %s received malformed JSON arguments: %s\nraw args: %s",
 			ErrToolValidation, tool.Name(), call.ArgsParseError, call.ArgsRawText,
 		)
@@ -1104,7 +1112,7 @@ func validateToolArgs(tool Tool, call ToolCall) error {
 
 	schema := tool.Schema()
 	if schema == nil {
-		return nil
+		return nil, nil
 	}
 
 	args := call.Args
@@ -1113,7 +1121,7 @@ func validateToolArgs(tool Tool, call ToolCall) error {
 	}
 	var parsed map[string]any
 	if err := json.Unmarshal(args, &parsed); err != nil {
-		return fmt.Errorf("%w: %s received invalid JSON arguments: %v",
+		return nil, fmt.Errorf("%w: %s received invalid JSON arguments: %v",
 			ErrToolValidation, tool.Name(), err)
 	}
 
@@ -1129,6 +1137,13 @@ func validateToolArgs(tool Tool, call ToolCall) error {
 		}
 	}
 
+	// coerced tracks whether any value was recovered from a trivially-fixable
+	// type mismatch (e.g. a stringified number or JSON array). When set, the
+	// corrected args are re-marshaled and returned so the tool receives clean
+	// values instead of the loop stalling on a model that keeps re-sending the
+	// same mis-typed call. The original (mis-typed) args remain visible in the
+	// preceding EventToolExecStart, so the recovery stays observable.
+	coerced := false
 	if props, ok := schema["properties"].(map[string]any); ok {
 		for key, val := range parsed {
 			// JSON null on an optional field is equivalent to omitting the field.
@@ -1150,6 +1165,11 @@ func validateToolArgs(tool Tool, call ToolCall) error {
 				continue
 			}
 			if received, hint, mismatch := typeMismatch(val, expectedType); mismatch {
+				if fixed, ok := coerceArg(val, expectedType); ok {
+					parsed[key] = fixed
+					coerced = true
+					continue
+				}
 				issues = append(issues, ValidationIssue{
 					Kind:     IssueType,
 					Path:     key,
@@ -1161,10 +1181,54 @@ func validateToolArgs(tool Tool, call ToolCall) error {
 		}
 	}
 
-	if len(issues) == 0 {
-		return nil
+	if len(issues) > 0 {
+		return nil, &ToolValidationError{ToolName: tool.Name(), Issues: issues}
 	}
-	return &ToolValidationError{ToolName: tool.Name(), Issues: issues}
+	if coerced {
+		if fixed, err := json.Marshal(parsed); err == nil {
+			return fixed, nil
+		}
+		// Re-marshaling a freshly-unmarshaled map should never fail; if it
+		// somehow does, fall through and let the tool run with original args.
+	}
+	return nil, nil
+}
+
+// coerceArg recovers a trivially-fixable type mismatch: a value the model
+// emitted as a JSON string when the schema wants a number, array, or object.
+// It returns the corrected Go value and true only when the string parses
+// unambiguously into the expected type — e.g. "119" → 119 for an integer, or
+// `["a","b"]` → []any for an array. Anything ambiguous is left untouched so the
+// caller still surfaces a validation error. This rescues weaker models and
+// providers that stringify tool-call arguments and would otherwise loop forever
+// re-sending the same mis-typed call.
+func coerceArg(val any, expected string) (any, bool) {
+	s, ok := val.(string)
+	if !ok {
+		return nil, false
+	}
+	t := strings.TrimSpace(s)
+	switch expected {
+	case "integer":
+		if n, err := strconv.ParseInt(t, 10, 64); err == nil {
+			return float64(n), true
+		}
+	case "number":
+		if f, err := strconv.ParseFloat(t, 64); err == nil {
+			return f, true
+		}
+	case "array":
+		var a []any
+		if json.Unmarshal([]byte(t), &a) == nil {
+			return a, true
+		}
+	case "object":
+		var m map[string]any
+		if json.Unmarshal([]byte(t), &m) == nil {
+			return m, true
+		}
+	}
+	return nil, false
 }
 
 // typeMismatch reports whether val conflicts with the JSON Schema type. When it
