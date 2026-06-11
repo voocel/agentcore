@@ -8,7 +8,7 @@ import (
 	"github.com/voocel/agentcore"
 )
 
-const defaultClearedToolResult = "[Tool result cleared to save context. Re-run the relevant tool if exact output is needed.]"
+const defaultClearedToolResult = "[Tool result cleared to save context.]"
 
 type ToolResultMicrocompactConfig struct {
 	Classifier     ToolClassifier
@@ -51,13 +51,22 @@ func (s *ToolResultMicrocompactStrategy) Apply(_ context.Context, _ []agentcore.
 		}
 	}
 
-	if len(candidates) <= keepRecent {
-		return view, StrategyResult{Name: s.Name()}, nil
-	}
-
+	// Protect the most recent keepRecent results, deduplicated by (tool, args):
+	// when the model re-issues the identical call, only the newest result is
+	// worth protecting — older copies carry no extra information and would
+	// crowd genuinely distinct results out of the protection window.
 	protected := make(map[int]struct{}, keepRecent)
-	for i := len(candidates) - keepRecent; i < len(candidates); i++ {
-		protected[candidates[i].Index] = struct{}{}
+	seenKeys := make(map[string]struct{}, keepRecent)
+	for i := len(candidates) - 1; i >= 0 && len(protected) < keepRecent; i-- {
+		c := candidates[i]
+		if _, dup := seenKeys[c.Key]; dup {
+			continue
+		}
+		seenKeys[c.Key] = struct{}{}
+		protected[c.Index] = struct{}{}
+	}
+	if len(protected) == len(candidates) {
+		return view, StrategyResult{Name: s.Name()}, nil
 	}
 
 	out := copyMessages(view)
@@ -94,10 +103,18 @@ func (s *ToolResultMicrocompactStrategy) Apply(_ context.Context, _ []agentcore.
 type compactableToolResult struct {
 	Index    int
 	ToolName string
+	// Key identifies the originating call by tool name + raw args, so results
+	// of identical repeated calls can be deduplicated in the protection window.
+	Key string
+}
+
+type pendingToolCall struct {
+	name string
+	key  string
 }
 
 func findCompactableToolResults(msgs []agentcore.AgentMessage, classifier ToolClassifier) []compactableToolResult {
-	pending := map[string]string{}
+	pending := map[string]pendingToolCall{}
 	var results []compactableToolResult
 
 	for i, am := range msgs {
@@ -108,7 +125,10 @@ func findCompactableToolResults(msgs []agentcore.AgentMessage, classifier ToolCl
 
 		if msg.Role == agentcore.RoleAssistant {
 			for _, call := range msg.ToolCalls() {
-				pending[call.ID] = call.Name
+				pending[call.ID] = pendingToolCall{
+					name: call.Name,
+					key:  call.Name + "\x00" + string(call.Args),
+				}
 			}
 			continue
 		}
@@ -118,14 +138,14 @@ func findCompactableToolResults(msgs []agentcore.AgentMessage, classifier ToolCl
 		}
 
 		callID, _ := msg.Metadata["tool_call_id"].(string)
-		toolName := pending[callID]
-		if toolName == "" {
+		call := pending[callID]
+		if call.name == "" {
 			continue
 		}
-		if classifier != nil && !classifier(toolName) {
+		if classifier != nil && !classifier(call.name) {
 			continue
 		}
-		results = append(results, compactableToolResult{Index: i, ToolName: toolName})
+		results = append(results, compactableToolResult{Index: i, ToolName: call.name, Key: call.key})
 	}
 
 	return results

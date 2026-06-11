@@ -3,6 +3,7 @@ package context
 import (
 	"context"
 	"fmt"
+	"slices"
 	"strings"
 	"testing"
 
@@ -317,6 +318,79 @@ func TestContextEngineSnapshotTracksActiveViewAndLastRewrite(t *testing.T) {
 	if snapshot.LastStrategy != "light_trim" {
 		t.Fatalf("expected last strategy to be preserved after sync, got %q", snapshot.LastStrategy)
 	}
+}
+
+func TestToolResultMicrocompactDeduplicatesIdenticalCalls(t *testing.T) {
+	buildCallPairs := func(n int, argsFor func(i int) string) []agentcore.AgentMessage {
+		msgs := make([]agentcore.AgentMessage, 0, 2*n)
+		for i := 0; i < n; i++ {
+			id := fmt.Sprintf("tc%d", i)
+			msgs = append(msgs,
+				agentcore.Message{
+					Role: agentcore.RoleAssistant,
+					Content: []agentcore.ContentBlock{
+						agentcore.ToolCallBlock(agentcore.ToolCall{ID: id, Name: "novel_context", Args: []byte(argsFor(i))}),
+					},
+				},
+				agentcore.ToolResultMsg(id, []byte(fmt.Sprintf(`"RESULT_%d_%s"`, i, strings.Repeat("x", 80))), false),
+			)
+		}
+		return msgs
+	}
+	clearedIndexes := func(msgs []agentcore.AgentMessage) []int {
+		var cleared []int
+		for i, am := range msgs {
+			if msg, ok := am.(agentcore.Message); ok && msg.Role == agentcore.RoleTool &&
+				strings.Contains(msg.TextContent(), defaultClearedToolResult) {
+				cleared = append(cleared, i)
+			}
+		}
+		return cleared
+	}
+	strategy := NewToolResultMicrocompact(ToolResultMicrocompactConfig{KeepRecent: 5})
+
+	t.Run("identical calls keep only the newest result", func(t *testing.T) {
+		msgs := buildCallPairs(6, func(int) string { return `{"chapter":119}` })
+		out, res, err := strategy.Apply(context.Background(), nil, msgs, Budget{})
+		if err != nil {
+			t.Fatalf("apply failed: %v", err)
+		}
+		if !res.Applied {
+			t.Fatal("expected microcompact to clear duplicated results")
+		}
+
+		if got, want := clearedIndexes(out), []int{1, 3, 5, 7, 9}; !slices.Equal(got, want) {
+			t.Fatalf("expected cleared indexes %v, got %v", want, got)
+		}
+	})
+
+	t.Run("duplicates cleared even under the keep-recent limit", func(t *testing.T) {
+		msgs := buildCallPairs(3, func(int) string { return `{"chapter":119}` })
+		out, res, err := strategy.Apply(context.Background(), nil, msgs, Budget{})
+		if err != nil {
+			t.Fatalf("apply failed: %v", err)
+		}
+		if !res.Applied {
+			t.Fatal("expected microcompact to clear duplicated results")
+		}
+		if got, want := clearedIndexes(out), []int{1, 3}; !slices.Equal(got, want) {
+			t.Fatalf("expected cleared indexes %v, got %v", want, got)
+		}
+	})
+
+	t.Run("distinct calls keep the recent window intact", func(t *testing.T) {
+		msgs := buildCallPairs(6, func(i int) string { return fmt.Sprintf(`{"chapter":%d}`, i) })
+		out, res, err := strategy.Apply(context.Background(), nil, msgs, Budget{})
+		if err != nil {
+			t.Fatalf("apply failed: %v", err)
+		}
+		if !res.Applied {
+			t.Fatal("expected microcompact to clear the oldest result")
+		}
+		if got, want := clearedIndexes(out), []int{1}; !slices.Equal(got, want) {
+			t.Fatalf("expected cleared indexes %v, got %v", want, got)
+		}
+	})
 }
 
 func TestContextEngineProjectDoesNotMutateOriginalMessageMetadata(t *testing.T) {
