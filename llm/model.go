@@ -98,6 +98,9 @@ func NewBaseModel(info ModelInfo, config *GenerationConfig) *BaseModel {
 func (m *BaseModel) Info() ModelInfo              { return m.info }
 func (m *BaseModel) GetConfig() *GenerationConfig { return m.config }
 
+// ModelName implements agentcore.ModelNamer.
+func (m *BaseModel) ModelName() string { return m.info.Name }
+
 func (m *BaseModel) SupportsCapability(capability ModelCapability) bool {
 	for _, c := range m.info.Capabilities {
 		if c == string(capability) {
@@ -114,4 +117,3 @@ func (m *BaseModel) SupportsTools() bool {
 func (m *BaseModel) SupportsStreaming() bool {
 	return m.SupportsCapability(CapabilityStreaming)
 }
-

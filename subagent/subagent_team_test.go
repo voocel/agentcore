@@ -115,16 +115,9 @@ func TestSubAgentTool_TeamSpawn_RequiresSpawner(t *testing.T) {
 		"task":      "x",
 		"team_name": "alpha",
 	})
-	out, err := tl.Execute(context.Background(), args)
-	if err != nil {
-		t.Fatalf("Execute: %v", err)
-	}
-	var s string
-	if err := json.Unmarshal(out, &s); err != nil {
-		t.Fatalf("unmarshal: %v", err)
-	}
-	if !strings.Contains(s, "team spawn is not configured") {
-		t.Errorf("expected configuration error, got %q", s)
+	_, err := tl.Execute(context.Background(), args)
+	if err == nil || !strings.Contains(err.Error(), "team spawn is not configured") {
+		t.Errorf("expected configuration error, got %v", err)
 	}
 }
 
@@ -138,16 +131,9 @@ func TestSubAgentTool_TeamSpawn_MutexWithBackground(t *testing.T) {
 		"team_name":  "alpha",
 		"background": true,
 	})
-	out, err := tl.Execute(context.Background(), args)
-	if err != nil {
-		t.Fatalf("Execute: %v", err)
-	}
-	var s string
-	if err := json.Unmarshal(out, &s); err != nil {
-		t.Fatalf("unmarshal: %v", err)
-	}
-	if !strings.Contains(s, "mutually exclusive") {
-		t.Errorf("expected mutex error, got %q", s)
+	_, err := tl.Execute(context.Background(), args)
+	if err == nil || !strings.Contains(err.Error(), "mutually exclusive") {
+		t.Errorf("expected mutex error, got %v", err)
 	}
 }
 
@@ -158,16 +144,9 @@ func TestSubAgentTool_TeamSpawn_RequiresAgentAndTask(t *testing.T) {
 	args, _ := json.Marshal(map[string]any{
 		"team_name": "alpha",
 	})
-	out, err := tl.Execute(context.Background(), args)
-	if err != nil {
-		t.Fatalf("Execute: %v", err)
-	}
-	var s string
-	if err := json.Unmarshal(out, &s); err != nil {
-		t.Fatalf("unmarshal: %v", err)
-	}
-	if !strings.Contains(s, "agent + task") {
-		t.Errorf("expected missing-agent/task error, got %q", s)
+	_, err := tl.Execute(context.Background(), args)
+	if err == nil || !strings.Contains(err.Error(), "agent + task") {
+		t.Errorf("expected missing-agent/task error, got %v", err)
 	}
 }
 
@@ -180,15 +159,8 @@ func TestSubAgentTool_TeamSpawn_PropagatesSpawnerError(t *testing.T) {
 		"task":      "x",
 		"team_name": "alpha",
 	})
-	out, err := tl.Execute(context.Background(), args)
-	if err != nil {
-		t.Fatalf("Execute: %v", err)
-	}
-	var got map[string]any
-	if err := json.Unmarshal(out, &got); err != nil {
-		t.Fatalf("unmarshal: %v", err)
-	}
-	if errStr, _ := got["error"].(string); !strings.Contains(errStr, "at capacity") {
-		t.Errorf("expected spawner error propagated, got %v", got)
+	_, err := tl.Execute(context.Background(), args)
+	if err == nil || !strings.Contains(err.Error(), "at capacity") {
+		t.Errorf("expected spawner error propagated, got %v", err)
 	}
 }

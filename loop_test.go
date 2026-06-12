@@ -79,7 +79,7 @@ func TestCallLLM_CommitsProjectedContextWhenRequested(t *testing.T) {
 	}
 
 	events := make(chan Event, 16)
-	if _, _, err := callLLM(context.Background(), agentCtx, cfg, events, llmCallHooks{}); err != nil {
+	if _, _, err := callLLM(context.Background(), agentCtx, cfg, eventSink{ctx: context.Background(), ch: events}, llmCallHooks{}); err != nil {
 		t.Fatalf("callLLM failed: %v", err)
 	}
 
@@ -1627,7 +1627,7 @@ func TestCallLLMStream_StreamInitErrorBubbles(t *testing.T) {
 	m := &streamErrModel{err: fmt.Errorf("provider unavailable")}
 	events := make(chan Event, 4)
 
-	_, _, err := callLLMStream(context.Background(), m, nil, nil, nil, events, llmCallHooks{})
+	_, _, err := callLLMStream(context.Background(), m, nil, nil, nil, eventSink{ctx: context.Background(), ch: events}, llmCallHooks{})
 	close(events)
 
 	if err == nil {
@@ -1665,7 +1665,7 @@ func TestCallLLMStream_PartialStreamErrorOnTruncation(t *testing.T) {
 	m := &partialStreamModel{text: "half a sente"}
 	events := make(chan Event, 16)
 
-	_, _, err := callLLMStream(context.Background(), m, nil, nil, nil, events, llmCallHooks{})
+	_, _, err := callLLMStream(context.Background(), m, nil, nil, nil, eventSink{ctx: context.Background(), ch: events}, llmCallHooks{})
 	close(events)
 
 	var partialErr *PartialStreamError
@@ -1731,7 +1731,7 @@ func TestCallLLMWithRetry_RetriesPartialStream(t *testing.T) {
 	cfg := LoopConfig{Model: m, MaxRetries: 2}
 	agentCtx := &AgentContext{Messages: []AgentMessage{UserMsg("hi")}}
 
-	msg, _, err := callLLMWithRetry(context.Background(), agentCtx, cfg, events, llmCallHooks{}, nil)
+	msg, _, err := callLLMWithRetry(context.Background(), agentCtx, cfg, eventSink{ctx: context.Background(), ch: events}, llmCallHooks{}, nil)
 	if err != nil {
 		t.Fatalf("expected retry to succeed, got %v", err)
 	}

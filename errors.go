@@ -54,8 +54,8 @@ type MaxTurnsError struct {
 	Limit int
 }
 
-func (e *MaxTurnsError) Error() string         { return fmt.Sprintf("max turns (%d) reached", e.Limit) }
-func (e *MaxTurnsError) Is(target error) bool  { return target == ErrMaxTurns }
+func (e *MaxTurnsError) Error() string        { return fmt.Sprintf("max turns (%d) reached", e.Limit) }
+func (e *MaxTurnsError) Is(target error) bool { return target == ErrMaxTurns }
 
 // PartialStreamError indicates a stream closed without a terminal done event.
 // Partial carries any content received before truncation; callers can inspect
@@ -82,7 +82,7 @@ func (e *ContextOverflowError) Error() string {
 	}
 	return "context window overflow: " + e.Cause.Error()
 }
-func (e *ContextOverflowError) Unwrap() error       { return e.Cause }
+func (e *ContextOverflowError) Unwrap() error        { return e.Cause }
 func (e *ContextOverflowError) Is(target error) bool { return target == ErrContextOverflow }
 
 // ToolValidationError is returned when tool call arguments fail schema
@@ -119,6 +119,47 @@ func IsContextOverflow(err error) bool {
 		return true
 	}
 	return litellm.IsContextOverflowError(err)
+}
+
+// ErrorKind returns a stable, log-friendly label for err: "canceled",
+// "stop_guard", "max_turns", "context_overflow", "stream_partial",
+// "tool_validation", "stream_idle", "rate_limit", "timeout", "auth",
+// "network". Returns "" for nil and "unknown" when nothing matches.
+//
+// Labels are part of the public API contract — they will not change between
+// minor versions, so harnesses can key alert routing and log filters on them
+// instead of matching error strings.
+func ErrorKind(err error) string {
+	if err == nil {
+		return ""
+	}
+	switch {
+	case errors.Is(err, context.Canceled):
+		return "canceled"
+	case errors.Is(err, ErrStopGuard):
+		return "stop_guard"
+	case errors.Is(err, ErrMaxTurns):
+		return "max_turns"
+	case IsContextOverflow(err):
+		return "context_overflow"
+	case errors.Is(err, ErrStreamPartial):
+		return "stream_partial"
+	case errors.Is(err, ErrToolValidation):
+		return "tool_validation"
+	}
+	switch classifyProviderSentinel(err) {
+	case ErrProviderStreamIdle:
+		return "stream_idle"
+	case ErrProviderRateLimit:
+		return "rate_limit"
+	case ErrProviderTimeout:
+		return "timeout"
+	case ErrProviderAuth:
+		return "auth"
+	case ErrProviderNetwork:
+		return "network"
+	}
+	return "unknown"
 }
 
 // streamIdleMsgPattern matches the rendered message of a stream-idle abort.

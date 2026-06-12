@@ -25,7 +25,7 @@ type turnToolExecutor struct {
 	cancel context.CancelFunc
 	tools  []Tool
 	config LoopConfig
-	ch     chan<- Event
+	sink   eventSink
 
 	mu             sync.Mutex
 	cond           *sync.Cond
@@ -38,7 +38,7 @@ type turnToolExecutor struct {
 	maxConcurrency int
 }
 
-func newTurnToolExecutor(ctx context.Context, tools []Tool, config LoopConfig, toolErrors map[string]int, ch chan<- Event) *turnToolExecutor {
+func newTurnToolExecutor(ctx context.Context, tools []Tool, config LoopConfig, toolErrors map[string]int, sink eventSink) *turnToolExecutor {
 	execCtx, cancel := context.WithCancel(ctx)
 	maxConc := config.MaxToolConcurrency
 	if maxConc <= 1 {
@@ -49,7 +49,7 @@ func newTurnToolExecutor(ctx context.Context, tools []Tool, config LoopConfig, t
 		cancel:         cancel,
 		tools:          tools,
 		config:         config,
-		ch:             ch,
+		sink:           sink,
 		toolErrors:     toolErrors,
 		maxConcurrency: maxConc,
 	}
@@ -97,9 +97,9 @@ func (e *turnToolExecutor) Wait() ([]ToolResult, []AgentMessage) {
 			continue
 		}
 		if skipMessage != "" {
-			results = append(results, skipToolCallWithMessage(entry.call, e.tools, e.ch, skipMessage))
+			results = append(results, skipToolCallWithMessage(entry.call, e.tools, e.sink, skipMessage))
 		} else {
-			results = append(results, skipToolCall(entry.call, e.tools, e.ch))
+			results = append(results, skipToolCall(entry.call, e.tools, e.sink))
 		}
 	}
 
@@ -162,7 +162,7 @@ func (e *turnToolExecutor) startLocked(entry *turnToolEntry) {
 	go func(ent *turnToolEntry) {
 		defer cancel()
 
-		result := executeSingleToolCall(runCtx, e.tools, ent.call, e.config, ent.failCount, e.ch)
+		result := executeSingleToolCall(runCtx, e.tools, ent.call, e.config, ent.failCount, e.sink)
 
 		e.mu.Lock()
 		defer e.mu.Unlock()

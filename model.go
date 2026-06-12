@@ -94,9 +94,11 @@ type LoopConfig struct {
 	ShouldEmitAbortMarker func() bool
 
 	// StopAfterTool, if non-nil, is called after each successful (non-error)
-	// tool execution. If it returns true, the loop exits immediately with
-	// EndReasonStop. Use this to let a terminal tool (e.g. commit_chapter)
-	// end the loop without wasting turns.
+	// tool execution. If it returns true, the loop exits with EndReasonStop.
+	// Use this to let a terminal tool (e.g. commit_chapter) end the loop
+	// without wasting turns. The exit passes through StopGuard (with
+	// Trigger=StopTriggerAfterTool) like any other normal stop, so a guard
+	// can veto a premature terminal-tool exit.
 	StopAfterTool func(toolName string) bool
 
 	// StopAfterToolResult is the result-aware variant of StopAfterTool. It is
@@ -108,9 +110,15 @@ type LoopConfig struct {
 	// context (assistant, tool result, steering). Use for session logging.
 	OnMessage func(msg AgentMessage)
 
-	// StopGuard is consulted when the LLM would end a run without tool calls.
-	// Nil (default) means every stop is allowed.
+	// StopGuard is consulted on every normal stop (end_turn and
+	// StopAfterTool exits). Nil (default) means every stop is allowed.
 	StopGuard StopGuard
+
+	// LengthRecoveryPrompt overrides the user message injected when the
+	// model's output is truncated (max_tokens) with no completed tool calls.
+	// Empty uses a built-in default. Each recovery is an extra LLM call on
+	// top of normal turn accounting, bounded by an internal cap.
+	LengthRecoveryPrompt string
 
 	// ToolsAreIdempotent declares that all registered tools are safe to re-execute
 	// with the same arguments — i.e. running them twice produces the same observable
@@ -278,6 +286,14 @@ type ProviderNamer interface {
 	ProviderName() string
 }
 
+// ModelNamer is an optional interface for ChatModel implementations to
+// expose their model identifier (e.g. "claude-sonnet-4-6"). Harnesses need
+// this for display and telemetry; without it they fall back to concrete-type
+// assertions.
+type ModelNamer interface {
+	ModelName() string
+}
+
 // SwappableModel wraps a ChatModel and allows replacing the underlying model
 // at runtime. Swaps take effect on the next call.
 type SwappableModel struct {
@@ -329,6 +345,15 @@ func (m *SwappableModel) ProviderName() string {
 		return ""
 	}
 	return pn.ProviderName()
+}
+
+func (m *SwappableModel) ModelName() string {
+	model := m.Current()
+	mn, ok := model.(ModelNamer)
+	if !ok {
+		return ""
+	}
+	return mn.ModelName()
 }
 
 // ---------------------------------------------------------------------------

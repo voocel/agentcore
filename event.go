@@ -1,6 +1,7 @@
 package agentcore
 
 import (
+	"context"
 	"encoding/json"
 	"time"
 )
@@ -13,9 +14,13 @@ import (
 type EventType string
 
 const (
-	EventAgentStart     EventType = "agent_start"
-	EventAgentEnd       EventType = "agent_end"
-	EventTurnStart      EventType = "turn_start"
+	EventAgentStart EventType = "agent_start"
+	EventAgentEnd   EventType = "agent_end"
+	EventTurnStart  EventType = "turn_start"
+	// EventTurnEnd fires after every LLM call completes (including its tool
+	// executions) — a "turn" here is one model invocation, not one logical
+	// user exchange. Steering injections and length recoveries each produce
+	// additional TurnEnds within the same run.
 	EventTurnEnd        EventType = "turn_end"
 	EventMessageStart   EventType = "message_start"
 	EventMessageUpdate  EventType = "message_update"
@@ -98,16 +103,36 @@ type RetryInfo struct {
 // Event Helpers
 // ---------------------------------------------------------------------------
 
-// emit sends an event to the channel. Blocks if the channel is full,
-// creating backpressure to prevent event loss.
-func emit(ch chan<- Event, ev Event) {
-	ch <- ev
+// eventSink delivers loop events bound to the run context. It is created
+// once per run at the AgentLoop entry points, so every emission site shares
+// the same lifetime regardless of narrower contexts (per-tool cancellation
+// must not affect event delivery).
+type eventSink struct {
+	ctx context.Context
+	ch  chan<- Event
+}
+
+// emit sends an event to the channel, blocking when it is full — backpressure,
+// never event loss, while the run is live. Once the run context is canceled
+// delivery degrades to best-effort: a buffered/ready send still succeeds (a
+// draining reader receives the terminal events), but when the channel stays
+// full the event is dropped so an abandoned channel cannot leak the loop
+// goroutine.
+func (s eventSink) emit(ev Event) {
+	select {
+	case s.ch <- ev:
+	default:
+		select {
+		case s.ch <- ev:
+		case <-s.ctx.Done():
+		}
+	}
 }
 
 // emitError sends an error event followed by agent_end.
-func emitError(ch chan<- Event, err error, summary *RunSummary) {
-	emit(ch, Event{Type: EventError, Err: err})
-	emit(ch, Event{Type: EventAgentEnd, Err: err, Summary: summary})
+func (s eventSink) emitError(err error, summary *RunSummary) {
+	s.emit(Event{Type: EventError, Err: err})
+	s.emit(Event{Type: EventAgentEnd, Err: err, Summary: summary})
 }
 
 // ---------------------------------------------------------------------------

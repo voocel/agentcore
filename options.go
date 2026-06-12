@@ -28,9 +28,21 @@ func WithTools(tools ...Tool) AgentOption {
 	return func(a *Agent) { a.tools = tools }
 }
 
-// WithMaxTurns sets the max turns safety limit.
+// WithMaxTurns sets the max turns safety limit. n <= 0 falls back to the
+// built-in default (100).
+//
+// Accounting note: a "turn" is one LLM call. Length-recovery (automatic
+// resume after a max_tokens truncation) injects extra calls that count
+// toward this limit, so budget recoveries into tight limits.
 func WithMaxTurns(n int) AgentOption {
 	return func(a *Agent) { a.maxTurns = n }
+}
+
+// WithLengthRecoveryPrompt overrides the user message injected when output
+// is truncated (max_tokens) with no completed tool calls. Empty keeps the
+// built-in default prompt.
+func WithLengthRecoveryPrompt(prompt string) AgentOption {
+	return func(a *Agent) { a.lengthRecoveryPrompt = prompt }
 }
 
 // WithThinkingLevel sets the reasoning depth for models that support it.

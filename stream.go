@@ -41,6 +41,10 @@ type EventStream struct {
 // NewEventStream creates an EventStream that reads from the source channel.
 // Events are forwarded to an internal channel for iteration.
 // The final result is captured from EventAgentEnd.
+//
+// Events() carries the same consumption contract as the source: iterate until
+// it closes. Abandoning it mid-stream leaks the forwarding goroutine — the
+// wrapper has no context to detect an absent reader.
 func NewEventStream(source <-chan Event) *EventStream {
 	s := &EventStream{
 		events: make(chan Event, 128),

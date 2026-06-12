@@ -217,28 +217,15 @@ func TestTool_ModeValidation(t *testing.T) {
 	tool := New(simpleAgent("x", "y"))
 
 	// No mode
-	result, err := tool.Execute(context.Background(), json.RawMessage(`{}`))
-	if err != nil {
-		t.Fatal(err)
-	}
-	var msg string
-	if err := json.Unmarshal(result, &msg); err != nil {
-		t.Fatal(err)
-	}
-	if !strings.Contains(msg, "exactly one mode") {
-		t.Fatalf("expected mode validation error, got %q", msg)
+	_, err := tool.Execute(context.Background(), json.RawMessage(`{}`))
+	if err == nil || !strings.Contains(err.Error(), "exactly one mode") {
+		t.Fatalf("expected mode validation error, got %v", err)
 	}
 
 	// Multiple modes
-	result, err = tool.Execute(context.Background(), json.RawMessage(`{"agent":"x","task":"t","tasks":[{"agent":"x","task":"t"}]}`))
-	if err != nil {
-		t.Fatal(err)
-	}
-	if err := json.Unmarshal(result, &msg); err != nil {
-		t.Fatal(err)
-	}
-	if !strings.Contains(msg, "exactly one mode") {
-		t.Fatalf("expected mode validation error, got %q", msg)
+	_, err = tool.Execute(context.Background(), json.RawMessage(`{"agent":"x","task":"t","tasks":[{"agent":"x","task":"t"}]}`))
+	if err == nil || !strings.Contains(err.Error(), "exactly one mode") {
+		t.Fatalf("expected mode validation error, got %v", err)
 	}
 }
 
@@ -301,11 +288,11 @@ func TestTool_BackgroundRespectsMaxAgentDepth(t *testing.T) {
 	tool.SetTaskRuntime(task.NewRuntime())
 
 	cases := []struct {
-		callerDepth  int
-		wantError    bool
-		wantBgDepth  int // entry.Depth on success path
+		callerDepth int
+		wantError   bool
+		wantBgDepth int // entry.Depth on success path
 	}{
-		{callerDepth: 0, wantError: false, wantBgDepth: 1},                     // main agent
+		{callerDepth: 0, wantError: false, wantBgDepth: 1},                      // main agent
 		{callerDepth: task.MaxAgentDepth - 1, wantError: false, wantBgDepth: 5}, // last legal level
 		{callerDepth: task.MaxAgentDepth, wantError: true},                      // childDepth = 6, rejected
 		{callerDepth: task.MaxAgentDepth + 5, wantError: true},                  // way past

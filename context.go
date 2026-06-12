@@ -142,3 +142,12 @@ type ContextEstimator interface {
 type ContextWindower interface {
 	ContextWindow() int
 }
+
+// ContextWindowSetter is an optional interface a ContextManager can implement
+// to receive window updates pushed through Agent.SetContextWindow. When
+// implemented, the agent and its context manager can never disagree on the
+// window size after a model hot-switch — without it, callers had to update
+// both sides manually and a missed call silently skewed compaction thresholds.
+type ContextWindowSetter interface {
+	SetContextWindow(n int)
+}

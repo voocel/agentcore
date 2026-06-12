@@ -26,25 +26,26 @@ type AgentState struct {
 // It consumes loop events to update internal state, just like any external listener.
 type Agent struct {
 	// Configuration (set via options)
-	model              ChatModel
-	systemPrompt       string
-	systemBlocks       []SystemBlock
-	tools              []Tool
-	maxTurns           int
-	maxRetries         int
-	maxToolErrors      int
-	thinkingLevel      ThinkingLevel
-	contextManager     ContextManager
-	convertToLLM       func([]AgentMessage) []Message
-	contextWindow      int
-	contextEstimateFn  ContextEstimateFn
-	toolGate           ToolGate
-	middlewares        []ToolMiddleware
-	maxToolConcurrency int
-	toolsAreIdempotent bool
-	onMessage          func(AgentMessage)
-	stopGuard          StopGuard
-	cacheLastMessage   string
+	model                ChatModel
+	systemPrompt         string
+	systemBlocks         []SystemBlock
+	tools                []Tool
+	maxTurns             int
+	maxRetries           int
+	maxToolErrors        int
+	thinkingLevel        ThinkingLevel
+	contextManager       ContextManager
+	convertToLLM         func([]AgentMessage) []Message
+	contextWindow        int
+	contextEstimateFn    ContextEstimateFn
+	toolGate             ToolGate
+	middlewares          []ToolMiddleware
+	maxToolConcurrency   int
+	toolsAreIdempotent   bool
+	lengthRecoveryPrompt string
+	onMessage            func(AgentMessage)
+	stopGuard            StopGuard
+	cacheLastMessage     string
 
 	// State
 	messages         []AgentMessage
@@ -99,6 +100,14 @@ func NewAgent(opts ...AgentOption) *Agent {
 }
 
 // Subscribe registers a listener for agent events. Returns an unsubscribe function.
+//
+// Dispatch contract (stable API guarantee): listeners are invoked
+// synchronously, in registration order, on the agent's event-consumption
+// goroutine. A listener registered before another always observes each event
+// first — ordering-sensitive consumers (e.g. a budget sentinel that must veto
+// before a dispatcher reacts) may rely on this. The flip side: a slow listener
+// delays event delivery to all later listeners and backpressures the loop's
+// event channel; offload heavy work to your own goroutine.
 func (a *Agent) Subscribe(fn func(Event)) func() {
 	a.mu.Lock()
 	defer a.mu.Unlock()
@@ -129,6 +138,16 @@ func (a *Agent) PromptMessages(msgs ...AgentMessage) error {
 
 // Continue resumes from the current context without adding new messages.
 // If the last message is from assistant, it dequeues steering/follow-up
+// messages (steering first) and replays them as the new prompt.
+//
+// Queue retention caveat: messages queued via Steer/FollowUp survive an
+// aborted run — Abort cancels execution but never consumes or clears the
+// queues, so the next Continue (including any automatic resume the harness
+// performs) replays them. If a queued directive must not outlive the run it
+// was meant for, clear it on your abort path via ClearSteeringQueue /
+// ClearFollowUpQueue / ClearAllQueues; agentcore cannot decide this — some
+// harnesses queue droppable steering text, others queue task-completion
+// notifications that must never be lost.
 func (a *Agent) Continue() error {
 	a.mu.Lock()
 	if a.isRunning {
@@ -178,6 +197,11 @@ func (a *Agent) FollowUp(msg AgentMessage) {
 
 // Abort cancels the current execution and emits an abort marker message
 // so the LLM knows the user interrupted.
+//
+// Abort does not touch the steering/follow-up queues: messages queued before
+// the cancellation stay queued and are replayed by the next run (see
+// Continue). Harnesses that treat queued input as stale after an abort must
+// clear it explicitly.
 func (a *Agent) Abort() {
 	a.wantAbortMarker.Store(true)
 	a.mu.Lock()
@@ -419,11 +443,20 @@ func (a *Agent) SetModel(m ChatModel) {
 	a.model = m
 }
 
-// SetContextWindow updates the context window size (in tokens).
+// SetContextWindow updates the context window size (in tokens). The new value
+// is also pushed to the ContextManager when it implements ContextWindowSetter,
+// so a model hot-switch needs exactly one call to keep agent-side usage
+// reporting and engine-side compaction thresholds in agreement.
 func (a *Agent) SetContextWindow(n int) {
 	a.mu.Lock()
-	defer a.mu.Unlock()
 	a.contextWindow = n
+	cm := a.contextManager
+	a.mu.Unlock()
+	// Propagate outside the agent lock: the manager has its own mutex and
+	// may be queried concurrently by a running loop.
+	if s, ok := cm.(ContextWindowSetter); ok {
+		s.SetContextWindow(n)
+	}
 }
 
 // SetSystemPrompt changes the system prompt (single-string mode).
@@ -621,6 +654,7 @@ func (a *Agent) buildConfig() LoopConfig {
 		ShouldEmitAbortMarker: a.wantAbortMarker.Load,
 		OnMessage:             a.onMessage,
 		StopGuard:             a.stopGuard,
+		LengthRecoveryPrompt:  a.lengthRecoveryPrompt,
 		ToolsAreIdempotent:    a.toolsAreIdempotent,
 		CacheLastMessage:      a.cacheLastMessage,
 	}

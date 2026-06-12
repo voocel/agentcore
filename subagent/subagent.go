@@ -307,10 +307,10 @@ func (t *Tool) Execute(ctx context.Context, args json.RawMessage) (json.RawMessa
 	// so a user calling with both keys gets the team-mode error path.
 	if p.TeamName != "" {
 		if p.Background || hasChain || hasParallel {
-			return json.Marshal("team_name is mutually exclusive with background/tasks/chain")
+			return nil, fmt.Errorf("team_name is mutually exclusive with background/tasks/chain")
 		}
 		if !hasSingle {
-			return json.Marshal("team mode requires agent + task")
+			return nil, fmt.Errorf("team mode requires agent + task")
 		}
 		return t.executeTeamSpawn(ctx, p, modelOverride)
 	}
@@ -321,7 +321,7 @@ func (t *Tool) Execute(ctx context.Context, args json.RawMessage) (json.RawMessa
 	// completion" semantics that synchronous execution cannot satisfy.
 	if p.Background {
 		if !hasSingle {
-			return json.Marshal("background mode requires agent + task")
+			return nil, fmt.Errorf("background mode requires agent + task")
 		}
 		if t.taskRT == nil {
 			return nil, fmt.Errorf("background mode requires a wired TaskRuntime (call subagent.Tool.SetTaskRuntime)")
@@ -331,7 +331,7 @@ func (t *Tool) Execute(ctx context.Context, args json.RawMessage) (json.RawMessa
 
 	modeCount := boolToInt(hasChain) + boolToInt(hasParallel) + boolToInt(hasSingle)
 	if modeCount != 1 {
-		return json.Marshal("Invalid parameters: provide exactly one mode (agent+task, tasks, or chain)")
+		return nil, fmt.Errorf("invalid parameters: provide exactly one mode (agent+task, tasks, or chain)")
 	}
 
 	switch {
@@ -352,7 +352,7 @@ func (t *Tool) Execute(ctx context.Context, args json.RawMessage) (json.RawMessa
 // team spawn through one user-facing surface.
 func (t *Tool) executeTeamSpawn(ctx context.Context, p params, modelOverride agentcore.ChatModel) (json.RawMessage, error) {
 	if t.teamSpawner == nil {
-		return json.Marshal("team spawn is not configured in this environment")
+		return nil, fmt.Errorf("team spawn is not configured in this environment")
 	}
 	cfg, ok := t.agents[p.Agent]
 	if !ok {
@@ -380,7 +380,7 @@ func (t *Tool) executeTeamSpawn(ctx context.Context, p params, modelOverride age
 	}
 	res, err := t.teamSpawner(ctx, req)
 	if err != nil {
-		return json.Marshal(map[string]any{"error": err.Error()})
+		return nil, fmt.Errorf("team spawn failed: %w", err)
 	}
 	return json.Marshal(map[string]any{
 		"task_id":  res.TaskID,
