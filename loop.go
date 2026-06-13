@@ -11,8 +11,6 @@ import (
 	"strconv"
 	"strings"
 	"time"
-
-	"github.com/voocel/litellm"
 )
 
 const (
@@ -483,8 +481,8 @@ func callLLMWithRetry(ctx context.Context, agentCtx *AgentContext, config LoopCo
 		// User cancellation is never retryable: the next attempt would just
 		// rediscover ctx.Done(), and emitting EventRetry in that window surfaces
 		// confusing "retry (1/N)" messages to users who already aborted. Aligns
-		// with IsFailoverEligible (errors.go) and litellm/resilience.go, which
-		// both treat context.Canceled as terminal.
+		// with IsFailoverEligible (errors.go), which also treats
+		// context.Canceled as terminal.
 		if errors.Is(err, context.Canceled) {
 			return Message{}, info, err
 		}
@@ -494,7 +492,7 @@ func callLLMWithRetry(ctx context.Context, agentCtx *AgentContext, config LoopCo
 		// that a fresh request can recover from. The HasCompletedToolCalls guard
 		// above already prevents retrying after a tool side-effect has fired.
 		var pse *PartialStreamError
-		retryable := litellm.IsRetryableError(err) || errors.As(err, &pse)
+		retryable := isRetryable(err) || errors.As(err, &pse)
 		if !retryable || attempt == maxRetries {
 			return Message{}, info, err
 		}
@@ -566,8 +564,8 @@ func recoverOverflow(ctx context.Context, agentCtx *AgentContext, config LoopCon
 // Respects Retry-After from rate limit errors. Capped at defaultMaxRetryDelay.
 func retryDelay(err error, attempt int) time.Duration {
 	maxDelay := defaultMaxRetryDelay
-	if after := litellm.GetRetryAfter(err); after > 0 {
-		d := time.Duration(after) * time.Second
+	if after := retryAfterHint(err); after > 0 {
+		d := after
 		if d > maxDelay {
 			d = maxDelay
 		}

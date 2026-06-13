@@ -186,7 +186,7 @@ func (l *LiteLLMAdapter) Generate(ctx context.Context, messages []agentcore.Mess
 
 	ltResp, err := l.client.Chat(ctx, ltReq)
 	if err != nil {
-		return nil, fmt.Errorf("llm: chat failed: %w", err)
+		return nil, fmt.Errorf("llm: chat failed: %w", wrapProviderError(err))
 	}
 
 	msg := convertResponse(ltResp)
@@ -215,7 +215,7 @@ func (l *LiteLLMAdapter) GenerateStream(ctx context.Context, messages []agentcor
 
 	stream, err := l.client.Stream(ctx, request)
 	if err != nil {
-		return nil, fmt.Errorf("llm: stream failed: %w", err)
+		return nil, fmt.Errorf("llm: stream failed: %w", wrapProviderError(err))
 	}
 
 	eventChan := make(chan agentcore.StreamEvent, 100)
@@ -356,7 +356,7 @@ func (l *LiteLLMAdapter) GenerateStream(ctx context.Context, messages []agentcor
 		})
 
 		if err != nil {
-			eventChan <- agentcore.StreamEvent{Type: agentcore.StreamEventError, Err: err}
+			eventChan <- agentcore.StreamEvent{Type: agentcore.StreamEventError, Err: wrapProviderError(err)}
 			return
 		}
 

@@ -6,8 +6,7 @@ import (
 	"fmt"
 	"sort"
 	"strings"
-
-	"github.com/voocel/litellm"
+	"time"
 )
 
 // Errors produced by agentcore fall into two layers:
@@ -16,9 +15,12 @@ import (
 //      Surfaced as sentinel errors (Err*) or typed errors (*Error).
 //      Match with errors.Is(err, ErrXxx) or errors.As(err, &SomeError{}).
 //
-//   2. Model layer — LLM provider errors flow through Unwrap to
-//      *litellm.LiteLLMError. Match with errors.As(err, &litellm.LiteLLMError{})
-//      and inspect .Type for the category (rate_limit, quota, auth, ...).
+//   2. Model layer — provider errors. The kernel does not import any LLM SDK;
+//      model adapters classify their SDK's errors at the boundary by mapping
+//      them onto this package's sentinels (ErrContextOverflow, ErrProvider*)
+//      via errors.Is and the RetryableError / RetryHinter interfaces. Adapters
+//      Unwrap to the original SDK error, so callers that DO know the SDK can
+//      still match it with errors.As.
 //
 // User cancellation surfaces as context.Canceled, not a custom sentinel —
 // use errors.Is(err, context.Canceled) for abort detection.
@@ -37,10 +39,10 @@ var (
 	ErrInjectNilMessage = errors.New("inject message is nil")
 )
 
-// Provider runtime sentinels. These categorize errors returned by the LLM
-// provider at call time (litellm errors, network failures, server responses).
-// Use ClassifyProvider to derive the most specific sentinel from an error chain,
-// or match directly with errors.Is.
+// Provider runtime sentinels. These categorize errors returned by the model
+// adapter at call time (provider API errors, network failures, server
+// responses). Use ClassifyProvider to derive the most specific sentinel from
+// an error chain, or match directly with errors.Is.
 var (
 	ErrProviderRateLimit  = errors.New("provider rate limit")
 	ErrProviderTimeout    = errors.New("provider timeout")
@@ -48,6 +50,39 @@ var (
 	ErrProviderNetwork    = errors.New("provider network")
 	ErrProviderAuth       = errors.New("provider auth")
 )
+
+// RetryableError when implemented by an error in the chain, tells the loop
+// whether re-issuing the identical request may succeed. Model adapters
+// implement it so the kernel decides same-provider retries without importing
+// any LLM SDK. Errors that do not implement it are treated as non-retryable
+// (the loop still has its own message-pattern classification as a fallback).
+type RetryableError interface {
+	Retryable() bool
+}
+
+// RetryHinter when implemented, supplies a provider-specified backoff hint
+// (e.g. a Retry-After header). The loop honors it for the next retry delay,
+// capped at its own maximum. A zero duration means "no hint, use backoff".
+type RetryHinter interface {
+	RetryAfter() time.Duration
+}
+
+// isRetryable reports whether the error chain advertises retryability via
+// RetryableError.
+func isRetryable(err error) bool {
+	var r RetryableError
+	return errors.As(err, &r) && r.Retryable()
+}
+
+// retryAfterHint extracts a provider backoff hint from the chain, or 0 if none
+// is present.
+func retryAfterHint(err error) time.Duration {
+	var h RetryHinter
+	if errors.As(err, &h) {
+		return h.RetryAfter()
+	}
+	return 0
+}
 
 // MaxTurnsError carries the configured turn limit. errors.Is matches ErrMaxTurns.
 type MaxTurnsError struct {
@@ -70,7 +105,7 @@ func (e *PartialStreamError) Error() string        { return "stream closed witho
 func (e *PartialStreamError) Is(target error) bool { return target == ErrStreamPartial }
 
 // ContextOverflowError wraps an underlying context-overflow cause (typically
-// a litellm error). errors.Is matches ErrContextOverflow; Unwrap reaches the
+// a provider error). errors.Is matches ErrContextOverflow; Unwrap reaches the
 // raw cause so callers can extract provider-specific details if needed.
 type ContextOverflowError struct {
 	Cause error
@@ -111,14 +146,13 @@ const (
 	IssueType    = "type"
 )
 
-// IsContextOverflow reports whether err indicates a context-overflow condition
-// at any layer (agentcore wrapper or raw litellm provider). Convenience for
-// callers that want to detect "request too big" without caring where it surfaced.
+// IsContextOverflow reports whether err indicates a context-overflow condition.
+// Both the agentcore wrapper (*ContextOverflowError) and adapter-classified
+// provider errors map onto ErrContextOverflow, so a single errors.Is covers
+// both layers. Convenience for callers that want to detect "request too big"
+// without caring where it surfaced.
 func IsContextOverflow(err error) bool {
-	if errors.Is(err, ErrContextOverflow) {
-		return true
-	}
-	return litellm.IsContextOverflowError(err)
+	return errors.Is(err, ErrContextOverflow)
 }
 
 // ErrorKind returns a stable, log-friendly label for err: "canceled",
@@ -179,12 +213,12 @@ func IsStreamIdleMessage(s string) bool {
 //
 // Stream-idle is checked before generic timeout: it is a stuck connection that
 // failover can typically rescue, whereas a generic timeout may just be a slow
-// model. Both error-chain matching (via litellm.IsStreamIdleError) and message
-// pattern matching are supported because sub-agent JSON results flatten the
-// original error to a plain string.
+// model. Both error-chain matching (adapters map stream-idle onto
+// ErrProviderStreamIdle) and message pattern matching are supported because
+// sub-agent JSON results flatten the original error to a plain string.
 //
-// Context overflow is intentionally not returned here — use IsContextOverflow
-// (which already handles both agentcore and litellm layers).
+// Context overflow is intentionally not returned here — use IsContextOverflow,
+// which covers both the agentcore wrapper and adapter-classified errors.
 func ClassifyProvider(err error) error {
 	if err == nil {
 		return nil
@@ -196,7 +230,7 @@ func ClassifyProvider(err error) error {
 }
 
 func classifyProviderSentinel(err error) error {
-	if litellm.IsStreamIdleError(err) {
+	if errors.Is(err, ErrProviderStreamIdle) {
 		return ErrProviderStreamIdle
 	}
 	if errors.Is(err, context.DeadlineExceeded) {
