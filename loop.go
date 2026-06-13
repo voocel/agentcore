@@ -43,6 +43,7 @@ func AgentLoop(ctx context.Context, prompts []AgentMessage, agentCtx AgentContex
 
 	go func() {
 		defer close(ch)
+		defer recoverToEnd(sink) // runs before close(ch): a panic still emits EventAgentEnd
 
 		var newMessages []AgentMessage
 
@@ -68,6 +69,17 @@ func AgentLoop(ctx context.Context, prompts []AgentMessage, agentCtx AgentContex
 	return ch
 }
 
+// recoverToEnd turns a panic in the loop goroutine into a clean terminal event
+// instead of silently closing the channel. The loop contract promises the
+// channel always closes; this extends it so EventAgentEnd is emitted on every
+// termination path including panic, which observers/subscribers rely on (e.g.
+// to mark an agent stopped). Deferred BEFORE close(ch) so the emit lands first.
+func recoverToEnd(sink eventSink) {
+	if r := recover(); r != nil {
+		sink.emitError(fmt.Errorf("agent loop panicked: %v", r), &RunSummary{EndReason: EndReasonError})
+	}
+}
+
 // AgentLoopContinue continues from existing context without adding new messages.
 // The last message in context must convert to user or tool role via ConvertToLLM.
 //
@@ -89,6 +101,7 @@ func AgentLoopContinue(ctx context.Context, agentCtx AgentContext, config LoopCo
 
 	go func() {
 		defer close(ch)
+		defer recoverToEnd(sink) // runs before close(ch): a panic still emits EventAgentEnd
 
 		var newMessages []AgentMessage
 		currentCtx := AgentContext{

@@ -10,6 +10,7 @@ import (
 	"io"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/voocel/agentcore"
@@ -177,6 +178,31 @@ type TeamSpawnResult struct {
 // needs one method and call sites are simpler with a closure.
 type TeamSpawner func(ctx context.Context, req TeamSpawnRequest) (*TeamSpawnResult, error)
 
+// RunMeta identifies one sub-agent run (one runAgent invocation) for an
+// external event observer. It lets a harness route a run's raw AgentLoop
+// events to a per-run sink (e.g. a live-preview transcript) without the
+// subagent tool knowing anything about that sink.
+//
+//   - Agent:      the agent definition/type name (e.g. "explore"). Not unique
+//     when the same type runs more than once concurrently (parallel mode).
+//   - InstanceID: unique per runAgent invocation within this Tool's lifetime.
+//     Use this — not Agent — as the routing key.
+//   - Mode:       one of the Mode* constants below.
+type RunMeta struct {
+	Agent      string
+	InstanceID string
+	Mode       string
+}
+
+// Run modes — the authoritative set of values for RunMeta.Mode. Observers
+// should compare against these rather than string literals.
+const (
+	ModeSingle     = "single"
+	ModeParallel   = "parallel"
+	ModeChain      = "chain"
+	ModeBackground = "background"
+)
+
 // Tool implements agentcore.Tool. The main agent calls this tool to delegate
 // tasks to specialized sub-agents with isolated contexts.
 type Tool struct {
@@ -186,6 +212,8 @@ type Tool struct {
 	bgOutputFactory func(taskID, agentName string) (io.WriteCloser, string, error) // creates output writer for background tasks
 	taskRT          *task.Runtime                                                  // shared background task registry
 	teamSpawner     TeamSpawner                                                    // routes team-mode calls; nil means team spawn is rejected
+	eventObserver   func(meta RunMeta, ev agentcore.Event)                         // optional: observes every run's raw AgentLoop events; nil disables
+	runSeq          atomic.Int64                                                   // mints unique RunMeta.InstanceID values
 }
 
 // New creates a subagent tool from a set of agent configs.
@@ -222,6 +250,19 @@ func (t *Tool) SetCreateModel(fn func(name string) (agentcore.ChatModel, error))
 // regular subagent run.
 func (t *Tool) SetTeamSpawner(fn TeamSpawner) {
 	t.teamSpawner = fn
+}
+
+// SetEventObserver installs a callback that receives every raw AgentLoop event
+// produced by any sub-agent run (single/parallel/chain/background), tagged with
+// a RunMeta carrying a unique per-run InstanceID. A harness uses this to drive
+// a live preview of sub-agent work — symmetric to how a teammate executor fans
+// its loop events out. nil (the default) disables observation with zero cost.
+//
+// The callback MUST be non-blocking: it runs inline on the sub-agent's
+// execution goroutine (and on parallel/background goroutines concurrently), so
+// a slow observer stalls the run. Sinks that may block should buffer + drop.
+func (t *Tool) SetEventObserver(fn func(meta RunMeta, ev agentcore.Event)) {
+	t.eventObserver = fn
 }
 
 // AgentConfig returns the registered sub-agent definition for name, or
@@ -463,7 +504,7 @@ func (t *Tool) executeBackground(callerCtx context.Context, agentName, taskStr, 
 			}
 		}
 
-		output, _, u, err := t.runAgent(bgCtx, agentName, taskStr, modelOverride, &bgRunOpts{taskID: taskID, rt: rt, outFile: outFile})
+		output, _, u, err := t.runAgent(bgCtx, agentName, taskStr, modelOverride, &bgRunOpts{taskID: taskID, rt: rt, outFile: outFile}, ModeBackground)
 		if outFile != nil {
 			outFile.Close()
 		}
@@ -512,7 +553,7 @@ func (t *Tool) notify(taskID string) {
 
 // executeSingle runs one sub-agent with an isolated context.
 func (t *Tool) executeSingle(ctx context.Context, agentName, taskStr string, modelOverride agentcore.ChatModel) (json.RawMessage, error) {
-	output, terminalResult, u, err := t.runAgent(ctx, agentName, taskStr, modelOverride, nil)
+	output, terminalResult, u, err := t.runAgent(ctx, agentName, taskStr, modelOverride, nil, ModeSingle)
 	if err != nil {
 		if u != nil {
 			return nil, fmt.Errorf("agent %q failed: %w (turns=%d tools=%d)", agentName, err, u.Turns, u.Tools)
@@ -541,7 +582,7 @@ func (t *Tool) executeChain(ctx context.Context, chain []chainStep, modelOverrid
 		}
 
 		taskStr := strings.ReplaceAll(step.Task, "{previous}", previous)
-		output, terminalResult, u, err := t.runAgent(ctx, step.Agent, taskStr, modelOverride, nil)
+		output, terminalResult, u, err := t.runAgent(ctx, step.Agent, taskStr, modelOverride, nil, ModeChain)
 
 		r := result{
 			Agent:          step.Agent,
@@ -590,7 +631,7 @@ func (t *Tool) executeParallel(ctx context.Context, tasks []taskItem, modelOverr
 			sem <- struct{}{}
 			defer func() { <-sem }()
 
-			output, terminalResult, u, err := t.runAgent(ctx, st.Agent, st.Task, modelOverride, nil)
+			output, terminalResult, u, err := t.runAgent(ctx, st.Agent, st.Task, modelOverride, nil, ModeParallel)
 			r := result{
 				Agent:          st.Agent,
 				Task:           st.Task,
@@ -633,7 +674,7 @@ type bgRunOpts struct {
 // runAgent executes an isolated agent loop for the given agent config and
 // task. Includes panic recovery to prevent a subagent crash from taking down
 // the parent.
-func (t *Tool) runAgent(ctx context.Context, agentName, taskStr string, modelOverride agentcore.ChatModel, bg *bgRunOpts) (output string, terminalResult json.RawMessage, u *usage, err error) {
+func (t *Tool) runAgent(ctx context.Context, agentName, taskStr string, modelOverride agentcore.ChatModel, bg *bgRunOpts, mode string) (output string, terminalResult json.RawMessage, u *usage, err error) {
 	cfg, ok := t.agents[agentName]
 	if !ok {
 		available := make([]string, 0, len(t.agents))
@@ -711,6 +752,21 @@ func (t *Tool) runAgent(ctx context.Context, agentName, taskStr string, modelOve
 		loopCfg.OnMessage = func(msg agentcore.AgentMessage) { cfg.OnMessage(name, ts, msg) }
 	}
 
+	// Fan raw loop events to an external observer (e.g. a live preview),
+	// tagged with a unique per-run id. Built once so every event carries the
+	// same InstanceID; nil observer ⇒ no closure, zero overhead. Runs for
+	// background too — unlike the ProgressPayload relay below, which is
+	// foreground-only (bg == nil).
+	var observe func(agentcore.Event)
+	if t.eventObserver != nil {
+		meta := RunMeta{
+			Agent:      agentName,
+			InstanceID: fmt.Sprintf("%s#%d", agentName, t.runSeq.Add(1)),
+			Mode:       mode,
+		}
+		observe = func(ev agentcore.Event) { t.eventObserver(meta, ev) }
+	}
+
 	events := agentcore.AgentLoop(ctx, []agentcore.AgentMessage{agentcore.UserMsg(taskStr)}, agentCtx, loopCfg)
 
 	var lastAssistantContent string
@@ -719,6 +775,16 @@ func (t *Tool) runAgent(ctx context.Context, agentName, taskStr string, modelOve
 	su := &usage{}
 
 	for ev := range events {
+		// Fan to the observer first — before any case below can `continue`
+		// past the end of the loop body — so the observer sees the complete
+		// raw stream. Publishing is read-only w.r.t. the run's own state, so
+		// ordering vs the bookkeeping switch is immaterial. EventAgentEnd is
+		// guaranteed on every termination path — normal/abort/max-turns/error
+		// and, via the loop's panic recovery, panic too — so an observer can
+		// rely on it as the run's stop signal.
+		if observe != nil {
+			observe(ev)
+		}
 		switch ev.Type {
 		case agentcore.EventToolExecStart:
 			su.Tools++

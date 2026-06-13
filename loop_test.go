@@ -1742,3 +1742,20 @@ func TestCallLLMWithRetry_RetriesPartialStream(t *testing.T) {
 		t.Fatalf("expected exactly 2 stream calls (1 partial + 1 success), got %d", m.calls)
 	}
 }
+
+func TestAgentLoop_PanicEmitsAgentEnd(t *testing.T) {
+	model := funcModel(func(context.Context, *LLMRequest) (*LLMResponse, error) {
+		panic("boom")
+	})
+	ch := AgentLoop(context.Background(), []AgentMessage{UserMsg("hi")}, AgentContext{}, LoopConfig{Model: model})
+	events := collectEvents(ch)
+
+	// Despite the panic, the loop must still emit a terminal EventAgentEnd
+	// (preceded by EventError) before closing the channel — observers that key
+	// off EventAgentEnd to mark an agent stopped rely on it and would otherwise
+	// leak. collectEvents returning at all proves the channel closed.
+	if len(events) == 0 || events[len(events)-1].Type != EventAgentEnd {
+		t.Fatalf("expected EventAgentEnd as the final event after a panic, got %+v", events)
+	}
+	requireEvent(t, events, EventError)
+}
