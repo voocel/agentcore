@@ -51,7 +51,7 @@ type ToolSpec struct {
 // LoopConfig configures the agent loop.
 type LoopConfig struct {
 	Model         ChatModel
-	MaxTurns      int           // safety limit, default 10
+	MaxTurns      int           // safety limit, default 100
 	MaxRetries    int           // LLM call retry limit for retryable errors, default 3
 	MaxToolErrors int           // consecutive tool failure threshold per tool, 0 = unlimited
 	ThinkingLevel ThinkingLevel // reasoning depth

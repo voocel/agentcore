@@ -75,7 +75,7 @@ type Agent struct {
 // When a ContextManager is set, the agent auto-wires ConvertToLLM, the
 // context-token estimator, and the context window from the manager when it
 // implements the optional ContextLLMConverter / ContextEstimator /
-// ContextWindower interfaces.
+// ContextWindowProvider interfaces.
 func NewAgent(opts ...AgentOption) *Agent {
 	a := &Agent{
 		maxTurns:         defaultMaxTurns,
@@ -94,7 +94,7 @@ func NewAgent(opts ...AgentOption) *Agent {
 		if e, ok := a.contextManager.(ContextEstimator); ok {
 			a.contextEstimateFn = e.EstimateContext
 		}
-		if w, ok := a.contextManager.(ContextWindower); ok {
+		if w, ok := a.contextManager.(ContextWindowProvider); ok {
 			a.contextWindow = w.ContextWindow()
 		}
 	}

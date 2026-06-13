@@ -302,6 +302,8 @@ func containsAny(msg string, patterns ...string) bool {
 // Missing params come first (most fundamental error), then type mismatches;
 // within each group, paths sort alphabetically for stable output.
 func formatValidationIssues(toolName string, issues []ValidationIssue) string {
+	// Sort a copy: Error() must not mutate the caller's Issues slice.
+	issues = append([]ValidationIssue(nil), issues...)
 	sort.SliceStable(issues, func(i, j int) bool {
 		if issues[i].Kind != issues[j].Kind {
 			return issues[i].Kind == IssueMissing

@@ -109,7 +109,7 @@ func WithToolsAreIdempotent(idempotent bool) AgentOption {
 // When configured, it drives prompt projection, overflow recovery, and usage
 // reporting. The agent auto-wires ConvertToLLM, context-token estimation,
 // and the context window from the manager when it implements the optional
-// ContextLLMConverter / ContextEstimator / ContextWindower interfaces.
+// ContextLLMConverter / ContextEstimator / ContextWindowProvider interfaces.
 func WithContextManager(mgr ContextManager) AgentOption {
 	return func(a *Agent) { a.contextManager = mgr }
 }

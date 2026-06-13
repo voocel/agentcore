@@ -7,6 +7,7 @@ package proxy
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"time"
 
 	"github.com/voocel/agentcore"
@@ -32,7 +33,9 @@ type Frame struct {
 	ToolName   string               `json:"tool_name,omitempty"`
 	StopReason agentcore.StopReason `json:"stop_reason,omitempty"`
 	Usage      *agentcore.Usage     `json:"usage,omitempty"`
-	Err        error                `json:"-"`
+	// Error carries a FrameError message. It is a string (not error) so it
+	// survives the JSON wire round-trip — the whole point of this adapter.
+	Error string `json:"error,omitempty"`
 }
 
 // StreamFn makes an LLM call through a remote proxy and returns a channel of
@@ -130,7 +133,11 @@ func (p *Model) GenerateStream(ctx context.Context, messages []agentcore.Message
 				out <- agentcore.StreamEvent{Type: agentcore.StreamEventDone, Message: partial, StopReason: fr.StopReason}
 
 			case FrameError:
-				out <- agentcore.StreamEvent{Type: agentcore.StreamEventError, Err: fr.Err}
+				msg := fr.Error
+				if msg == "" {
+					msg = "proxy stream error"
+				}
+				out <- agentcore.StreamEvent{Type: agentcore.StreamEventError, Err: errors.New(msg)}
 				return
 			}
 		}

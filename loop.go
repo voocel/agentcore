@@ -188,7 +188,7 @@ func runLoop(ctx context.Context, currentCtx *AgentContext, newMessages *[]Agent
 					}
 					abortMsg := AbortMsg(text, phase)
 					sink.emit(Event{Type: EventMessageEnd, Message: abortMsg})
-					*newMessages = append(*newMessages, abortMsg)
+					commitMessage(currentCtx, newMessages, config, abortMsg)
 				}
 				sink.emit(Event{Type: EventError, Err: ctx.Err()})
 				sink.emit(Event{Type: EventAgentEnd, NewMessages: *newMessages, Summary: buildSummary(turnCount, EndReasonAborted)})
@@ -253,7 +253,7 @@ func runLoop(ctx context.Context, currentCtx *AgentContext, newMessages *[]Agent
 						}
 						abortMsg := AbortMsg(text, "inference")
 						sink.emit(Event{Type: EventMessageEnd, Message: abortMsg})
-						*newMessages = append(*newMessages, abortMsg)
+						commitMessage(currentCtx, newMessages, config, abortMsg)
 					}
 					sink.emit(Event{Type: EventError, Err: ctx.Err()})
 					sink.emit(Event{Type: EventAgentEnd, NewMessages: *newMessages, Summary: buildSummary(turnCount, EndReasonAborted)})
@@ -265,6 +265,14 @@ func runLoop(ctx context.Context, currentCtx *AgentContext, newMessages *[]Agent
 
 			// Check stop reason — terminate early on error/aborted
 			if assistantMsg.StopReason == StopReasonError || assistantMsg.StopReason == StopReasonAborted {
+				// A custom ChatModel may report Error/Aborted on a message whose
+				// stream already completed tool calls (the bundled litellm
+				// adapter never does, but the kernel is model-agnostic). Drain the
+				// executor so its child ctx and goroutines don't leak past this
+				// early exit — every other exit that can hold streamedTools does.
+				if streamedTools != nil {
+					streamedTools.AbortAndWait()
+				}
 				commitMessage(currentCtx, newMessages, config, assistantMsg)
 				sink.emit(Event{Type: EventModelResponse, Message: assistantMsg})
 				turnCount++
@@ -348,9 +356,11 @@ func runLoop(ctx context.Context, currentCtx *AgentContext, newMessages *[]Agent
 					return
 				}
 				// Guard vetoed the early exit: keep the loop alive with the
-				// injected message. Steering queued during this turn stays in
-				// steeringAfterTools and is delivered after the next turn.
-				pendingMessages = []AgentMessage{UserMsg(inject)}
+				// injected message, carrying any steering captured during this
+				// terminal-tool turn so a follow-up tool turn can't drop the
+				// already-dequeued steering.
+				pendingMessages = append([]AgentMessage{UserMsg(inject)}, steeringAfterTools...)
+				steeringAfterTools = nil
 				continue
 			}
 

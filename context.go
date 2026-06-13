@@ -137,9 +137,9 @@ type ContextEstimator interface {
 	EstimateContext([]AgentMessage) (tokens, usageTokens, trailingTokens int)
 }
 
-// ContextWindower is an optional interface a ContextManager can implement
+// ContextWindowProvider is an optional interface a ContextManager can implement
 // to report its configured context window size.
-type ContextWindower interface {
+type ContextWindowProvider interface {
 	ContextWindow() int
 }
 

@@ -277,18 +277,18 @@ func ReactivateDeferred(tools []Tool, msgs []AgentMessage) {
 // Tool Behavior Interfaces (optional)
 // ---------------------------------------------------------------------------
 
-// ReadOnlyer is an optional interface for tools that declare read-only behavior.
+// ReadOnlyTool is an optional interface for tools that declare read-only behavior.
 // Read-only tools are eligible for concurrent execution by default.
 // The args parameter allows input-dependent classification
 // (e.g., bash is read-only for "ls" but not for "rm").
-type ReadOnlyer interface {
+type ReadOnlyTool interface {
 	ReadOnly(args json.RawMessage) bool
 }
 
-// ConcurrencySafer is an optional interface for tools that declare
+// ConcurrencySafeTool is an optional interface for tools that declare
 // whether they can safely execute concurrently with other tools.
-// Takes precedence over ReadOnlyer for concurrency scheduling.
-type ConcurrencySafer interface {
+// Takes precedence over ReadOnlyTool for concurrency scheduling.
+type ConcurrencySafeTool interface {
 	ConcurrencySafe(args json.RawMessage) bool
 }
 
@@ -301,10 +301,10 @@ const (
 	InterruptBehaviorCancel InterruptBehavior = "cancel"
 )
 
-// InterruptBehaviorer is an optional interface for tools that declare whether
+// InterruptBehaviorTool is an optional interface for tools that declare whether
 // they should be cancelled or allowed to finish when a steering message arrives.
 // Defaults to InterruptBehaviorBlock when not implemented.
-type InterruptBehaviorer interface {
+type InterruptBehaviorTool interface {
 	InterruptBehavior(args json.RawMessage) InterruptBehavior
 }
 
@@ -315,19 +315,19 @@ type ActivityDescriber interface {
 }
 
 // isToolConcurrencySafe checks whether a tool call is safe for concurrent execution.
-// Priority: ConcurrencySafer > ReadOnlyer > false.
+// Priority: ConcurrencySafeTool > ReadOnlyTool > false.
 func isToolConcurrencySafe(tool Tool, args json.RawMessage) bool {
-	if cs, ok := tool.(ConcurrencySafer); ok {
+	if cs, ok := tool.(ConcurrencySafeTool); ok {
 		return cs.ConcurrencySafe(args)
 	}
-	if ro, ok := tool.(ReadOnlyer); ok {
+	if ro, ok := tool.(ReadOnlyTool); ok {
 		return ro.ReadOnly(args)
 	}
 	return false
 }
 
 func toolInterruptBehavior(tool Tool, args json.RawMessage) InterruptBehavior {
-	if ib, ok := tool.(InterruptBehaviorer); ok {
+	if ib, ok := tool.(InterruptBehaviorTool); ok {
 		switch behavior := ib.InterruptBehavior(args); behavior {
 		case InterruptBehaviorCancel:
 			return InterruptBehaviorCancel

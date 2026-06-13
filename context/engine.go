@@ -618,7 +618,7 @@ func (e *ContextEngine) SetReserveTokens(n int) {
 	e.cfg.ReserveTokens = n
 }
 
-// ContextWindow implements agentcore.ContextWindower.
+// ContextWindow implements agentcore.ContextWindowProvider.
 func (e *ContextEngine) ContextWindow() int {
 	return e.cfg.ContextWindow
 }
