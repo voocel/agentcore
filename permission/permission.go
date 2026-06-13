@@ -1,3 +1,7 @@
+// Package permission is an optional policy engine for gating tool execution.
+// It is not wired in automatically: adapt its decisions to an
+// [agentcore.ToolGate] yourself, so the kernel stays free of any built-in
+// permission model.
 package permission
 
 import (

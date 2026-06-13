@@ -1,3 +1,7 @@
+// Package llm adapts LLM providers to the [agentcore.ChatModel] interface. It
+// wraps litellm to reach OpenAI, Anthropic, Gemini, and other backends, and
+// classifies provider errors onto agentcore's retry and overflow contracts.
+// Construct a model with [NewModel].
 package llm
 
 import (
