@@ -17,11 +17,11 @@ const (
 	EventAgentStart EventType = "agent_start"
 	EventAgentEnd   EventType = "agent_end"
 	EventTurnStart  EventType = "turn_start"
-	// EventTurnEnd fires after every LLM call completes (including its tool
-	// executions) — a "turn" here is one model invocation, not one logical
-	// user exchange. Steering injections and length recoveries each produce
-	// additional TurnEnds within the same run.
-	EventTurnEnd        EventType = "turn_end"
+	// EventModelResponse fires after every model call completes, including any
+	// tool executions it triggered. One model invocation produces one event —
+	// not one logical user exchange — so steering injections and length
+	// recoveries each produce additional ones within the same run.
+	EventModelResponse  EventType = "model_response"
 	EventMessageStart   EventType = "message_start"
 	EventMessageUpdate  EventType = "message_update"
 	EventMessageEnd     EventType = "message_end"

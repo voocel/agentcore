@@ -23,6 +23,11 @@ const (
 
 const defaultLengthRecoveryPrompt = "Output token limit hit. Resume directly - no apology, no recap of what you were doing. Pick up mid-thought if that is where the cut happened. Break remaining work into smaller pieces."
 
+const (
+	defaultAbortMarkerText     = "[Request interrupted by user]"
+	defaultAbortMarkerToolText = "[Request interrupted by user for tool use]"
+)
+
 // AgentLoop starts an agent loop with new prompt messages.
 // Prompts are added to context and events are emitted for them.
 //
@@ -170,10 +175,16 @@ func runLoop(ctx context.Context, currentCtx *AgentContext, newMessages *[]Agent
 			if ctx.Err() != nil {
 				if config.ShouldEmitAbortMarker != nil && config.ShouldEmitAbortMarker() {
 					phase := "inference"
-					text := "[Request interrupted by user]"
+					text := config.AbortMarkerText
+					if text == "" {
+						text = defaultAbortMarkerText
+					}
 					if afterToolExec {
 						phase = "tool_execution"
-						text = "[Request interrupted by user for tool use]"
+						text = config.AbortMarkerToolText
+						if text == "" {
+							text = defaultAbortMarkerToolText
+						}
 					}
 					abortMsg := AbortMsg(text, phase)
 					sink.emit(Event{Type: EventMessageEnd, Message: abortMsg})
@@ -236,7 +247,11 @@ func runLoop(ctx context.Context, currentCtx *AgentContext, newMessages *[]Agent
 				}
 				if ctx.Err() != nil {
 					if config.ShouldEmitAbortMarker != nil && config.ShouldEmitAbortMarker() {
-						abortMsg := AbortMsg("[Request interrupted by user]", "inference")
+						text := config.AbortMarkerText
+						if text == "" {
+							text = defaultAbortMarkerText
+						}
+						abortMsg := AbortMsg(text, "inference")
 						sink.emit(Event{Type: EventMessageEnd, Message: abortMsg})
 						*newMessages = append(*newMessages, abortMsg)
 					}
@@ -251,7 +266,7 @@ func runLoop(ctx context.Context, currentCtx *AgentContext, newMessages *[]Agent
 			// Check stop reason — terminate early on error/aborted
 			if assistantMsg.StopReason == StopReasonError || assistantMsg.StopReason == StopReasonAborted {
 				commitMessage(currentCtx, newMessages, config, assistantMsg)
-				sink.emit(Event{Type: EventTurnEnd, Message: assistantMsg})
+				sink.emit(Event{Type: EventModelResponse, Message: assistantMsg})
 				turnCount++
 				reason := EndReasonError
 				if assistantMsg.StopReason == StopReasonAborted {
@@ -310,7 +325,7 @@ func runLoop(ctx context.Context, currentCtx *AgentContext, newMessages *[]Agent
 				}
 			}
 
-			sink.emit(Event{Type: EventTurnEnd, Message: assistantMsg, ToolResults: turnToolResults})
+			sink.emit(Event{Type: EventModelResponse, Message: assistantMsg, ToolResults: turnToolResults})
 			turnCount++
 
 			// Early exit: a terminal tool completed successfully. This is a

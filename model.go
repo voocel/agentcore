@@ -120,6 +120,14 @@ type LoopConfig struct {
 	// top of normal turn accounting, bounded by an internal cap.
 	LengthRecoveryPrompt string
 
+	// AbortMarkerText overrides the marker message recorded when a run is
+	// cancelled mid-inference (only when ShouldEmitAbortMarker returns true).
+	// Empty uses a built-in default. Lets non-English harnesses localize it.
+	AbortMarkerText string
+	// AbortMarkerToolText overrides the marker message recorded when
+	// cancellation lands during tool execution. Empty uses a built-in default.
+	AbortMarkerToolText string
+
 	// ToolsAreIdempotent declares that all registered tools are safe to re-execute
 	// with the same arguments — i.e. running them twice produces the same observable
 	// state as running them once. When true, the retry loop will not bail out just

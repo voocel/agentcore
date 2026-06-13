@@ -1,6 +1,9 @@
 package agentcore
 
-import "fmt"
+import (
+	"context"
+	"fmt"
+)
 
 // InjectDisposition describes how an injected message was delivered.
 type InjectDisposition string
@@ -48,7 +51,7 @@ func (a *Agent) Inject(msg AgentMessage) (InjectResult, error) {
 	if !canResume {
 		return InjectResult{Disposition: InjectQueued}, nil
 	}
-	if err := a.Continue(); err != nil {
+	if err := a.Continue(context.Background()); err != nil {
 		return InjectResult{Disposition: InjectQueued}, fmt.Errorf("inject idle resume failed: %w", err)
 	}
 	return InjectResult{Disposition: InjectResumedIdleRun}, nil

@@ -13,10 +13,10 @@ import (
 type Mode string
 
 const (
-	ModeStrict      Mode = "strict"
-	ModeBalanced    Mode = "balanced"
-	ModeAcceptEdits Mode = "accept_edits"
-	ModeTrust       Mode = "trust"
+	ModeStrict   Mode = "strict"
+	ModeBalanced Mode = "balanced"
+	ModeAuto     Mode = "auto"
+	ModeTrust    Mode = "trust"
 )
 
 type Capability string

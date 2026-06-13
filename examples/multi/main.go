@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"fmt"
 	"os"
 
@@ -104,7 +105,7 @@ func main() {
 		}
 	})
 
-	if err := agent.Prompt("Explore the current directory structure, then review any Go files you find. Use chain mode: scout first, then review."); err != nil {
+	if err := agent.Prompt(context.Background(), "Explore the current directory structure, then review any Go files you find. Use chain mode: scout first, then review."); err != nil {
 		fmt.Fprintf(os.Stderr, "prompt error: %v\n", err)
 		os.Exit(1)
 	}

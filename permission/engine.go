@@ -143,10 +143,10 @@ func (e *Engine) Decide(ctx context.Context, req Request) (*Decision, error) {
 		decision := allowDecision(DecisionSourceMode, info, "trust mode allows tool execution")
 		e.audit(info, decision)
 		return decision, nil
-	case ModeAcceptEdits:
+	case ModeAuto:
 		switch info.capability {
 		case CapabilityRead, CapabilityInternal, CapabilityWrite:
-			decision := allowDecision(DecisionSourceMode, info, "accept-edits mode allows this capability")
+			decision := allowDecision(DecisionSourceMode, info, "auto mode allows this capability")
 			e.audit(info, decision)
 			return decision, nil
 		default:

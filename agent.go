@@ -43,6 +43,8 @@ type Agent struct {
 	maxToolConcurrency   int
 	toolsAreIdempotent   bool
 	lengthRecoveryPrompt string
+	abortMarkerText      string
+	abortMarkerToolText  string
 	onMessage            func(AgentMessage)
 	stopGuard            StopGuard
 	cacheLastMessage     string
@@ -120,19 +122,22 @@ func (a *Agent) Subscribe(fn func(Event)) func() {
 	}
 }
 
-// Prompt starts a new conversation turn with the given input.
-func (a *Agent) Prompt(input string) error {
-	return a.PromptMessages(UserMsg(input))
+// Prompt starts a new conversation turn with the given input. The ctx scopes
+// the run: its deadline, trace values, and cancellation propagate into the
+// loop, and cancelling it aborts the run just like Abort.
+func (a *Agent) Prompt(ctx context.Context, input string) error {
+	return a.PromptMessages(ctx, UserMsg(input))
 }
 
 // PromptMessages starts a new conversation turn with arbitrary AgentMessages.
-func (a *Agent) PromptMessages(msgs ...AgentMessage) error {
+// See Prompt for ctx semantics.
+func (a *Agent) PromptMessages(ctx context.Context, msgs ...AgentMessage) error {
 	a.mu.Lock()
 	if a.isRunning {
 		a.mu.Unlock()
 		return fmt.Errorf("%w; use Steer() or FollowUp() to queue messages", ErrAlreadyRunning)
 	}
-	a.startPromptRunLocked(msgs)
+	a.startPromptRunLocked(ctx, msgs)
 	return nil
 }
 
@@ -148,7 +153,7 @@ func (a *Agent) PromptMessages(msgs ...AgentMessage) error {
 // ClearFollowUpQueue / ClearAllQueues; agentcore cannot decide this — some
 // harnesses queue droppable steering text, others queue task-completion
 // notifications that must never be lost.
-func (a *Agent) Continue() error {
+func (a *Agent) Continue(ctx context.Context) error {
 	a.mu.Lock()
 	if a.isRunning {
 		a.mu.Unlock()
@@ -164,19 +169,19 @@ func (a *Agent) Continue() error {
 	if lastMsg.GetRole() == RoleAssistant {
 		if queued := dequeue(&a.steeringQ); len(queued) > 0 {
 			a.skipNextInitialSteeringPoll = true
-			a.startPromptRunLocked(queued)
+			a.startPromptRunLocked(ctx, queued)
 			return nil
 		}
 		if queued := dequeue(&a.followUpQ); len(queued) > 0 {
 			a.skipNextInitialSteeringPoll = true
-			a.startPromptRunLocked(queued)
+			a.startPromptRunLocked(ctx, queued)
 			return nil
 		}
 		a.mu.Unlock()
 		return ErrBadContinuation
 	}
 
-	a.startContinueRunLocked()
+	a.startContinueRunLocked(ctx)
 	return nil
 }
 
@@ -304,11 +309,13 @@ func (a *Agent) ClearMessages() {
 }
 
 // startPromptRunLocked starts a prompt-based run. Caller must hold a.mu.
-func (a *Agent) startPromptRunLocked(msgs []AgentMessage) {
+// The run ctx derives from the caller's ctx, so an external cancel and Abort
+// share standard OR semantics.
+func (a *Agent) startPromptRunLocked(ctx context.Context, msgs []AgentMessage) {
 	a.isRunning = true
 	a.lastError = ""
 
-	ctx, cancel := context.WithCancel(context.Background())
+	runCtx, cancel := context.WithCancel(ctx)
 	a.cancel = cancel
 	a.done = make(chan struct{})
 
@@ -321,15 +328,16 @@ func (a *Agent) startPromptRunLocked(msgs []AgentMessage) {
 	config := a.buildConfig()
 	a.mu.Unlock()
 
-	go a.consumeLoop(AgentLoop(ctx, msgs, agentCtx, config))
+	go a.consumeLoop(AgentLoop(runCtx, msgs, agentCtx, config))
 }
 
 // startContinueRunLocked starts a continue run from the current context. Caller must hold a.mu.
-func (a *Agent) startContinueRunLocked() {
+// See startPromptRunLocked for run-ctx semantics.
+func (a *Agent) startContinueRunLocked(ctx context.Context) {
 	a.isRunning = true
 	a.lastError = ""
 
-	ctx, cancel := context.WithCancel(context.Background())
+	runCtx, cancel := context.WithCancel(ctx)
 	a.cancel = cancel
 	a.done = make(chan struct{})
 
@@ -342,7 +350,7 @@ func (a *Agent) startContinueRunLocked() {
 	config := a.buildConfig()
 	a.mu.Unlock()
 
-	go a.consumeLoop(AgentLoopContinue(ctx, agentCtx, config))
+	go a.consumeLoop(AgentLoopContinue(runCtx, agentCtx, config))
 }
 
 // ContextUsage returns an estimate of the current context window occupancy.
@@ -655,6 +663,8 @@ func (a *Agent) buildConfig() LoopConfig {
 		OnMessage:             a.onMessage,
 		StopGuard:             a.stopGuard,
 		LengthRecoveryPrompt:  a.lengthRecoveryPrompt,
+		AbortMarkerText:       a.abortMarkerText,
+		AbortMarkerToolText:   a.abortMarkerToolText,
 		ToolsAreIdempotent:    a.toolsAreIdempotent,
 		CacheLastMessage:      a.cacheLastMessage,
 	}
@@ -663,9 +673,13 @@ func (a *Agent) buildConfig() LoopConfig {
 // consumeLoop reads events from the loop channel and updates internal state.
 // handles partial message residue, and constructs error fallback messages.
 func (a *Agent) consumeLoop(events <-chan Event) {
-	// Capture our done channel before any new Prompt() can replace a.done.
+	// Capture this run's done channel and cancel up front. A new run can take
+	// over before this loop's defer runs — an auto-continue may start it from
+	// this run's EventAgentEnd listener — reassigning a.done/a.cancel to that
+	// run. Holding our own copies keeps the defer from touching the newer run.
 	a.mu.Lock()
 	myDone := a.done
+	myCancel := a.cancel
 	a.mu.Unlock()
 
 	var partial AgentMessage // tracks partial message during streaming
@@ -684,12 +698,25 @@ func (a *Agent) consumeLoop(events <-chan Event) {
 			}
 		}
 
-		// Full cleanup
-		a.isRunning = false
-		a.streamMessage = nil
-		a.pendingToolCalls = make(map[string]struct{})
-		a.cancel = nil
-		a.wantAbortMarker.Store(false)
+		// Release this run's derived ctx now that the loop has drained — chiefly
+		// the propagation goroutine context starts when the caller passes a
+		// cancellable parent. myCancel is this run's own, so this never touches a
+		// newer run's ctx.
+		if myCancel != nil {
+			myCancel()
+		}
+
+		// Reset shared run-state only if no newer run has taken over. An
+		// auto-continue can start the next run from this run's EventAgentEnd
+		// listener (which fires before this defer), reassigning a.done/a.cancel/
+		// isRunning to that run — stomping them here would abort it.
+		if a.done == myDone {
+			a.isRunning = false
+			a.streamMessage = nil
+			a.pendingToolCalls = make(map[string]struct{})
+			a.cancel = nil
+			a.wantAbortMarker.Store(false)
+		}
 		a.mu.Unlock()
 		close(myDone)
 	}()
@@ -728,7 +755,7 @@ func (a *Agent) consumeLoop(events <-chan Event) {
 			delete(a.pendingToolCalls, ev.ToolID)
 
 		// Turn end
-		case EventTurnEnd:
+		case EventModelResponse:
 			if msg, ok := ev.Message.(Message); ok {
 				if errStr, _ := msg.Metadata["error_message"].(string); errStr != "" {
 					a.lastError = errStr

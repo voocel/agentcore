@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -17,7 +18,7 @@ func TestAgentInject_WhenRunning_ReturnsSteeredCurrentRun(t *testing.T) {
 		})),
 	)
 
-	if err := agent.Prompt("start"); err != nil {
+	if err := agent.Prompt(context.Background(), "start"); err != nil {
 		t.Fatalf("prompt failed: %v", err)
 	}
 
@@ -49,7 +50,7 @@ func TestAgentInject_WhenIdleAndAssistantTail_ReturnsResumedIdleRun(t *testing.T
 		)),
 	)
 
-	if err := agent.Prompt("start"); err != nil {
+	if err := agent.Prompt(context.Background(), "start"); err != nil {
 		t.Fatalf("prompt failed: %v", err)
 	}
 	agent.WaitForIdle()
@@ -110,7 +111,7 @@ func TestAgentInject_IsAtomicUnderConcurrentCalls(t *testing.T) {
 		)),
 	)
 
-	if err := agent.Prompt("start"); err != nil {
+	if err := agent.Prompt(context.Background(), "start"); err != nil {
 		t.Fatalf("prompt failed: %v", err)
 	}
 	agent.WaitForIdle()
@@ -148,7 +149,7 @@ func TestAgentInject_IsAtomicUnderConcurrentCalls(t *testing.T) {
 		if time.Now().After(deadline) {
 			t.Fatal("timed out waiting for queued injected messages to drain")
 		}
-		if err := agent.Continue(); err != nil {
+		if err := agent.Continue(context.Background()); err != nil {
 			t.Fatalf("continue failed while draining injected messages: %v", err)
 		}
 	}
@@ -204,12 +205,12 @@ func TestEventError_ClearsStreamMessageBeforeListeners(t *testing.T) {
 	)
 
 	var (
-		mu             sync.Mutex
-		errorSnapshot  AgentState
-		sawError       bool
-		sawMidStream   bool
-		done           = make(chan struct{})
-		closeDoneOnce  sync.Once
+		mu            sync.Mutex
+		errorSnapshot AgentState
+		sawError      bool
+		sawMidStream  bool
+		done          = make(chan struct{})
+		closeDoneOnce sync.Once
 	)
 	agent.Subscribe(func(ev Event) {
 		switch ev.Type {
@@ -231,7 +232,7 @@ func TestEventError_ClearsStreamMessageBeforeListeners(t *testing.T) {
 		}
 	})
 
-	if err := agent.Prompt("trigger"); err != nil {
+	if err := agent.Prompt(context.Background(), "trigger"); err != nil {
 		t.Fatalf("prompt failed: %v", err)
 	}
 	select {
@@ -253,3 +254,63 @@ func TestEventError_ClearsStreamMessageBeforeListeners(t *testing.T) {
 	}
 }
 
+// A run started from another run's EventAgentEnd listener — exactly how a
+// harness auto-continues — must survive the finishing run's cleanup. The
+// finishing run's consumeLoop defer once reset a.cancel, which the synchronous
+// resume had already reassigned to the new run, aborting it the instant it
+// began. The fix: cleanup uses the run's own captured cancel and only resets
+// shared state when no newer run has taken over (a.done == myDone).
+func TestResumeFromAgentEndListenerSurvivesCleanup(t *testing.T) {
+	started := make(chan struct{})
+	release := make(chan struct{})
+	cancelled := make(chan struct{})
+	var calls atomic.Int32
+	agent := NewAgent(WithModel(funcModel(func(ctx context.Context, _ *LLMRequest) (*LLMResponse, error) {
+		if calls.Add(1) == 1 {
+			return &LLMResponse{Message: assistantMsg("run 1", StopReasonStop)}, nil
+		}
+		// Resumed run: announce arrival, then hold until released — unless the
+		// finishing run's cleanup wrongly cancels our ctx.
+		close(started)
+		select {
+		case <-release:
+			return &LLMResponse{Message: assistantMsg("run 2", StopReasonStop)}, nil
+		case <-ctx.Done():
+			close(cancelled)
+			return nil, ctx.Err()
+		}
+	})))
+
+	var resumed atomic.Bool
+	agent.Subscribe(func(ev Event) {
+		if ev.Type == EventAgentEnd && !resumed.Swap(true) {
+			_, _ = agent.Inject(UserMsg("resume"))
+		}
+	})
+
+	if err := agent.Prompt(context.Background(), "start"); err != nil {
+		t.Fatalf("prompt failed: %v", err)
+	}
+
+	select {
+	case <-started:
+		// Resumed run reached the model; give the finishing run's defer its
+		// window to (wrongly) cancel it.
+		select {
+		case <-cancelled:
+			t.Fatal("resumed run was cancelled by the finishing run's cleanup")
+		case <-time.After(200 * time.Millisecond):
+		}
+		close(release)
+	case <-cancelled:
+		t.Fatal("resumed run was cancelled before reaching the model")
+	case <-time.After(2 * time.Second):
+		t.Fatal("resumed run never started")
+	}
+
+	agent.WaitForIdle()
+	msgs := agent.Messages()
+	if got := msgs[len(msgs)-1].TextContent(); got != "run 2" {
+		t.Fatalf("resumed run did not complete: last message = %q, want %q", got, "run 2")
+	}
+}

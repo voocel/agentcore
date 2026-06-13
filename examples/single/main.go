@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"fmt"
 	"os"
 
@@ -69,7 +70,7 @@ func main() {
 		}
 	})
 
-	if err := agent.Prompt("List the files in the current directory and tell me what you see."); err != nil {
+	if err := agent.Prompt(context.Background(), "List the files in the current directory and tell me what you see."); err != nil {
 		fmt.Fprintf(os.Stderr, "prompt error: %v\n", err)
 		os.Exit(1)
 	}

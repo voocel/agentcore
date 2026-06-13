@@ -22,7 +22,7 @@ func TestAgentLoop_SimpleTextResponse(t *testing.T) {
 	requireEvent(t, events, EventAgentStart)
 	requireEvent(t, events, EventAgentEnd)
 	requireEvent(t, events, EventTurnStart)
-	requireEvent(t, events, EventTurnEnd)
+	requireEvent(t, events, EventModelResponse)
 
 	ev, _ := findEvent(events, EventAgentEnd)
 	if len(ev.NewMessages) < 2 {

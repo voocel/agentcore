@@ -11,11 +11,11 @@ func ParseMode(raw string) (Mode, error) {
 		return ModeBalanced, nil
 	case "strict":
 		return ModeStrict, nil
-	case "accept-edits", "accept_edits":
-		return ModeAcceptEdits, nil
+	case "auto", "accept-edits", "accept_edits":
+		return ModeAuto, nil
 	case "trust", "off":
 		return ModeTrust, nil
 	default:
-		return "", fmt.Errorf("invalid mode %q (allowed: strict, balanced, accept-edits, trust)", raw)
+		return "", fmt.Errorf("invalid mode %q (allowed: strict, balanced, auto, trust)", raw)
 	}
 }

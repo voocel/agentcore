@@ -45,6 +45,17 @@ func WithLengthRecoveryPrompt(prompt string) AgentOption {
 	return func(a *Agent) { a.lengthRecoveryPrompt = prompt }
 }
 
+// WithAbortMarkerText overrides the marker messages recorded when a run is
+// cancelled: inference is used mid-inference, toolUse during tool execution.
+// Either empty keeps that built-in default. Lets non-English harnesses
+// localize the markers that get written into conversation history.
+func WithAbortMarkerText(inference, toolUse string) AgentOption {
+	return func(a *Agent) {
+		a.abortMarkerText = inference
+		a.abortMarkerToolText = toolUse
+	}
+}
+
 // WithThinkingLevel sets the reasoning depth for models that support it.
 func WithThinkingLevel(level ThinkingLevel) AgentOption {
 	return func(a *Agent) { a.thinkingLevel = level }
