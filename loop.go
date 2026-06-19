@@ -689,9 +689,11 @@ func callLLM(ctx context.Context, agentCtx *AgentContext, config LoopConfig, sin
 	// Build per-call options
 	var callOpts []CallOption
 
-	// Thinking level (provider-default budget; per-call WithThinkingBudget can be
-	// applied by ChatModel adapters that need to override).
-	if config.ThinkingLevel != "" && config.ThinkingLevel != ThinkingOff {
+	// Thinking level. Forward any explicit level, including ThinkingOff — the
+	// litellm adapter translates "off" into an explicit disabled-thinking request
+	// so models that think by default can actually be turned off. Empty means
+	// "unset": leave it to the provider/model default.
+	if config.ThinkingLevel != "" {
 		callOpts = append(callOpts, WithThinking(config.ThinkingLevel))
 	}
 

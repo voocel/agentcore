@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -437,5 +438,88 @@ func TestTool_BackgroundDrainsPendingMessagesIntoNextTurn(t *testing.T) {
 	}
 	if !sawSteering.Load() {
 		t.Fatal("steering message was not injected into the second LLM call — wiring is broken")
+	}
+}
+
+// thinkingCaptureModel records the reasoning level resolved from the call
+// options on each model call, then returns a terminal assistant message.
+type thinkingCaptureModel struct {
+	mu   sync.Mutex
+	last agentcore.ThinkingLevel
+}
+
+func (m *thinkingCaptureModel) record(opts []agentcore.CallOption) {
+	cfg := agentcore.ResolveCallConfig(opts)
+	m.mu.Lock()
+	m.last = cfg.ThinkingLevel
+	m.mu.Unlock()
+}
+
+func (m *thinkingCaptureModel) thinking() agentcore.ThinkingLevel {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.last
+}
+
+func (m *thinkingCaptureModel) reply() agentcore.Message {
+	return agentcore.Message{
+		Role:       agentcore.RoleAssistant,
+		Content:    []agentcore.ContentBlock{agentcore.TextBlock("done")},
+		StopReason: agentcore.StopReasonStop,
+	}
+}
+
+func (m *thinkingCaptureModel) Generate(ctx context.Context, _ []agentcore.Message, _ []agentcore.ToolSpec, opts ...agentcore.CallOption) (*agentcore.LLMResponse, error) {
+	m.record(opts)
+	return &agentcore.LLMResponse{Message: m.reply()}, nil
+}
+
+func (m *thinkingCaptureModel) GenerateStream(ctx context.Context, _ []agentcore.Message, _ []agentcore.ToolSpec, opts ...agentcore.CallOption) (<-chan agentcore.StreamEvent, error) {
+	m.record(opts)
+	msg := m.reply()
+	ch := make(chan agentcore.StreamEvent, 1)
+	ch <- agentcore.StreamEvent{Type: agentcore.StreamEventDone, Message: msg, StopReason: msg.StopReason}
+	close(ch)
+	return ch, nil
+}
+
+func (m *thinkingCaptureModel) SupportsTools() bool { return true }
+
+// Config.ThinkingLevel must reach the LLM call as the resolved reasoning level.
+func TestTool_ThinkingLevelFromConfig(t *testing.T) {
+	model := &thinkingCaptureModel{}
+	tool := New(Config{Name: "writer", Description: "w", Model: model, MaxTurns: 3, ThinkingLevel: agentcore.ThinkingHigh})
+	if _, err := tool.Execute(context.Background(), json.RawMessage(`{"agent":"writer","task":"go"}`)); err != nil {
+		t.Fatal(err)
+	}
+	if got := model.thinking(); got != agentcore.ThinkingHigh {
+		t.Fatalf("config thinking: got %q, want %q", got, agentcore.ThinkingHigh)
+	}
+}
+
+// SetThinkingLevel installs a runtime override that wins over Config.ThinkingLevel.
+func TestTool_SetThinkingLevelOverridesConfig(t *testing.T) {
+	model := &thinkingCaptureModel{}
+	tool := New(Config{Name: "writer", Description: "w", Model: model, MaxTurns: 3, ThinkingLevel: agentcore.ThinkingLow})
+	tool.SetThinkingLevel("writer", agentcore.ThinkingXHigh)
+	if _, err := tool.Execute(context.Background(), json.RawMessage(`{"agent":"writer","task":"go"}`)); err != nil {
+		t.Fatal(err)
+	}
+	if got := model.thinking(); got != agentcore.ThinkingXHigh {
+		t.Fatalf("override thinking: got %q, want %q", got, agentcore.ThinkingXHigh)
+	}
+}
+
+// ThinkingOff must be forwarded explicitly (not dropped like an empty level), so
+// downstream adapters can issue a real "disabled" request to turn off models
+// that think by default.
+func TestTool_ThinkingOffIsForwarded(t *testing.T) {
+	model := &thinkingCaptureModel{}
+	tool := New(Config{Name: "writer", Description: "w", Model: model, MaxTurns: 3, ThinkingLevel: agentcore.ThinkingOff})
+	if _, err := tool.Execute(context.Background(), json.RawMessage(`{"agent":"writer","task":"go"}`)); err != nil {
+		t.Fatal(err)
+	}
+	if got := model.thinking(); got != agentcore.ThinkingOff {
+		t.Fatalf("off thinking: got %q, want %q (must be forwarded, not dropped)", got, agentcore.ThinkingOff)
 	}
 }

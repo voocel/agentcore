@@ -43,6 +43,12 @@ type Config struct {
 	Tools            []agentcore.Tool
 	MaxTurns         int
 
+	// ThinkingLevel sets the reasoning depth for this sub-agent's runs.
+	// Empty ("") leaves it unspecified (model/provider default). Mirrors
+	// agentcore.WithThinkingLevel for top-level agents. A runtime override
+	// installed via Tool.SetThinkingLevel takes precedence over this baseline.
+	ThinkingLevel agentcore.ThinkingLevel
+
 	// MaxRetries caps the LLM call retry count for retryable errors within
 	// this sub-agent's loop. 0 (default) disables retry entirely.
 	MaxRetries int
@@ -207,6 +213,8 @@ const (
 // tasks to specialized sub-agents with isolated contexts.
 type Tool struct {
 	agents          map[string]Config
+	thinkMu         sync.RWMutex                                                   // guards thinkOverride (runtime reconfiguration)
+	thinkOverride   map[string]agentcore.ThinkingLevel                             // runtime thinking-level overrides keyed by agent name; nil until first SetThinkingLevel
 	notifyFn        func(agentcore.AgentMessage)                                   // called when a background task completes
 	createModel     func(name string) (agentcore.ChatModel, error)                 // resolves model name to ChatModel at runtime
 	bgOutputFactory func(taskID, agentName string) (io.WriteCloser, string, error) // creates output writer for background tasks
@@ -242,6 +250,32 @@ func (t *Tool) SetNotifyFn(fn func(agentcore.AgentMessage)) {
 // instances at runtime. Enables LLM to override the default model per call.
 func (t *Tool) SetCreateModel(fn func(name string) (agentcore.ChatModel, error)) {
 	t.createModel = fn
+}
+
+// SetThinkingLevel overrides a sub-agent's reasoning depth at runtime, keyed by
+// agent name. It takes effect on the next run of that agent (mirroring how a
+// SwappableModel swap takes effect on the next run) and overrides the agent's
+// Config.ThinkingLevel baseline. Safe to call concurrently with running agents:
+// the override lives in an isolated map and never mutates the immutable agents
+// config map. Empty level ("") means model/provider default.
+func (t *Tool) SetThinkingLevel(agentName string, level agentcore.ThinkingLevel) {
+	t.thinkMu.Lock()
+	defer t.thinkMu.Unlock()
+	if t.thinkOverride == nil {
+		t.thinkOverride = make(map[string]agentcore.ThinkingLevel)
+	}
+	t.thinkOverride[agentName] = level
+}
+
+// resolveThinking returns the runtime override for agentName if one was
+// installed via SetThinkingLevel, otherwise the config baseline.
+func (t *Tool) resolveThinking(agentName string, base agentcore.ThinkingLevel) agentcore.ThinkingLevel {
+	t.thinkMu.RLock()
+	defer t.thinkMu.RUnlock()
+	if lv, ok := t.thinkOverride[agentName]; ok {
+		return lv
+	}
+	return base
 }
 
 // SetTeamSpawner installs the closure that handles team-spawn mode. Without
@@ -712,6 +746,7 @@ func (t *Tool) runAgent(ctx context.Context, agentName, taskStr string, modelOve
 		ToolsAreIdempotent: cfg.ToolsAreIdempotent,
 		ContextManager:     contextManager,
 		ConvertToLLM:       cfg.ConvertToLLM,
+		ThinkingLevel:      t.resolveThinking(agentName, cfg.ThinkingLevel),
 	}
 
 	// Drain parent→child messages at every steering tick so a SendToSubAgent
