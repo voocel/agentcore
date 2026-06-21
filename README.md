@@ -105,6 +105,24 @@ agent := agentcore.NewAgent(
 
 The optional `agentcore/permission` subpackage offers a richer decision engine (modes, rules, filesystem roots, audit). Adapt it to `ToolGate` with a small wrapper.
 
+### Provider-Level Config
+
+`llm.WithExtra` is merged into each request body. Use `llm.WithProviderExtra` for HTTP headers, `User-Agent`, or provider client options:
+
+```go
+model, err := llm.NewModel("anthropic", "claude-sonnet-4",
+    llm.WithAPIKey(apiKey),
+    llm.WithBaseURL(baseURL),
+    llm.WithProviderExtra(map[string]any{
+        "user_agent": "my-client/1.0",
+        "anthropic_beta": "beta-name",
+        "headers": map[string]string{
+            "X-Custom-Client": "my-client",
+        },
+    }),
+)
+```
+
 ### Multi-Agent (SubAgent Tool)
 
 Sub-agents are invoked as regular tools with isolated contexts. Import the

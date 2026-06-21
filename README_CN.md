@@ -105,6 +105,24 @@ agent := agentcore.NewAgent(
 
 可选的 `agentcore/permission` 子包提供更完整的决策引擎（模式、规则、文件系统根、审计）。几行 wrapper 即可适配为 `ToolGate`。
 
+### Provider 级配置
+
+`llm.WithExtra` 会并入每次请求的 body；需要设置 HTTP 头、`User-Agent` 或 provider 客户端选项时，使用 `llm.WithProviderExtra`：
+
+```go
+model, err := llm.NewModel("anthropic", "claude-sonnet-4",
+    llm.WithAPIKey(apiKey),
+    llm.WithBaseURL(baseURL),
+    llm.WithProviderExtra(map[string]any{
+        "user_agent": "my-client/1.0",
+        "anthropic_beta": "beta-name",
+        "headers": map[string]string{
+            "X-Custom-Client": "my-client",
+        },
+    }),
+)
+```
+
 ### 多 Agent（SubAgent 工具）
 
 子 Agent 作为普通工具被调用，各自拥有隔离的上下文。需要 import `agentcore/subagent` 子包：

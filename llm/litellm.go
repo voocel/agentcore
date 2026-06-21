@@ -73,6 +73,7 @@ type modelConfig struct {
 	resilience    *ResilienceConfig
 	clientOpts    []litellm.ClientOption
 	extra         map[string]any
+	providerExtra map[string]any
 }
 
 // ModelOption configures NewModel.
@@ -117,6 +118,13 @@ func WithExtra(extra map[string]any) ModelOption {
 	return func(c *modelConfig) { c.extra = extra }
 }
 
+// WithProviderExtra sets provider-level configuration passed to
+// litellm.ProviderConfig.Extra. Use it for HTTP headers or other provider
+// client options, while WithExtra remains request-body Extra.
+func WithProviderExtra(extra map[string]any) ModelOption {
+	return func(c *modelConfig) { c.providerExtra = extra }
+}
+
 // cloneExtra copies the model-level extra map so per-call mutations (e.g.
 // session_id) never leak back into the shared model config across requests.
 func cloneExtra(m map[string]any) map[string]any {
@@ -140,6 +148,7 @@ func NewModel(provider, model string, opts ...ModelOption) (*LiteLLMAdapter, err
 		APIKey:  cfg.apiKey,
 		BaseURL: cfg.baseURL,
 		Timeout: cfg.timeout,
+		Extra:   cloneExtra(cfg.providerExtra),
 	}
 	if cfg.resilience != nil {
 		pcfg.Resilience = *cfg.resilience
