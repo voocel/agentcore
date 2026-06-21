@@ -48,14 +48,17 @@ const (
 type ReadTool struct {
 	WorkDir   string
 	readState *FileReadState
+	fs        WorkspaceFS
 }
 
 // NewRead creates a read tool rooted at workDir.
 //
 // Pass the same non-nil FileReadState to NewRead, NewWrite, and NewEdit to
 // enable read-before-write/edit validation. Pass nil to disable this tracking.
-func NewRead(workDir string, state *FileReadState) *ReadTool {
-	return &ReadTool{WorkDir: workDir, readState: state}
+// By default the tool operates on the local filesystem; pass WithFS to inject
+// a different WorkspaceFS backend.
+func NewRead(workDir string, state *FileReadState, opts ...Option) *ReadTool {
+	return &ReadTool{WorkDir: workDir, readState: state, fs: resolveFS(opts)}
 }
 
 func (t *ReadTool) Name() string                                 { return "read" }
@@ -97,13 +100,13 @@ type resolvedRead struct {
 	path    string
 	offset  int
 	limit   int
-	info    os.FileInfo
+	info    FileInfo
 	partial bool // user explicitly passed offset or limit
 }
 
 // Execute returns a text-only result (for backward compatibility / middleware).
 func (t *ReadTool) Execute(ctx context.Context, args json.RawMessage) (json.RawMessage, error) {
-	a, err := t.parseArgs(args)
+	a, err := t.parseArgs(ctx, args)
 	if err != nil {
 		return nil, err
 	}
@@ -119,14 +122,14 @@ func (t *ReadTool) Execute(ctx context.Context, args json.RawMessage) (json.RawM
 // ExecuteContent returns rich content blocks (text or image).
 // Implements agentcore.ContentTool.
 func (t *ReadTool) ExecuteContent(ctx context.Context, args json.RawMessage) ([]agentcore.ContentBlock, error) {
-	a, err := t.parseArgs(args)
+	a, err := t.parseArgs(ctx, args)
 	if err != nil {
 		return nil, err
 	}
 
-	if !a.info.IsDir() {
-		if mime := detectImageMIME(a.path); mime != "" {
-			blocks, err := t.readImage(a.path, mime)
+	if !a.info.IsDir {
+		if mime := t.detectImageMIME(ctx, a.path); mime != "" {
+			blocks, err := t.readImage(ctx, a.path, mime)
 			if err == nil {
 				t.recordRead(a)
 			}
@@ -142,7 +145,7 @@ func (t *ReadTool) ExecuteContent(ctx context.Context, args json.RawMessage) ([]
 	return []agentcore.ContentBlock{agentcore.TextBlock(result)}, nil
 }
 
-func (t *ReadTool) parseArgs(args json.RawMessage) (resolvedRead, error) {
+func (t *ReadTool) parseArgs(ctx context.Context, args json.RawMessage) (resolvedRead, error) {
 	var a readArgs
 	if err := json.Unmarshal(args, &a); err != nil {
 		return resolvedRead{}, fmt.Errorf("invalid args: %w", err)
@@ -152,10 +155,10 @@ func (t *ReadTool) parseArgs(args json.RawMessage) (resolvedRead, error) {
 	}
 
 	p := ResolvePath(t.WorkDir, a.FilePath)
-	info, err := os.Stat(p)
+	info, err := t.fs.Stat(ctx, p)
 	if err != nil {
 		if os.IsNotExist(err) {
-			return resolvedRead{}, fmt.Errorf("%s", notFoundWithSuggestions(p))
+			return resolvedRead{}, fmt.Errorf("%s", t.notFoundWithSuggestions(ctx, p))
 		}
 		return resolvedRead{}, fmt.Errorf("read %s: %w", p, err)
 	}
@@ -183,26 +186,27 @@ func (t *ReadTool) parseArgs(args json.RawMessage) (resolvedRead, error) {
 // directories. Files are keyed by absolute path so write/edit (which also
 // use ResolvePath) hit the same bucket.
 func (t *ReadTool) recordRead(a resolvedRead) {
-	if t.readState == nil || a.info == nil || a.info.IsDir() {
+	if t.readState == nil || a.path == "" || a.info.IsDir {
 		return
 	}
 	t.readState.Set(a.path, FileReadStamp{
 		ReadAt:  time.Now(),
-		Mtime:   a.info.ModTime(),
+		Mtime:   a.info.ModTime,
+		Version: a.info.Version,
 		Partial: a.partial,
 	})
 }
 
 func (t *ReadTool) readTextual(ctx context.Context, a resolvedRead) (string, error) {
-	if a.info.IsDir() {
-		return readDirectory(a)
+	if a.info.IsDir {
+		return t.readDirectory(ctx, a)
 	}
 
-	if mime := detectImageMIME(a.path); mime != "" {
+	if mime := t.detectImageMIME(ctx, a.path); mime != "" {
 		return fmt.Sprintf("Read image file [%s]", mime), nil
 	}
 
-	isBinary, err := isBinaryFile(a.path, a.info.Size())
+	isBinary, err := t.isBinaryFile(ctx, a.path, a.info.Size)
 	if err != nil {
 		return "", err
 	}
@@ -210,12 +214,12 @@ func (t *ReadTool) readTextual(ctx context.Context, a resolvedRead) (string, err
 		return "", fmt.Errorf("cannot read binary file: %s", a.path)
 	}
 
-	return readTextFile(ctx, a)
+	return t.readTextFile(ctx, a)
 }
 
 // readImage reads a file as an image, optionally resizes, and returns content blocks.
-func (t *ReadTool) readImage(path, mime string) ([]agentcore.ContentBlock, error) {
-	data, err := os.ReadFile(path)
+func (t *ReadTool) readImage(ctx context.Context, path, mime string) ([]agentcore.ContentBlock, error) {
+	data, err := t.fs.ReadFile(ctx, path)
 	if err != nil {
 		return nil, fmt.Errorf("read %s: %w", path, err)
 	}
@@ -273,16 +277,16 @@ func resizeImage(data []byte, mime string) ([]byte, string, string) {
 	return jpegBuf.Bytes(), "image/jpeg", fmt.Sprintf("[Resized %dx%d → %dx%d]", w, h, newW, newH)
 }
 
-func readDirectory(a resolvedRead) (string, error) {
-	entries, err := os.ReadDir(a.path)
+func (t *ReadTool) readDirectory(ctx context.Context, a resolvedRead) (string, error) {
+	entries, err := t.fs.ReadDir(ctx, a.path)
 	if err != nil {
 		return "", fmt.Errorf("read directory %s: %w", a.path, err)
 	}
 
 	list := make([]string, 0, len(entries))
 	for _, entry := range entries {
-		name := entry.Name()
-		if entry.IsDir() {
+		name := entry.Name
+		if entry.IsDir {
 			name += "/"
 		}
 		list = append(list, name)
@@ -314,8 +318,8 @@ func readDirectory(a resolvedRead) (string, error) {
 	return result, nil
 }
 
-func readTextFile(ctx context.Context, a resolvedRead) (string, error) {
-	f, err := os.Open(a.path)
+func (t *ReadTool) readTextFile(ctx context.Context, a resolvedRead) (string, error) {
+	f, err := t.fs.Open(ctx, a.path)
 	if err != nil {
 		return "", fmt.Errorf("read %s: %w", a.path, err)
 	}
@@ -386,10 +390,10 @@ func readTextFile(ctx context.Context, a resolvedRead) (string, error) {
 	return result, nil
 }
 
-func notFoundWithSuggestions(target string) string {
+func (t *ReadTool) notFoundWithSuggestions(ctx context.Context, target string) string {
 	dir := filepath.Dir(target)
 	base := filepath.Base(target)
-	entries, err := os.ReadDir(dir)
+	entries, err := t.fs.ReadDir(ctx, dir)
 	if err != nil {
 		return fmt.Sprintf("file not found: %s", target)
 	}
@@ -398,7 +402,7 @@ func notFoundWithSuggestions(target string) string {
 	lowerBase := strings.ToLower(base)
 	lowerStem := strings.ToLower(strings.TrimSuffix(base, filepath.Ext(base)))
 	for _, entry := range entries {
-		name := entry.Name()
+		name := entry.Name
 		lowerName := strings.ToLower(name)
 		lowerNameStem := strings.ToLower(strings.TrimSuffix(name, filepath.Ext(name)))
 		if strings.Contains(lowerName, lowerBase) ||
@@ -418,8 +422,8 @@ func notFoundWithSuggestions(target string) string {
 
 // detectImageMIME sniffs the file's content type and returns the MIME type
 // if it's a supported image format, or "" otherwise.
-func detectImageMIME(path string) string {
-	f, err := os.Open(path)
+func (t *ReadTool) detectImageMIME(ctx context.Context, path string) string {
+	f, err := t.fs.Open(ctx, path)
 	if err != nil {
 		return ""
 	}
@@ -438,7 +442,7 @@ func detectImageMIME(path string) string {
 	return ""
 }
 
-func isBinaryFile(path string, size int64) (bool, error) {
+func (t *ReadTool) isBinaryFile(ctx context.Context, path string, size int64) (bool, error) {
 	switch strings.ToLower(filepath.Ext(path)) {
 	case ".zip", ".tar", ".gz", ".exe", ".dll", ".so", ".class", ".jar", ".war",
 		".7z", ".doc", ".docx", ".xls", ".xlsx", ".ppt", ".pptx", ".odt", ".ods",
@@ -449,7 +453,7 @@ func isBinaryFile(path string, size int64) (bool, error) {
 		return false, nil
 	}
 
-	f, err := os.Open(path)
+	f, err := t.fs.Open(ctx, path)
 	if err != nil {
 		return false, fmt.Errorf("read %s: %w", path, err)
 	}

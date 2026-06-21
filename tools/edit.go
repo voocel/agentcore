@@ -20,14 +20,17 @@ import (
 type EditTool struct {
 	WorkDir   string
 	readState *FileReadState
+	fs        WorkspaceFS
 }
 
 // NewEdit creates an edit tool rooted at workDir.
 //
 // Pass the same non-nil FileReadState to NewRead, NewWrite, and NewEdit to
 // enable read-before-write/edit validation. Pass nil to disable this tracking.
-func NewEdit(workDir string, state *FileReadState) *EditTool {
-	return &EditTool{WorkDir: workDir, readState: state}
+// By default the tool operates on the local filesystem; pass WithFS to inject
+// a different WorkspaceFS backend.
+func NewEdit(workDir string, state *FileReadState, opts ...Option) *EditTool {
+	return &EditTool{WorkDir: workDir, readState: state, fs: resolveFS(opts)}
 }
 
 func (t *EditTool) Name() string                                 { return "edit" }
@@ -73,7 +76,7 @@ type editResult struct {
 // Validate enforces read-before-edit and detects stale writes. Unlike Write,
 // edit always requires an existing file — a non-existent path fails.
 // Error codes match WriteTool.Validate.
-func (t *EditTool) Validate(_ context.Context, args json.RawMessage) agentcore.ValidationResult {
+func (t *EditTool) Validate(ctx context.Context, args json.RawMessage) agentcore.ValidationResult {
 	if t.readState == nil {
 		return agentcore.ValidationResult{OK: true}
 	}
@@ -84,14 +87,14 @@ func (t *EditTool) Validate(_ context.Context, args json.RawMessage) agentcore.V
 	}
 	path := ResolvePath(t.WorkDir, a.FilePath)
 
-	info, err := os.Stat(path)
+	info, err := t.fs.Stat(ctx, path)
 	if err != nil {
 		if os.IsNotExist(err) {
 			return agentcore.ValidationResult{OK: false, Message: "file not found: " + path}
 		}
 		return agentcore.ValidationResult{OK: false, Message: "stat " + path + ": " + err.Error()}
 	}
-	if info.IsDir() {
+	if info.IsDir {
 		return agentcore.ValidationResult{OK: false, Message: "path is a directory: " + path}
 	}
 
@@ -103,9 +106,10 @@ func (t *EditTool) Validate(_ context.Context, args json.RawMessage) agentcore.V
 			Message:   "File has not been read yet. Read it first before editing.",
 		}
 	}
-	// Compare against the mtime recorded at read time, not just "after ReadAt".
-	// Catches mtime regressions too (e.g. git checkout of an older version).
-	if !info.ModTime().Equal(stamp.Mtime) {
+	// Compare against the content token / mtime recorded at read time, not just
+	// "after ReadAt". Catches mtime regressions too (e.g. git checkout of an
+	// older version), and unsaved-buffer changes when the backend sets Version.
+	if !stampMatches(stamp, info) {
 		return agentcore.ValidationResult{
 			OK:        false,
 			ErrorCode: 3,
@@ -115,7 +119,7 @@ func (t *EditTool) Validate(_ context.Context, args json.RawMessage) agentcore.V
 	return agentcore.ValidationResult{OK: true}
 }
 
-func (t *EditTool) parseAndMatch(args json.RawMessage) (*editResult, error) {
+func (t *EditTool) parseAndMatch(ctx context.Context, args json.RawMessage) (*editResult, error) {
 	var a editArgs
 	if err := json.Unmarshal(args, &a); err != nil {
 		return nil, fmt.Errorf("invalid args: %w", err)
@@ -123,7 +127,7 @@ func (t *EditTool) parseAndMatch(args json.RawMessage) (*editResult, error) {
 
 	a.FilePath = ResolvePath(t.WorkDir, a.FilePath)
 
-	data, err := os.ReadFile(a.FilePath)
+	data, err := t.fs.ReadFile(ctx, a.FilePath)
 	if err != nil {
 		return nil, fmt.Errorf("file not found: %s", a.FilePath)
 	}
@@ -207,7 +211,7 @@ func (t *EditTool) Preview(ctx context.Context, args json.RawMessage) (json.RawM
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
-	r, err := t.parseAndMatch(args)
+	r, err := t.parseAndMatch(ctx, args)
 	if err != nil {
 		return nil, err
 	}
@@ -222,7 +226,7 @@ func (t *EditTool) Execute(ctx context.Context, args json.RawMessage) (json.RawM
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
-	r, err := t.parseAndMatch(args)
+	r, err := t.parseAndMatch(ctx, args)
 	if err != nil {
 		return nil, err
 	}
@@ -232,7 +236,7 @@ func (t *EditTool) Execute(ctx context.Context, args json.RawMessage) (json.RawM
 	}
 
 	finalContent := r.bom + restoreLineEndings(r.newContent, r.ending)
-	if err := os.WriteFile(r.path, []byte(finalContent), 0o644); err != nil {
+	if err := t.fs.WriteFile(ctx, r.path, []byte(finalContent), 0o644); err != nil {
 		return nil, fmt.Errorf("write %s: %w", r.path, err)
 	}
 

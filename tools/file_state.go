@@ -15,9 +15,14 @@ import (
 // Partial is true when the read used offset/limit. A partial read does not
 // satisfy read-before-write — the LLM may not know about content outside
 // the slice it read.
+//
+// Version is the backend-defined content token recorded at read time (see
+// WorkspaceFS.FileInfo.Version). It is empty for the OS backend; Write/Edit
+// fall back to comparing Mtime when either side's Version is empty.
 type FileReadStamp struct {
 	ReadAt  time.Time
 	Mtime   time.Time
+	Version string
 	Partial bool
 }
 
@@ -53,4 +58,17 @@ func (s *FileReadState) Reset() {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.m = make(map[string]FileReadStamp)
+}
+
+// stampMatches reports whether the file described by info is unchanged since
+// the read recorded in stamp. When both sides carry a non-empty Version
+// (a backend content token), it compares Version; otherwise it falls back to
+// mtime equality — so the OS backend (Version always empty) keeps its existing
+// behaviour, while backends serving unsaved buffers get content-accurate
+// stale-write detection.
+func stampMatches(stamp FileReadStamp, info FileInfo) bool {
+	if stamp.Version != "" && info.Version != "" {
+		return stamp.Version == info.Version
+	}
+	return info.ModTime.Equal(stamp.Mtime)
 }

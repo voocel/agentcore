@@ -19,14 +19,17 @@ import (
 type WriteTool struct {
 	WorkDir   string
 	readState *FileReadState
+	fs        WorkspaceFS
 }
 
 // NewWrite creates a write tool rooted at workDir.
 //
 // Pass the same non-nil FileReadState to NewRead, NewWrite, and NewEdit to
 // enable read-before-write/edit validation. Pass nil to disable this tracking.
-func NewWrite(workDir string, state *FileReadState) *WriteTool {
-	return &WriteTool{WorkDir: workDir, readState: state}
+// By default the tool operates on the local filesystem; pass WithFS to inject
+// a different WorkspaceFS backend.
+func NewWrite(workDir string, state *FileReadState, opts ...Option) *WriteTool {
+	return &WriteTool{WorkDir: workDir, readState: state, fs: resolveFS(opts)}
 }
 
 func (t *WriteTool) Name() string                                 { return "write" }
@@ -63,7 +66,7 @@ type writeState struct {
 	exists     bool
 }
 
-func (t *WriteTool) parseWrite(args json.RawMessage) (*writeState, error) {
+func (t *WriteTool) parseWrite(ctx context.Context, args json.RawMessage) (*writeState, error) {
 	var a writeArgs
 	if err := json.Unmarshal(args, &a); err != nil {
 		return nil, fmt.Errorf("invalid args: %w", err)
@@ -73,7 +76,7 @@ func (t *WriteTool) parseWrite(args json.RawMessage) (*writeState, error) {
 
 	contentOld := ""
 	exists := false
-	if data, err := os.ReadFile(a.FilePath); err == nil {
+	if data, err := t.fs.ReadFile(ctx, a.FilePath); err == nil {
 		contentOld = string(data)
 		exists = true
 	} else if !os.IsNotExist(err) {
@@ -90,8 +93,8 @@ func (t *WriteTool) parseWrite(args json.RawMessage) (*writeState, error) {
 
 const writePreviewMaxLines = 12
 
-func (t *WriteTool) Preview(_ context.Context, args json.RawMessage) (json.RawMessage, error) {
-	state, err := t.parseWrite(args)
+func (t *WriteTool) Preview(ctx context.Context, args json.RawMessage) (json.RawMessage, error) {
+	state, err := t.parseWrite(ctx, args)
 	if err != nil {
 		return nil, err
 	}
@@ -123,7 +126,7 @@ func (t *WriteTool) Preview(_ context.Context, args json.RawMessage) (json.RawMe
 //   - 2: existing file has not been read this session, or only a partial
 //     slice was read.
 //   - 3: file was modified after the last read.
-func (t *WriteTool) Validate(_ context.Context, args json.RawMessage) agentcore.ValidationResult {
+func (t *WriteTool) Validate(ctx context.Context, args json.RawMessage) agentcore.ValidationResult {
 	if t.readState == nil {
 		return agentcore.ValidationResult{OK: true}
 	}
@@ -134,14 +137,14 @@ func (t *WriteTool) Validate(_ context.Context, args json.RawMessage) agentcore.
 	}
 	path := ResolvePath(t.WorkDir, a.FilePath)
 
-	info, err := os.Stat(path)
+	info, err := t.fs.Stat(ctx, path)
 	if os.IsNotExist(err) {
 		return agentcore.ValidationResult{OK: true}
 	}
 	if err != nil {
 		return agentcore.ValidationResult{OK: false, Message: "stat " + path + ": " + err.Error()}
 	}
-	if info.IsDir() {
+	if info.IsDir {
 		return agentcore.ValidationResult{OK: false, Message: "path is a directory: " + path}
 	}
 
@@ -153,9 +156,10 @@ func (t *WriteTool) Validate(_ context.Context, args json.RawMessage) agentcore.
 			Message:   "File has not been read yet. Read it first before writing to it.",
 		}
 	}
-	// Compare against the mtime recorded at read time, not just "after ReadAt".
-	// Catches mtime regressions too (e.g. git checkout of an older version).
-	if !info.ModTime().Equal(stamp.Mtime) {
+	// Compare against the content token / mtime recorded at read time, not just
+	// "after ReadAt". Catches mtime regressions too (e.g. git checkout of an
+	// older version), and unsaved-buffer changes when the backend sets Version.
+	if !stampMatches(stamp, info) {
 		return agentcore.ValidationResult{
 			OK:        false,
 			ErrorCode: 3,
@@ -165,17 +169,17 @@ func (t *WriteTool) Validate(_ context.Context, args json.RawMessage) agentcore.
 	return agentcore.ValidationResult{OK: true}
 }
 
-func (t *WriteTool) Execute(_ context.Context, args json.RawMessage) (json.RawMessage, error) {
-	state, err := t.parseWrite(args)
+func (t *WriteTool) Execute(ctx context.Context, args json.RawMessage) (json.RawMessage, error) {
+	state, err := t.parseWrite(ctx, args)
 	if err != nil {
 		return nil, err
 	}
 
-	if err := os.MkdirAll(filepath.Dir(state.path), 0o755); err != nil {
+	if err := t.fs.MkdirAll(ctx, filepath.Dir(state.path), 0o755); err != nil {
 		return nil, fmt.Errorf("mkdir: %w", err)
 	}
 
-	if err := os.WriteFile(state.path, []byte(state.contentNew), 0o644); err != nil {
+	if err := t.fs.WriteFile(ctx, state.path, []byte(state.contentNew), 0o644); err != nil {
 		return nil, fmt.Errorf("write %s: %w", state.path, err)
 	}
 
