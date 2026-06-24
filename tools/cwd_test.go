@@ -25,6 +25,36 @@ func TestWithCwdAndCwdFromContext(t *testing.T) {
 	}
 }
 
+func TestWithCwdFunc(t *testing.T) {
+	// nil fn is a no-op.
+	if got := CwdFromContext(WithCwdFunc(context.Background(), nil)); got != "" {
+		t.Errorf("WithCwdFunc(ctx, nil) should be a no-op, got %q", got)
+	}
+
+	// The func is consulted live: mutating the backing value after the context
+	// is derived changes what CwdFromContext returns.
+	cwd := "/first"
+	ctx := WithCwdFunc(context.Background(), func() string { return cwd })
+	if got := CwdFromContext(ctx); got != "/first" {
+		t.Errorf("live cwd = %q, want /first", got)
+	}
+	cwd = "/second"
+	if got := CwdFromContext(ctx); got != "/second" {
+		t.Errorf("after mutation live cwd = %q, want /second (must re-read, not snapshot)", got)
+	}
+
+	// A non-empty func result wins over a static WithCwd value...
+	layered := WithCwdFunc(WithCwd(context.Background(), "/static"), func() string { return "/live" })
+	if got := CwdFromContext(layered); got != "/live" {
+		t.Errorf("func should win over static, got %q", got)
+	}
+	// ...but an empty func result falls back to the static value.
+	fallback := WithCwdFunc(WithCwd(context.Background(), "/static"), func() string { return "" })
+	if got := CwdFromContext(fallback); got != "/static" {
+		t.Errorf("empty func should fall back to static, got %q", got)
+	}
+}
+
 func TestEffectiveWorkDir(t *testing.T) {
 	if got := effectiveWorkDir(context.Background(), "/fallback"); got != "/fallback" {
 		t.Errorf("no override → %q, want /fallback", got)

@@ -56,7 +56,11 @@ func NewEngine(cfg EngineConfig) *Engine {
 }
 
 func (e *Engine) Decide(ctx context.Context, req Request) (*Decision, error) {
-	info := inspectRequest(e.workspace, e.filesystemRoots(), e.classifier, req)
+	// A per-request Workspace (e.g. a worktree the harness entered mid-run)
+	// wins over the engine's construction-time workspace, so relative operand
+	// paths are normalized, checked, and audited against the directory the
+	// tool actually runs in. Empty preserves the original behaviour.
+	info := inspectRequest(firstNonEmpty(req.Workspace, e.workspace), e.filesystemRoots(), e.classifier, req)
 	if info.hardDeny != "" {
 		decision := denyDecision(DecisionSourceRoots, info, info.hardDeny)
 		e.audit(info, decision)

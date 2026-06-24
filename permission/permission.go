@@ -104,6 +104,10 @@ type Request struct {
 	Args      json.RawMessage `json:"args,omitempty"`
 	Preview   json.RawMessage `json:"preview,omitempty"`
 	Metadata  Metadata        `json:"metadata,omitempty"`
+	// Workspace overrides the base for resolving relative operand paths on THIS
+	// request; empty falls back to EngineConfig.Workspace. Set it when the cwd
+	// changes per call (e.g. a worktree) so checks/audit match where tools run.
+	Workspace string `json:"workspace,omitempty"`
 }
 
 type Decision struct {

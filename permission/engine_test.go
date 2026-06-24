@@ -86,6 +86,44 @@ func TestBalancedWriteDeniedWithoutApprover(t *testing.T) {
 	}
 }
 
+// TestRequestWorkspaceOverridesPathBase: a per-request Workspace changes the
+// base relative operand paths resolve (and audit) against, so a moved cwd (e.g.
+// into a worktree) checks the right directory.
+func TestRequestWorkspaceOverridesPathBase(t *testing.T) {
+	main := t.TempDir()
+	wt := t.TempDir()
+	var summaries []string
+	engine := NewEngine(EngineConfig{
+		Workspace:  main,
+		Mode:       ModeTrust, // auto-allow; we only assert the normalized path
+		Classifier: testClassifier,
+		Roots:      FilesystemRoots{ReadRoots: []string{main, wt}, WriteRoots: []string{main, wt}},
+		OnAudit:    func(e AuditEntry) { summaries = append(summaries, e.Summary) },
+	})
+
+	// No per-request workspace → relative path resolves against the engine
+	// workspace (main).
+	if _, err := engine.Decide(context.Background(), toolReq("write", map[string]any{"path": "a.txt"})); err != nil {
+		t.Fatalf("Decide default: %v", err)
+	}
+	// Per-request workspace → the same relative path resolves against wt.
+	req := toolReq("write", map[string]any{"path": "a.txt"})
+	req.Workspace = wt
+	if _, err := engine.Decide(context.Background(), req); err != nil {
+		t.Fatalf("Decide override: %v", err)
+	}
+
+	if len(summaries) != 2 {
+		t.Fatalf("want 2 audit entries, got %d", len(summaries))
+	}
+	if want := filepath.Join(main, "a.txt"); summaries[0] != want {
+		t.Errorf("default summary = %q, want %q", summaries[0], want)
+	}
+	if want := filepath.Join(wt, "a.txt"); summaries[1] != want {
+		t.Errorf("per-request workspace summary = %q, want %q", summaries[1], want)
+	}
+}
+
 func TestOutsideRootsAllowSessionDegradesToAllowOnce(t *testing.T) {
 	workspace := t.TempDir()
 	outside := filepath.Join(t.TempDir(), "outside.txt")
