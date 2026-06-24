@@ -80,7 +80,7 @@ func (t *LsTool) Execute(ctx context.Context, args json.RawMessage) (json.RawMes
 		return nil, fmt.Errorf("invalid args: %w", err)
 	}
 
-	dir := ResolvePath(t.WorkDir, a.Path)
+	dir := ResolvePath(effectiveWorkDir(ctx, t.WorkDir), a.Path)
 
 	depth := a.Depth
 	if depth <= 0 {

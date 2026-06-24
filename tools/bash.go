@@ -114,16 +114,17 @@ func (t *BashTool) Execute(ctx context.Context, args json.RawMessage) (json.RawM
 	}
 
 	if a.RunInBackground {
-		return t.executeBackground(a)
+		return t.executeBackground(ctx, a)
 	}
 
 	return t.executeForeground(ctx, a)
 }
 
-func (t *BashTool) resolveWorkDir(a bashArgs) (string, error) {
-	workDir := t.WorkDir
+func (t *BashTool) resolveWorkDir(ctx context.Context, a bashArgs) (string, error) {
+	base := effectiveWorkDir(ctx, t.WorkDir)
+	workDir := base
 	if a.WorkDir != "" {
-		workDir = ResolvePath(t.WorkDir, a.WorkDir)
+		workDir = ResolvePath(base, a.WorkDir)
 	}
 	if workDir == "" {
 		return "", nil
@@ -143,13 +144,13 @@ func (t *BashTool) resolveWorkDir(a bashArgs) (string, error) {
 
 // executeBackground starts a shell command in a detached goroutine and returns immediately.
 // Output is written to a file on disk for on-demand reading.
-func (t *BashTool) executeBackground(a bashArgs) (json.RawMessage, error) {
+func (t *BashTool) executeBackground(ctx context.Context, a bashArgs) (json.RawMessage, error) {
 	timeout := 10 * time.Minute // generous default for background
 	if a.Timeout > 0 {
 		timeout = time.Duration(a.Timeout) * time.Second
 	}
 
-	workDir, err := t.resolveWorkDir(a)
+	workDir, err := t.resolveWorkDir(ctx, a)
 	if err != nil {
 		return nil, err
 	}
@@ -291,7 +292,7 @@ func (t *BashTool) executeForeground(ctx context.Context, a bashArgs) (json.RawM
 		timeout = time.Duration(a.Timeout) * time.Second
 	}
 
-	workDir, err := t.resolveWorkDir(a)
+	workDir, err := t.resolveWorkDir(ctx, a)
 	if err != nil {
 		return nil, err
 	}

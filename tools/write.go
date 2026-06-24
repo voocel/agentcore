@@ -72,7 +72,7 @@ func (t *WriteTool) parseWrite(ctx context.Context, args json.RawMessage) (*writ
 		return nil, fmt.Errorf("invalid args: %w", err)
 	}
 
-	a.FilePath = ResolvePath(t.WorkDir, a.FilePath)
+	a.FilePath = ResolvePath(effectiveWorkDir(ctx, t.WorkDir), a.FilePath)
 
 	contentOld := ""
 	exists := false
@@ -135,7 +135,7 @@ func (t *WriteTool) Validate(ctx context.Context, args json.RawMessage) agentcor
 	if err := json.Unmarshal(args, &a); err != nil {
 		return agentcore.ValidationResult{OK: false, Message: "invalid args: " + err.Error()}
 	}
-	path := ResolvePath(t.WorkDir, a.FilePath)
+	path := ResolvePath(effectiveWorkDir(ctx, t.WorkDir), a.FilePath)
 
 	info, err := t.fs.Stat(ctx, path)
 	if os.IsNotExist(err) {

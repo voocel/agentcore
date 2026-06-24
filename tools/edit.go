@@ -85,7 +85,7 @@ func (t *EditTool) Validate(ctx context.Context, args json.RawMessage) agentcore
 	if err := json.Unmarshal(args, &a); err != nil {
 		return agentcore.ValidationResult{OK: false, Message: "invalid args: " + err.Error()}
 	}
-	path := ResolvePath(t.WorkDir, a.FilePath)
+	path := ResolvePath(effectiveWorkDir(ctx, t.WorkDir), a.FilePath)
 
 	info, err := t.fs.Stat(ctx, path)
 	if err != nil {
@@ -125,7 +125,7 @@ func (t *EditTool) parseAndMatch(ctx context.Context, args json.RawMessage) (*ed
 		return nil, fmt.Errorf("invalid args: %w", err)
 	}
 
-	a.FilePath = ResolvePath(t.WorkDir, a.FilePath)
+	a.FilePath = ResolvePath(effectiveWorkDir(ctx, t.WorkDir), a.FilePath)
 
 	data, err := t.fs.ReadFile(ctx, a.FilePath)
 	if err != nil {

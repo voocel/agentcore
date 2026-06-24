@@ -59,7 +59,7 @@ func (t *GlobTool) Execute(ctx context.Context, args json.RawMessage) (json.RawM
 		return nil, fmt.Errorf("pattern is required")
 	}
 
-	searchDir := ResolvePath(t.WorkDir, a.Path)
+	searchDir := ResolvePath(effectiveWorkDir(ctx, t.WorkDir), a.Path)
 	info, err := os.Stat(searchDir)
 	if err != nil {
 		return nil, fmt.Errorf("glob %s: %w", searchDir, err)

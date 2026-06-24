@@ -154,7 +154,7 @@ func (t *ReadTool) parseArgs(ctx context.Context, args json.RawMessage) (resolve
 		return resolvedRead{}, fmt.Errorf("offset must be greater than or equal to 1")
 	}
 
-	p := ResolvePath(t.WorkDir, a.FilePath)
+	p := ResolvePath(effectiveWorkDir(ctx, t.WorkDir), a.FilePath)
 	info, err := t.fs.Stat(ctx, p)
 	if err != nil {
 		if os.IsNotExist(err) {

@@ -16,6 +16,7 @@ import (
 	"github.com/voocel/agentcore"
 	"github.com/voocel/agentcore/schema"
 	"github.com/voocel/agentcore/task"
+	"github.com/voocel/agentcore/tools"
 )
 
 const (
@@ -512,6 +513,10 @@ func (t *Tool) executeBackground(callerCtx context.Context, agentName, taskStr, 
 	// Thread the child's depth into bgCtx so any spawn the child itself makes
 	// will see the correct parent depth when reading DepthFromContext.
 	bgCtx = task.WithDepth(bgCtx, childDepth)
+	// Inherit the caller's working-directory override so a background sub-agent
+	// resolves paths in the same workspace (e.g. a git-worktree sandbox) as a
+	// foreground one would. No-op when the caller set none.
+	bgCtx = tools.WithCwd(bgCtx, tools.CwdFromContext(callerCtx))
 
 	entry := &task.Entry{
 		ID:          taskID,

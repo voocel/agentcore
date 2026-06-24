@@ -77,7 +77,7 @@ func (t *GrepTool) Execute(ctx context.Context, args json.RawMessage) (json.RawM
 		a.Limit = grepDefaultLimit
 	}
 
-	searchPath := ResolvePath(t.WorkDir, a.Path)
+	searchPath := ResolvePath(effectiveWorkDir(ctx, t.WorkDir), a.Path)
 
 	// Try ripgrep first
 	if result, err := t.grepWithRg(ctx, a, searchPath); err == nil {
