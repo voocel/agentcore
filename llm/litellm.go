@@ -222,6 +222,25 @@ func (l *LiteLLMAdapter) ProviderName() string {
 	return l.Info().Provider
 }
 
+// Capabilities returns the provider/model capability view exposed by litellm.
+func (l *LiteLLMAdapter) Capabilities() Capabilities {
+	if l == nil {
+		return Capabilities{}
+	}
+	if l.client == nil {
+		caps := Capabilities{Model: l.model}
+		if l.BaseModel != nil {
+			info := l.Info()
+			caps.Provider = info.Provider
+			if caps.Model == "" {
+				caps.Model = info.Name
+			}
+		}
+		return caps
+	}
+	return fromLiteLLMCapabilities(l.client.Capabilities(l.model))
+}
+
 // Generate produces a synchronous response.
 func (l *LiteLLMAdapter) Generate(ctx context.Context, messages []agentcore.Message, tools []agentcore.ToolSpec, opts ...agentcore.CallOption) (*agentcore.LLMResponse, error) {
 	if l.requestTimeout > 0 {

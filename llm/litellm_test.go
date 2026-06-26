@@ -67,6 +67,105 @@ func TestNewBaseModelClonesDefaultConfig(t *testing.T) {
 	}
 }
 
+type capabilityProvider struct {
+	captureProvider
+	caps litellm.Capabilities
+}
+
+func (p *capabilityProvider) Capabilities(string) litellm.Capabilities {
+	return p.caps
+}
+
+func TestLiteLLMAdapterCapabilities(t *testing.T) {
+	provider := &capabilityProvider{
+		caps: litellm.Capabilities{
+			Provider: "capture",
+			Model:    "m",
+			Thinking: litellm.ThinkingCapabilities{
+				Supported:     litellm.SupportYes,
+				Disable:       litellm.SupportYes,
+				Efforts:       []string{"minimal", "high", "max", "vendor-only"},
+				BudgetTokens:  litellm.SupportPartial,
+				IncludeOutput: litellm.SupportYes,
+				Notes:         []string{"budget varies by model"},
+			},
+			Tools: litellm.ToolCapabilities{
+				Calls:               litellm.SupportYes,
+				ParallelCalls:       litellm.SupportPartial,
+				StrictSchema:        litellm.SupportYes,
+				Choice:              litellm.SupportNo,
+				MultimodalResults:   litellm.SupportUnknown,
+				RequiresAdjacency:   true,
+				RoundTripSignatures: litellm.SupportYes,
+				HostedProviderTools: litellm.SupportPartial,
+			},
+			Structured: litellm.StructuredCapabilities{
+				JSONObject: litellm.SupportYes,
+				JSONSchema: litellm.SupportYes,
+				Strict:     litellm.SupportPartial,
+				PromptOnly: true,
+			},
+			Streaming: litellm.StreamingCapabilities{
+				Supported:       litellm.SupportYes,
+				Usage:           litellm.SupportPartial,
+				ReasoningDeltas: litellm.SupportYes,
+				ToolCallDeltas:  litellm.SupportYes,
+				NativeResponses: litellm.SupportNo,
+				IdleTimeout:     litellm.SupportYes,
+			},
+			Usage: litellm.UsageCapabilities{
+				InputTokens:      litellm.SupportYes,
+				OutputTokens:     litellm.SupportYes,
+				TotalTokens:      litellm.SupportYes,
+				ReasoningTokens:  litellm.SupportPartial,
+				CacheReadTokens:  litellm.SupportYes,
+				CacheWriteTokens: litellm.SupportNo,
+			},
+		},
+	}
+	model := NewLiteLLMAdapter("m", mustClient(t, provider))
+	caps := model.Capabilities()
+
+	if caps.Provider != "capture" || caps.Model != "m" {
+		t.Fatalf("identity = %s/%s, want capture/m", caps.Provider, caps.Model)
+	}
+	if caps.Thinking.Supported != SupportYes || caps.Thinking.Disable != SupportYes {
+		t.Fatalf("thinking support = %+v", caps.Thinking)
+	}
+	if !caps.Thinking.SupportsEffort(agentcore.ThinkingMinimal) || !caps.Thinking.SupportsEffort(agentcore.ThinkingMax) {
+		t.Fatalf("thinking efforts = %#v", caps.Thinking.Efforts)
+	}
+	if caps.Thinking.SupportsEffort(agentcore.ThinkingLevel("vendor-only")) {
+		t.Fatalf("vendor-only effort leaked into agentcore capabilities: %#v", caps.Thinking.Efforts)
+	}
+	if caps.Tools.StrictSchema != SupportYes || !caps.Tools.RequiresAdjacency {
+		t.Fatalf("tool capabilities = %+v", caps.Tools)
+	}
+	if caps.Structured.JSONSchema != SupportYes || caps.Structured.Strict != SupportPartial || !caps.Structured.PromptOnly {
+		t.Fatalf("structured capabilities = %+v", caps.Structured)
+	}
+	if caps.Streaming.Usage != SupportPartial || caps.Streaming.IdleTimeout != SupportYes {
+		t.Fatalf("streaming capabilities = %+v", caps.Streaming)
+	}
+	if caps.Usage.CacheReadTokens != SupportYes || caps.Usage.CacheWriteTokens != SupportNo {
+		t.Fatalf("usage capabilities = %+v", caps.Usage)
+	}
+	if len(caps.Thinking.Notes) != 1 || caps.Thinking.Notes[0] != "budget varies by model" {
+		t.Fatalf("thinking notes = %#v", caps.Thinking.Notes)
+	}
+}
+
+func TestLiteLLMAdapterCapabilitiesFallback(t *testing.T) {
+	model := NewLiteLLMAdapter("m", mustClient(t, &captureProvider{}))
+	caps := model.Capabilities()
+	if caps.Provider != "capture" || caps.Model != "m" {
+		t.Fatalf("identity = %s/%s, want capture/m", caps.Provider, caps.Model)
+	}
+	if caps.Thinking.Supported != SupportUnknown || caps.Tools.Calls != SupportUnknown {
+		t.Fatalf("fallback should be unknown support, got %+v / %+v", caps.Thinking, caps.Tools)
+	}
+}
+
 func mustClient(t *testing.T, provider litellm.Provider) *litellm.Client {
 	t.Helper()
 	client, err := litellm.New(provider)
