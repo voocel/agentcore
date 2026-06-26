@@ -9,24 +9,51 @@ import (
 	"encoding/json"
 	"fmt"
 	"maps"
+	"strings"
 	"time"
 
 	"github.com/voocel/agentcore"
 	"github.com/voocel/litellm"
+	"github.com/voocel/litellm/provider/anthropic"
+	"github.com/voocel/litellm/provider/bedrock"
+	"github.com/voocel/litellm/provider/compat"
+	"github.com/voocel/litellm/provider/deepseek"
+	"github.com/voocel/litellm/provider/gemini"
+	"github.com/voocel/litellm/provider/glm"
+	"github.com/voocel/litellm/provider/grok"
+	"github.com/voocel/litellm/provider/mimo"
+	"github.com/voocel/litellm/provider/minimax"
+	"github.com/voocel/litellm/provider/ollama"
+	"github.com/voocel/litellm/provider/openai"
+	"github.com/voocel/litellm/provider/openrouter"
+	"github.com/voocel/litellm/provider/qwen"
+	"github.com/voocel/litellm/retry"
 )
 
-// Re-exports so callers do not need to import litellm directly.
-type (
-	ProviderConfig   = litellm.ProviderConfig
-	ResilienceConfig = litellm.ResilienceConfig
-)
+// ProviderConfig is kept for source compatibility with older agentcore callers.
+// New litellm providers expose explicit Config structs; this package maps the
+// common subset that agentcore needs.
+type ProviderConfig struct {
+	APIKey  string
+	BaseURL string
+	Timeout time.Duration
+	Extra   map[string]any
+	Retry   *retry.Policy
+}
+
+// ResilienceConfig is the compatibility shape for retry and stream idle knobs.
+type ResilienceConfig struct {
+	StreamIdleTimeout time.Duration
+	Retry             *retry.Policy
+}
 
 // LiteLLMAdapter adapts litellm to the agentcore.ChatModel interface.
 type LiteLLMAdapter struct {
 	*BaseModel
-	client *litellm.Client
-	model  string
-	extra  map[string]any // model-level Extra merged into every request
+	client         *litellm.Client
+	model          string
+	requestTimeout time.Duration
+	extra          map[string]any // model-level Extra merged into every request
 }
 
 // NewLiteLLMAdapter wraps an existing litellm.Client as a ChatModel. Use this
@@ -42,18 +69,6 @@ func NewLiteLLMAdapter(model string, client *litellm.Client) *LiteLLMAdapter {
 			string(CapabilityStreaming),
 			string(CapabilityToolCalling),
 		},
-	}
-
-	// Enrich from registry if available
-	if caps, ok := litellm.GetModelCapabilities(model); ok {
-		modelInfo.MaxTokens = caps.MaxOutputTokens
-		modelInfo.ContextSize = caps.MaxInputTokens
-	}
-	if p, ok := litellm.GetModelPricing(model); ok {
-		modelInfo.Pricing = &ModelPricing{
-			InputPerToken:  p.InputCostPerToken,
-			OutputPerToken: p.OutputCostPerToken,
-		}
 	}
 
 	return &LiteLLMAdapter{
@@ -82,7 +97,7 @@ type ModelOption func(*modelConfig)
 func WithAPIKey(key string) ModelOption  { return func(c *modelConfig) { c.apiKey = key } }
 func WithBaseURL(url string) ModelOption { return func(c *modelConfig) { c.baseURL = url } }
 
-// WithRequestTimeout sets the per-request timeout (default 10m).
+// WithRequestTimeout sets an optional per-request timeout. Zero leaves timeout control to the caller context.
 func WithRequestTimeout(d time.Duration) ModelOption {
 	return func(c *modelConfig) { c.timeout = d }
 }
@@ -144,36 +159,62 @@ func NewModel(provider, model string, opts ...ModelOption) (*LiteLLMAdapter, err
 		opt(&cfg)
 	}
 
+	retryPolicy := (*retry.Policy)(nil)
+	if cfg.resilience != nil {
+		retryPolicy = cfg.resilience.Retry
+	}
 	pcfg := ProviderConfig{
 		APIKey:  cfg.apiKey,
 		BaseURL: cfg.baseURL,
 		Timeout: cfg.timeout,
 		Extra:   cloneExtra(cfg.providerExtra),
+		Retry:   retryPolicy,
 	}
-	if cfg.resilience != nil {
-		pcfg.Resilience = *cfg.resilience
-	}
-	if cfg.streamIdleSet {
-		if cfg.resilience == nil {
-			pcfg.Resilience = litellm.DefaultResilienceConfig()
-		}
-		pcfg.Resilience.StreamIdleTimeout = cfg.streamIdle
-	}
-
-	client, err := litellm.NewWithProvider(provider, pcfg, cfg.clientOpts...)
+	providerImpl, err := newProvider(provider, pcfg)
 	if err != nil {
 		return nil, fmt.Errorf("llm: %s: %w", provider, err)
 	}
+	clientOpts := append([]litellm.ClientOption(nil), cfg.clientOpts...)
+	if cfg.streamIdleSet {
+		clientOpts = append(clientOpts, litellm.WithStreamIdleTimeout(cfg.streamIdle))
+	} else if cfg.resilience != nil && cfg.resilience.StreamIdleTimeout > 0 {
+		clientOpts = append(clientOpts, litellm.WithStreamIdleTimeout(cfg.resilience.StreamIdleTimeout))
+	}
+	client, err := litellm.New(providerImpl, clientOpts...)
+	if err != nil {
+		return nil, fmt.Errorf("llm: %s client: %w", provider, err)
+	}
 	adapter := NewLiteLLMAdapter(model, client)
 	adapter.extra = cfg.extra
+	adapter.requestTimeout = cfg.timeout
 	return adapter, nil
 }
 
-// IsProviderRegistered reports whether the provider name is known to litellm.
-func IsProviderRegistered(name string) bool { return litellm.IsProviderRegistered(name) }
+var knownProviders = map[string]struct{}{
+	"anthropic":  {},
+	"bedrock":    {},
+	"deepseek":   {},
+	"gemini":     {},
+	"glm":        {},
+	"grok":       {},
+	"minimax":    {},
+	"mimo":       {},
+	"ollama":     {},
+	"openai":     {},
+	"openrouter": {},
+	"qwen":       {},
+}
 
-// RegisteredProviders returns all provider names known to litellm (builtin + custom).
-func RegisteredProviders() []string { return litellm.ListRegisteredProviders() }
+// IsProviderRegistered reports whether the provider name is known to this adapter.
+func IsProviderRegistered(name string) bool {
+	_, ok := knownProviders[strings.ToLower(strings.TrimSpace(name))]
+	return ok
+}
+
+// RegisteredProviders returns all provider names known to this adapter.
+func RegisteredProviders() []string {
+	return []string{"anthropic", "bedrock", "deepseek", "gemini", "glm", "grok", "minimax", "mimo", "ollama", "openai", "openrouter", "qwen"}
+}
 
 // ProviderName returns the provider name (e.g. "openai", "anthropic").
 // Implements agentcore.ProviderNamer for per-provider API key resolution.
@@ -183,21 +224,32 @@ func (l *LiteLLMAdapter) ProviderName() string {
 
 // Generate produces a synchronous response.
 func (l *LiteLLMAdapter) Generate(ctx context.Context, messages []agentcore.Message, tools []agentcore.ToolSpec, opts ...agentcore.CallOption) (*agentcore.LLMResponse, error) {
+	if l.requestTimeout > 0 {
+		var cancel context.CancelFunc
+		ctx, cancel = context.WithTimeout(ctx, l.requestTimeout)
+		defer cancel()
+	}
 	cfg := l.GetConfig()
 	llmMessages := convertMessages(messages)
 
 	ltReq := &litellm.Request{
-		Model:       l.model,
-		Messages:    llmMessages,
-		Temperature: &cfg.Temperature,
-		MaxTokens:   &cfg.MaxTokens,
-		Extra:       cloneExtra(l.extra),
+		Model:           l.model,
+		Messages:        llmMessages,
+		MaxTokens:       &cfg.MaxTokens,
+		ProviderOptions: litellm.ProviderOptions(cloneExtra(l.extra)),
+	}
+	applySamplingConfig(ltReq, cfg)
+
+	var err error
+	ctx, err = applyCallConfig(ctx, ltReq, opts)
+	if err != nil {
+		return nil, err
+	}
+	if err := applyToolConfig(ltReq, tools); err != nil {
+		return nil, err
 	}
 
-	applyCallConfig(ltReq, opts)
-	applyToolConfig(ltReq, tools)
-
-	ltResp, err := l.client.Chat(ctx, ltReq)
+	ltResp, err := l.client.Chat(ctx, *ltReq)
 	if err != nil {
 		return nil, fmt.Errorf("llm: chat failed: %w", wrapProviderError(err))
 	}
@@ -210,24 +262,42 @@ func (l *LiteLLMAdapter) Generate(ctx context.Context, messages []agentcore.Mess
 }
 
 // GenerateStream produces a streaming response with fine-grained events.
-// Delegates lifecycle detection to litellm's CollectStreamWithCallbacks.
 func (l *LiteLLMAdapter) GenerateStream(ctx context.Context, messages []agentcore.Message, tools []agentcore.ToolSpec, opts ...agentcore.CallOption) (<-chan agentcore.StreamEvent, error) {
+	var cancel context.CancelFunc
+	if l.requestTimeout > 0 {
+		ctx, cancel = context.WithTimeout(ctx, l.requestTimeout)
+	}
 	cfg := l.GetConfig()
 	llmMessages := convertMessages(messages)
 
 	request := &litellm.Request{
-		Model:       l.model,
-		Messages:    llmMessages,
-		Temperature: &cfg.Temperature,
-		MaxTokens:   &cfg.MaxTokens,
-		Extra:       cloneExtra(l.extra),
+		Model:           l.model,
+		Messages:        llmMessages,
+		MaxTokens:       &cfg.MaxTokens,
+		ProviderOptions: litellm.ProviderOptions(cloneExtra(l.extra)),
+	}
+	applySamplingConfig(request, cfg)
+
+	var err error
+	ctx, err = applyCallConfig(ctx, request, opts)
+	if err != nil {
+		if cancel != nil {
+			cancel()
+		}
+		return nil, err
+	}
+	if err := applyToolConfig(request, tools); err != nil {
+		if cancel != nil {
+			cancel()
+		}
+		return nil, err
 	}
 
-	applyCallConfig(request, opts)
-	applyToolConfig(request, tools)
-
-	stream, err := l.client.Stream(ctx, request)
+	stream, err := l.client.Stream(ctx, *request)
 	if err != nil {
+		if cancel != nil {
+			cancel()
+		}
 		return nil, fmt.Errorf("llm: stream failed: %w", wrapProviderError(err))
 	}
 
@@ -236,154 +306,114 @@ func (l *LiteLLMAdapter) GenerateStream(ctx context.Context, messages []agentcor
 	go func() {
 		defer close(eventChan)
 		defer stream.Close()
+		if cancel != nil {
+			defer cancel()
+		}
 
 		var (
 			partial          = agentcore.Message{Role: agentcore.RoleAssistant}
 			textIdx          = -1
 			thinkIdx         = -1
 			toolBlockIndices = make(map[string]int)
+			toolArgs         = make(map[string][]byte)
 		)
 
-		resp, err := litellm.CollectStreamWithCallbacks(stream, litellm.StreamCallbacks{
-			OnReasoningStart: func() {
-				partial.Content = append(partial.Content, agentcore.ThinkingBlock(""))
-				thinkIdx = len(partial.Content) - 1
-				eventChan <- agentcore.StreamEvent{
-					Type:         agentcore.StreamEventThinkingStart,
-					ContentIndex: thinkIdx,
-					Message:      partial,
+		resp, err := litellm.Handle(stream, func(ev litellm.Event) error {
+			switch e := ev.(type) {
+			case litellm.ReasoningDelta:
+				if e.Text == "" {
+					return nil
 				}
-			},
-			OnReasoning: func(content string) {
-				if content == "" {
-					return
+				if thinkIdx < 0 {
+					partial.Content = append(partial.Content, agentcore.ThinkingBlock(""))
+					thinkIdx = len(partial.Content) - 1
+					eventChan <- agentcore.StreamEvent{Type: agentcore.StreamEventThinkingStart, ContentIndex: thinkIdx, Message: partial}
 				}
-				partial.Content[thinkIdx].Thinking += content
-				eventChan <- agentcore.StreamEvent{
-					Type:         agentcore.StreamEventThinkingDelta,
-					ContentIndex: thinkIdx,
-					Delta:        content,
-					Message:      partial,
+				partial.Content[thinkIdx].Thinking += e.Text
+				eventChan <- agentcore.StreamEvent{Type: agentcore.StreamEventThinkingDelta, ContentIndex: thinkIdx, Delta: e.Text, Message: partial}
+			case litellm.ContentDelta:
+				if textIdx < 0 {
+					partial.Content = append(partial.Content, agentcore.TextBlock(""))
+					textIdx = len(partial.Content) - 1
+					eventChan <- agentcore.StreamEvent{Type: agentcore.StreamEventTextStart, ContentIndex: textIdx, Message: partial}
 				}
-			},
-			OnReasoningEnd: func(content string) {
-				eventChan <- agentcore.StreamEvent{
-					Type:         agentcore.StreamEventThinkingEnd,
-					ContentIndex: thinkIdx,
-					Message:      partial,
+				partial.Content[textIdx].Text += e.Text
+				eventChan <- agentcore.StreamEvent{Type: agentcore.StreamEventTextDelta, ContentIndex: textIdx, Delta: e.Text, Message: partial}
+			case litellm.ToolUseStart:
+				key := toolUseEventKey(e.ID, e.ItemID, e.Index, e.OutputIndex)
+				partial.Content = append(partial.Content, agentcore.ToolCallBlock(agentcore.ToolCall{ID: e.ID, Name: e.Name, ThoughtSignature: e.Signature}))
+				idx := len(partial.Content) - 1
+				if key != "" {
+					toolBlockIndices[key] = idx
 				}
-			},
-			OnContentStart: func() {
-				partial.Content = append(partial.Content, agentcore.TextBlock(""))
-				textIdx = len(partial.Content) - 1
-				eventChan <- agentcore.StreamEvent{
-					Type:         agentcore.StreamEventTextStart,
-					ContentIndex: textIdx,
-					Message:      partial,
-				}
-			},
-			OnContent: func(delta string) {
-				partial.Content[textIdx].Text += delta
-				eventChan <- agentcore.StreamEvent{
-					Type:         agentcore.StreamEventTextDelta,
-					ContentIndex: textIdx,
-					Delta:        delta,
-					Message:      partial,
-				}
-			},
-			OnContentEnd: func(content string) {
-				eventChan <- agentcore.StreamEvent{
-					Type:         agentcore.StreamEventTextEnd,
-					ContentIndex: textIdx,
-					Message:      partial,
-				}
-			},
-			OnToolCallStart: func(delta *litellm.ToolCallDelta) {
-				// Append a placeholder ToolCall block to partial so downstream stream
-				// consumers can read the active tool name from partial.ToolCalls()
-				// while arguments are still being streamed. Some providers deliver the
-				// function name later via OnToolCall; that's patched in below.
-				// OnToolCallEnd replaces this placeholder in-place with the completed call.
-				var name, id string
-				if delta != nil {
-					name = delta.FunctionName
-					id = delta.ID
-				}
-				partial.Content = append(partial.Content, agentcore.ToolCallBlock(agentcore.ToolCall{
-					ID:   id,
-					Name: name,
-				}))
-				if id != "" {
-					toolBlockIndices[id] = len(partial.Content) - 1
-				}
-				eventChan <- agentcore.StreamEvent{
-					Type:    agentcore.StreamEventToolCallStart,
-					Message: partial,
-				}
-			},
-			OnToolCall: func(delta *litellm.ToolCallDelta) {
-				if delta == nil {
-					return
-				}
-				toolBlockIdx := findPendingToolCallBlock(partial.Content, toolBlockIndices, delta.ID)
-				if toolBlockIdx >= 0 && delta.FunctionName != "" {
-					if block := partial.Content[toolBlockIdx]; block.ToolCall != nil && block.ToolCall.Name == "" {
-						block.ToolCall.Name = delta.FunctionName
-						partial.Content[toolBlockIdx] = block
+				eventChan <- agentcore.StreamEvent{Type: agentcore.StreamEventToolCallStart, Message: partial}
+			case litellm.ToolUseDelta:
+				key := toolUseEventKey(e.ID, e.ItemID, e.Index, e.OutputIndex)
+				idx := findPendingToolCallBlock(partial.Content, toolBlockIndices, key)
+				if idx >= 0 {
+					block := partial.Content[idx]
+					if block.ToolCall != nil {
+						if e.ID != "" && block.ToolCall.ID == "" {
+							block.ToolCall.ID = e.ID
+						}
+						if e.Signature != "" && block.ToolCall.ThoughtSignature == "" {
+							block.ToolCall.ThoughtSignature = e.Signature
+						}
+						partial.Content[idx] = block
+					}
+					if key != "" {
+						toolBlockIndices[key] = idx
 					}
 				}
-				if toolBlockIdx >= 0 && delta.ID != "" {
-					if block := partial.Content[toolBlockIdx]; block.ToolCall != nil && block.ToolCall.ID == "" {
-						block.ToolCall.ID = delta.ID
-						partial.Content[toolBlockIdx] = block
-					}
-					toolBlockIndices[delta.ID] = toolBlockIdx
+				if len(e.ArgumentsDelta) > 0 {
+					toolArgs[key] = append(toolArgs[key], e.ArgumentsDelta...)
+					eventChan <- agentcore.StreamEvent{Type: agentcore.StreamEventToolCallDelta, Delta: string(e.ArgumentsDelta), Message: partial}
 				}
-				if delta.ArgumentsDelta != "" {
-					eventChan <- agentcore.StreamEvent{
-						Type:    agentcore.StreamEventToolCallDelta,
-						Delta:   delta.ArgumentsDelta,
-						Message: partial,
-					}
+			case litellm.ToolUseDone:
+				key := toolUseEventKey(e.ID, e.ItemID, e.Index, e.OutputIndex)
+				idx := findPendingToolCallBlock(partial.Content, toolBlockIndices, key)
+				var current agentcore.ToolCall
+				if idx >= 0 && partial.Content[idx].ToolCall != nil {
+					current = *partial.Content[idx].ToolCall
 				}
-			},
-			OnToolCallEnd: func(call litellm.ToolCall) {
-				completed := buildToolCall(call.ID, call.Function.Name, call.Function.Arguments, call.ThoughtSignature)
-				idx := findPendingToolCallBlock(partial.Content, toolBlockIndices, call.ID)
+				if current.ID == "" {
+					current.ID = e.ID
+				}
+				args := string(toolArgs[key])
+				completed := buildToolCall(current.ID, current.Name, args, current.ThoughtSignature)
 				if idx >= 0 {
 					partial.Content[idx] = agentcore.ToolCallBlock(completed)
 				} else {
 					partial.Content = append(partial.Content, agentcore.ToolCallBlock(completed))
 					idx = len(partial.Content) - 1
 				}
-				if call.ID != "" {
-					toolBlockIndices[call.ID] = idx
-				}
-				eventChan <- agentcore.StreamEvent{
-					Type:              agentcore.StreamEventToolCallEnd,
-					ContentIndex:      idx,
-					Message:           partial,
-					CompletedToolCall: &completed,
-				}
-			},
+				eventChan <- agentcore.StreamEvent{Type: agentcore.StreamEventToolCallEnd, ContentIndex: idx, Message: partial, CompletedToolCall: &completed}
+			}
+			return nil
 		})
+
+		if textIdx >= 0 {
+			eventChan <- agentcore.StreamEvent{Type: agentcore.StreamEventTextEnd, ContentIndex: textIdx, Message: partial}
+		}
+		if thinkIdx >= 0 {
+			eventChan <- agentcore.StreamEvent{Type: agentcore.StreamEventThinkingEnd, ContentIndex: thinkIdx, Message: partial}
+		}
 
 		if err != nil {
 			eventChan <- agentcore.StreamEvent{Type: agentcore.StreamEventError, Err: wrapProviderError(err)}
 			return
 		}
 
-		// Map usage from collected response.
 		if resp != nil && resp.Usage.HasTokens() {
 			u := resp.Usage
 			provider, model := responseUsageModel(resp)
 			partial.Usage = &agentcore.Usage{
 				Provider:    provider,
 				Model:       model,
-				Input:       u.PromptTokens,
-				Output:      u.CompletionTokens,
-				CacheRead:   u.CacheReadInputTokens,
-				CacheWrite:  u.CacheCreationInputTokens,
+				Input:       u.InputTokens,
+				Output:      u.OutputTokens,
+				CacheRead:   u.CacheReadTokens,
+				CacheWrite:  u.CacheWriteTokens,
 				TotalTokens: u.TotalTokens,
 			}
 			partial.Usage.Cost = CalculateCost(pricingForUsage(l.Info().Pricing, partial.Usage), partial.Usage)
@@ -398,7 +428,7 @@ func (l *LiteLLMAdapter) GenerateStream(ctx context.Context, messages []agentcor
 }
 
 // convertMessages converts agentcore.Message to litellm.Message.
-// Handles multipart content (text + images) via litellm.Contents field.
+// Handles multipart content with ordered litellm Blocks.
 //
 // Drops two classes of assistant turns that strict OpenAI-compatible providers
 // reject with "assistant must provide content, reasoning_content or
@@ -432,31 +462,20 @@ func convertMessages(messages []agentcore.Message) []litellm.Message {
 // isEmptyAssistantMessage reports whether a converted assistant message has
 // no payload that any provider could consume.
 func isEmptyAssistantMessage(m litellm.Message) bool {
-	if m.Content != "" || m.ReasoningContent != "" {
-		return false
-	}
-	if len(m.Contents) > 0 || len(m.ToolCalls) > 0 {
-		return false
-	}
-	return true
+	return len(m.Blocks) == 0
 }
 
 // isReasoningOnlyStopAssistant reports whether an assistant turn carried only
 // internal reasoning and stopped without any externally-visible action.
-// stop_reason=stop signals natural completion; length / toolUse turns may
-// legitimately carry reasoning before truncation or tool dispatch and are
-// preserved.
 func isReasoningOnlyStopAssistant(orig agentcore.Message, converted litellm.Message) bool {
 	if orig.StopReason != agentcore.StopReasonStop {
 		return false
 	}
-	if converted.Content != "" {
+	if len(converted.Blocks) != 1 {
 		return false
 	}
-	if len(converted.Contents) > 0 || len(converted.ToolCalls) > 0 {
-		return false
-	}
-	return converted.ReasoningContent != ""
+	_, ok := converted.Blocks[0].(litellm.ReasoningBlock)
+	return ok
 }
 
 // hasImageContent reports whether any content block is an image.
@@ -471,122 +490,120 @@ func hasImageContent(blocks []agentcore.ContentBlock) bool {
 
 // convertSingleMessage converts one agentcore.Message to litellm.Message.
 func convertSingleMessage(msg agentcore.Message) litellm.Message {
-	llmMsg := litellm.Message{
-		Role: string(msg.Role),
-	}
-
-	// Multipart: if message contains images, use Contents field
-	if hasImageContent(msg.Content) {
-		var parts []litellm.MessageContent
-		for _, b := range msg.Content {
-			switch b.Type {
-			case agentcore.ContentText:
-				parts = append(parts, litellm.TextContent(b.Text))
-			case agentcore.ContentImage:
-				if b.Image != nil {
-					var imgURL string
-					if b.Image.URL != "" {
-						imgURL = b.Image.URL
-					} else {
-						imgURL = "data:" + b.Image.MimeType + ";base64," + b.Image.Data
-					}
-					parts = append(parts, litellm.ImageContent(imgURL))
-				}
-			}
-		}
-		llmMsg.Contents = parts
-	} else {
-		llmMsg.Content = msg.TextContent()
-	}
-
-	// Forward thinking content as reasoning_content for assistant messages.
-	// DeepSeek/GLM/Qwen/Mimo and other reasoning-aware OpenAI-compatible
-	// providers require assistant turns to carry at least one of
-	// content/reasoning_content/tool_calls; preserving thinking here keeps
-	// thinking-only turns valid on replay. Vanilla OpenAI and Anthropic
-	// ignore the field on the request side.
-	if msg.Role == agentcore.RoleAssistant {
-		if thinking := msg.ThinkingContent(); thinking != "" {
-			llmMsg.ReasoningContent = thinking
-		}
-	}
-
-	// Pass cache_control from Metadata for system messages (multi-block prompt caching).
-	if cc, ok := msg.Metadata["cache_control"].(string); ok && cc != "" {
-		llmMsg.CacheControl = &litellm.CacheControl{Type: cc}
-	}
-
+	llmMsg := litellm.Message{Role: litellm.Role(msg.Role)}
+	var blocks []litellm.Block
+	cache := cacheControlFromMetadata(msg.Metadata)
 	if msg.Role == agentcore.RoleTool {
-		if id, ok := msg.Metadata["tool_call_id"].(string); ok {
-			llmMsg.ToolCallID = id
-		}
-		if isErr, ok := msg.Metadata["is_error"].(bool); ok {
-			llmMsg.IsError = isErr
-		}
-		// Convert tool_reference content blocks for tool search results.
-		if hasToolRefBlocks(msg.Content) {
-			llmMsg.Contents = convertToolRefContent(msg.Content)
-			llmMsg.Content = ""
-		}
+		toolCallID, _ := msg.Metadata["tool_call_id"].(string)
+		isError, _ := msg.Metadata["is_error"].(bool)
+		content := convertAgentBlocks(msg.Content, cache)
+		blocks = append(blocks, litellm.ToolResultBlock{ToolUseID: toolCallID, Content: content, IsError: isError, Cache: cache})
+	} else {
+		blocks = convertAgentBlocks(msg.Content, cache)
 	}
+	llmMsg.Blocks = blocks
+	return llmMsg
+}
 
-	toolCalls := msg.ToolCalls()
-	if len(toolCalls) > 0 {
-		llmMsg.ToolCalls = make([]litellm.ToolCall, len(toolCalls))
-		for idx, call := range toolCalls {
-			llmMsg.ToolCalls[idx] = litellm.ToolCall{
-				ID:   call.ID,
-				Type: "function",
-				Function: litellm.FunctionCall{
-					Name:      call.Name,
-					Arguments: string(call.Args),
-				},
-				ThoughtSignature: call.ThoughtSignature,
+func cacheControlFromMetadata(metadata map[string]any) *litellm.CacheControl {
+	value, _ := metadata["cache_control"].(string)
+	if value == "" {
+		return nil
+	}
+	return &litellm.CacheControl{Type: value}
+}
+
+func cloneCacheControl(cache *litellm.CacheControl) *litellm.CacheControl {
+	if cache == nil {
+		return nil
+	}
+	return &litellm.CacheControl{Type: cache.Type, TTL: cache.TTL}
+}
+
+func convertAgentBlocks(content []agentcore.ContentBlock, cache *litellm.CacheControl) []litellm.Block {
+	blocks := make([]litellm.Block, 0, len(content))
+	for _, b := range content {
+		switch b.Type {
+		case agentcore.ContentText:
+			if b.Text != "" {
+				blocks = append(blocks, litellm.TextBlock{Text: b.Text, Cache: cloneCacheControl(cache)})
+			}
+		case agentcore.ContentThinking:
+			if b.Thinking != "" {
+				blocks = append(blocks, litellm.ReasoningBlock{Text: b.Thinking, Cache: cloneCacheControl(cache)})
+			}
+		case agentcore.ContentImage:
+			if b.Image != nil {
+				block := convertImageBlock(*b.Image)
+				block.Cache = cloneCacheControl(cache)
+				blocks = append(blocks, block)
+			}
+		case agentcore.ContentToolCall:
+			if b.ToolCall != nil {
+				blocks = append(blocks, litellm.ToolUseBlock{
+					ID:        b.ToolCall.ID,
+					Name:      b.ToolCall.Name,
+					Arguments: b.ToolCall.Args,
+					Signature: b.ToolCall.ThoughtSignature,
+					Cache:     cloneCacheControl(cache),
+				})
+			}
+		case agentcore.ContentToolRef:
+			if b.ToolName != "" {
+				blocks = append(blocks, litellm.ToolReferenceBlock{ToolName: b.ToolName, Cache: cloneCacheControl(cache)})
 			}
 		}
 	}
+	return blocks
+}
 
-	return llmMsg
+func convertImageBlock(img agentcore.ImageData) litellm.ImageBlock {
+	if img.URL != "" {
+		return litellm.ImageBlock{URL: img.URL, MIME: img.MimeType}
+	}
+	return litellm.ImageBlock{Data: []byte(img.Data), MIME: img.MimeType}
 }
 
 // convertResponse converts litellm.Response to agentcore.Message with content blocks.
 func convertResponse(response *litellm.Response) agentcore.Message {
 	var content []agentcore.ContentBlock
-
-	// Thinking/reasoning content
-	if response.ReasoningContent != "" {
-		content = append(content, agentcore.ThinkingBlock(response.ReasoningContent))
+	if response != nil {
+		for _, block := range response.Blocks {
+			switch b := block.(type) {
+			case litellm.TextBlock:
+				content = append(content, agentcore.TextBlock(b.Text))
+			case litellm.ReasoningBlock:
+				if b.Text != "" {
+					content = append(content, agentcore.ThinkingBlock(b.Text))
+				}
+			case litellm.ToolUseBlock:
+				content = append(content, agentcore.ToolCallBlock(buildToolCall(b.ID, b.Name, string(b.Arguments), b.Signature)))
+			}
+		}
 	}
 
-	// Text content
-	if response.Content != "" {
-		content = append(content, agentcore.TextBlock(response.Content))
-	}
-
-	// Tool calls
-	for _, call := range response.ToolCalls {
-		content = append(content, agentcore.ToolCallBlock(buildToolCall(call.ID, call.Function.Name, call.Function.Arguments, call.ThoughtSignature)))
-	}
-
-	// Map usage
 	var usage *agentcore.Usage
-	if response.Usage.HasTokens() {
+	if response != nil && response.Usage.HasTokens() {
 		provider, model := responseUsageModel(response)
 		usage = &agentcore.Usage{
 			Provider:    provider,
 			Model:       model,
-			Input:       response.Usage.PromptTokens,
-			Output:      response.Usage.CompletionTokens,
-			CacheRead:   response.Usage.CacheReadInputTokens,
-			CacheWrite:  response.Usage.CacheCreationInputTokens,
+			Input:       response.Usage.InputTokens,
+			Output:      response.Usage.OutputTokens,
+			CacheRead:   response.Usage.CacheReadTokens,
+			CacheWrite:  response.Usage.CacheWriteTokens,
 			TotalTokens: response.Usage.TotalTokens,
 		}
 	}
 
+	finish := agentcore.StopReasonStop
+	if response != nil {
+		finish = mapStopReason(response.FinishReason)
+	}
 	return agentcore.Message{
 		Role:       agentcore.RoleAssistant,
 		Content:    content,
-		StopReason: mapStopReason(response.FinishReason),
+		StopReason: finish,
 		Usage:      usage,
 	}
 }
@@ -607,25 +624,13 @@ func responseUsageModel(response *litellm.Response) (provider, model string) {
 }
 
 func pricingForUsage(fallback *ModelPricing, usage *agentcore.Usage) *ModelPricing {
-	if usage == nil || usage.Model == "" {
-		return fallback
-	}
-	pricing, ok := litellm.GetModelPricing(usage.Model)
-	if !ok {
-		return fallback
-	}
-	return &ModelPricing{
-		InputPerToken:      pricing.InputCostPerToken,
-		OutputPerToken:     pricing.OutputCostPerToken,
-		CacheReadPerToken:  pricing.CacheReadCostPerToken,
-		CacheWritePerToken: pricing.CacheWriteCostPerToken,
-	}
+	return fallback
 }
 
 // mapStopReason maps litellm canonical FinishReason to agentcore StopReason.
-func mapStopReason(reason string) agentcore.StopReason {
+func mapStopReason(reason litellm.FinishReason) agentcore.StopReason {
 	switch reason {
-	case litellm.FinishReasonStop, "":
+	case litellm.FinishReasonStop, litellm.FinishReason(""):
 		return agentcore.StopReasonStop
 	case litellm.FinishReasonLength:
 		return agentcore.StopReasonLength
@@ -634,125 +639,249 @@ func mapStopReason(reason string) agentcore.StopReason {
 	case litellm.FinishReasonError:
 		return agentcore.StopReasonError
 	default:
-		return agentcore.StopReason(reason)
+		return agentcore.StopReason(string(reason))
+	}
+}
+
+type apiKeyOverrideKey struct{}
+
+func contextWithAPIKey(ctx context.Context, key string) context.Context {
+	if key == "" {
+		return ctx
+	}
+	return context.WithValue(ctx, apiKeyOverrideKey{}, key)
+}
+
+func apiKeyFunc(defaultKey string) func(context.Context) (string, error) {
+	return func(ctx context.Context) (string, error) {
+		if key, ok := ctx.Value(apiKeyOverrideKey{}).(string); ok && key != "" {
+			return key, nil
+		}
+		return defaultKey, nil
+	}
+}
+
+func applySamplingConfig(req *litellm.Request, cfg *GenerationConfig) {
+	if req == nil || cfg == nil {
+		return
+	}
+	if cfg.Temperature != DefaultGenerationConfig.Temperature {
+		req.Temperature = &cfg.Temperature
 	}
 }
 
 // applyCallConfig resolves CallOptions once and applies API key, thinking,
 // session config, and response format to the litellm request.
-func applyCallConfig(req *litellm.Request, opts []agentcore.CallOption) {
+func applyCallConfig(ctx context.Context, req *litellm.Request, opts []agentcore.CallOption) (context.Context, error) {
 	callCfg := agentcore.ResolveCallConfig(opts)
+	ctx = contextWithAPIKey(ctx, callCfg.APIKey)
 
-	// Per-request API key override
-	if callCfg.APIKey != "" {
-		req.APIKey = callCfg.APIKey
-	}
-
-	// Thinking level + budget
-	// Anthropic requires temperature=1 when thinking is enabled.
+	// Thinking level + budget.
+	// Anthropic budget-token thinking requires temperature=1.
 	switch callCfg.ThinkingLevel {
 	case "":
 		// Leave unspecified to allow model/provider defaults.
 	case agentcore.ThinkingOff:
-		req.Thinking = litellm.NewThinkingDisabled()
+		req.Thinking = &litellm.Thinking{Mode: litellm.ThinkingDisabled}
 	default:
-		req.Thinking = litellm.NewThinkingWithLevel(string(callCfg.ThinkingLevel))
+		req.Thinking = &litellm.Thinking{Mode: litellm.ThinkingEnabled, Effort: string(callCfg.ThinkingLevel)}
 		if callCfg.ThinkingBudget > 0 {
 			req.Thinking.BudgetTokens = &callCfg.ThinkingBudget
 		}
-		t := 1.0
-		req.Temperature = &t
+		// Each provider owns its thinking-time sampling constraint: Anthropic
+		// wants temperature=1 (omitting it defaults to 1), while mimo forbids a
+		// custom temperature/top_p entirely. Clear the injected default and let
+		// the provider decide instead of forcing an Anthropic-specific value.
+		req.Temperature = nil
 	}
 
-	// Session ID for provider caching
 	if callCfg.SessionID != "" {
-		if req.Extra == nil {
-			req.Extra = make(map[string]any)
+		if req.ProviderOptions == nil {
+			req.ProviderOptions = make(litellm.ProviderOptions)
 		}
-		req.Extra["session_id"] = callCfg.SessionID
+		req.ProviderOptions["session_id"] = callCfg.SessionID
 	}
 
-	// Per-request max tokens override
 	if callCfg.MaxTokens > 0 {
 		req.MaxTokens = &callCfg.MaxTokens
 	}
 
-	// Tool choice: "auto" / "required" / "none"
 	if callCfg.ToolChoice != nil {
 		req.ToolChoice = callCfg.ToolChoice
 	}
 
 	if callCfg.ResponseFormat != nil {
-		req.ResponseFormat = convertResponseFormat(callCfg.ResponseFormat)
+		format, err := convertResponseFormat(callCfg.ResponseFormat)
+		if err != nil {
+			return ctx, err
+		}
+		req.ResponseFormat = format
 	}
+	return ctx, nil
 }
 
-func convertResponseFormat(format *agentcore.ResponseFormat) *litellm.ResponseFormat {
+func convertResponseFormat(format *agentcore.ResponseFormat) (*litellm.ResponseFormat, error) {
 	if format == nil {
-		return nil
+		return nil, nil
 	}
 	out := &litellm.ResponseFormat{
-		Type: format.Type,
+		Type: litellm.ResponseFormatType(format.Type),
 	}
 	if format.JSONSchema != nil {
+		schema, err := litellm.SchemaFrom(format.JSONSchema.Schema)
+		if err != nil {
+			return nil, fmt.Errorf("llm: response format schema: %w", err)
+		}
 		out.JSONSchema = &litellm.JSONSchema{
 			Name:        format.JSONSchema.Name,
 			Description: format.JSONSchema.Description,
-			Schema:      format.JSONSchema.Schema,
-			Strict:      format.JSONSchema.Strict,
+			Schema:      schema,
+			Strict:      strictMode(format.JSONSchema.Strict),
 		}
 	}
-	return out
+	return out, nil
 }
 
-func applyToolConfig(request *litellm.Request, tools []agentcore.ToolSpec) {
+func applyToolConfig(request *litellm.Request, tools []agentcore.ToolSpec) error {
 	if len(tools) == 0 {
-		return
+		return nil
 	}
 	ltTools := make([]litellm.Tool, 0, len(tools))
 	for _, t := range tools {
 		if t.Name == "" {
 			continue
 		}
+		schema, err := litellm.SchemaFrom(t.Parameters)
+		if err != nil {
+			return fmt.Errorf("llm: tool %q schema: %w", t.Name, err)
+		}
 		ltTools = append(ltTools, litellm.Tool{
-			Type: "function",
-			Function: litellm.FunctionDef{
-				Name:        t.Name,
-				Description: t.Description,
-				Parameters:  t.Parameters,
-				Strict:      t.Strict,
-			},
-			DeferLoading: t.DeferLoading,
+			Name:        t.Name,
+			Description: t.Description,
+			Parameters:  schema,
+			Strict:      strictMode(t.Strict),
 		})
 	}
 	request.Tools = ltTools
+	return nil
 }
 
-// hasToolRefBlocks reports whether any content block is a tool_reference.
-func hasToolRefBlocks(blocks []agentcore.ContentBlock) bool {
-	for _, b := range blocks {
-		if b.Type == agentcore.ContentToolRef {
-			return true
-		}
+func strictMode(v *bool) litellm.StrictMode {
+	if v == nil {
+		return litellm.StrictDefault
 	}
-	return false
+	if *v {
+		return litellm.StrictEnabled
+	}
+	return litellm.StrictDisabled
 }
 
-// convertToolRefContent converts agentcore ContentBlocks with tool_reference
-// types into litellm MessageContent for API serialization.
-func convertToolRefContent(blocks []agentcore.ContentBlock) []litellm.MessageContent {
-	var parts []litellm.MessageContent
-	for _, b := range blocks {
-		switch b.Type {
-		case agentcore.ContentText:
-			if b.Text != "" {
-				parts = append(parts, litellm.TextContent(b.Text))
+func newProvider(name string, cfg ProviderConfig) (litellm.Provider, error) {
+	name = strings.ToLower(strings.TrimSpace(name))
+	headers, err := headersFromExtra(cfg.Extra)
+	if err != nil {
+		return nil, err
+	}
+	userAgent := stringFromExtra(cfg.Extra, "user_agent")
+	switch name {
+	case "openai":
+		return openai.New(openai.Config{APIKeyFunc: apiKeyFunc(cfg.APIKey), BaseURL: cfg.BaseURL, Retry: cfg.Retry, Headers: headers, UserAgent: userAgent})
+	case "anthropic":
+		return anthropic.New(anthropic.Config{APIKeyFunc: apiKeyFunc(cfg.APIKey), BaseURL: cfg.BaseURL, Retry: cfg.Retry, Beta: stringFromExtra(cfg.Extra, "anthropic_beta"), Headers: headers, UserAgent: userAgent})
+	case "bedrock":
+		bedrockCfg, err := bedrockConfig(cfg)
+		if err != nil {
+			return nil, err
+		}
+		return bedrock.New(bedrockCfg)
+	case "gemini":
+		return gemini.New(gemini.Config{APIKeyFunc: apiKeyFunc(cfg.APIKey), BaseURL: cfg.BaseURL, Retry: cfg.Retry})
+	case "deepseek":
+		return deepseek.New(compatProviderConfig(cfg, headers, userAgent))
+	case "glm":
+		return glm.New(compatProviderConfig(cfg, headers, userAgent))
+	case "grok":
+		return grok.New(compatProviderConfig(cfg, headers, userAgent))
+	case "minimax":
+		return minimax.New(compatProviderConfig(cfg, headers, userAgent))
+	case "mimo":
+		return mimo.New(compatProviderConfig(cfg, headers, userAgent))
+	case "ollama":
+		return ollama.New(compatProviderConfig(cfg, headers, userAgent))
+	case "openrouter":
+		return openrouter.New(compatProviderConfig(cfg, headers, userAgent))
+	case "qwen":
+		return qwen.New(compatProviderConfig(cfg, headers, userAgent))
+	default:
+		return nil, fmt.Errorf("unknown provider %q", name)
+	}
+}
+
+func compatProviderConfig(cfg ProviderConfig, headers map[string]string, userAgent string) compat.Config {
+	return compat.Config{
+		APIKeyFunc:                  apiKeyFunc(cfg.APIKey),
+		BaseURL:                     cfg.BaseURL,
+		Retry:                       cfg.Retry,
+		Headers:                     headers,
+		UserAgent:                   userAgent,
+		AllowUnknownProviderOptions: true,
+	}
+}
+
+func bedrockConfig(cfg ProviderConfig) (bedrock.Config, error) {
+	accessKeyID := firstStringFromExtra(cfg.Extra, "access_key_id", "aws_access_key_id")
+	secretAccessKey := firstStringFromExtra(cfg.Extra, "secret_access_key", "aws_secret_access_key")
+	if accessKeyID == "" || secretAccessKey == "" {
+		return bedrock.Config{}, fmt.Errorf("bedrock: access_key_id and secret_access_key are required in provider extra")
+	}
+	return bedrock.Config{
+		Region:              firstStringFromExtra(cfg.Extra, "region", "aws_region"),
+		BaseURL:             cfg.BaseURL,
+		ControlPlaneBaseURL: stringFromExtra(cfg.Extra, "control_plane_base_url"),
+		Credentials: bedrock.StaticCredentials(
+			accessKeyID,
+			secretAccessKey,
+			firstStringFromExtra(cfg.Extra, "session_token", "aws_session_token"),
+		),
+		Retry: cfg.Retry,
+	}, nil
+}
+
+func headersFromExtra(extra map[string]any) (map[string]string, error) {
+	raw, ok := extra["headers"]
+	if !ok || raw == nil {
+		return nil, nil
+	}
+	switch h := raw.(type) {
+	case map[string]string:
+		return maps.Clone(h), nil
+	case map[string]any:
+		out := make(map[string]string, len(h))
+		for k, v := range h {
+			s, ok := v.(string)
+			if !ok {
+				return nil, fmt.Errorf("llm: provider header %q must be string", k)
 			}
-		case agentcore.ContentToolRef:
-			parts = append(parts, litellm.ToolRefContent(b.ToolName))
+			out[k] = s
+		}
+		return out, nil
+	default:
+		return nil, fmt.Errorf("llm: provider headers must be map[string]string")
+	}
+}
+
+func stringFromExtra(extra map[string]any, key string) string {
+	v, _ := extra[key].(string)
+	return v
+}
+
+func firstStringFromExtra(extra map[string]any, keys ...string) string {
+	for _, key := range keys {
+		if value := stringFromExtra(extra, key); value != "" {
+			return value
 		}
 	}
-	return parts
+	return ""
 }
 
 // normalizedArgs is the parsed shape of raw LLM tool-call args.
@@ -799,6 +928,21 @@ func buildToolCall(id, name, rawArgs, thoughtSignature string) agentcore.ToolCal
 		ArgsRawText:      n.RawText,
 		ArgsParseError:   n.ParseErr,
 		ThoughtSignature: thoughtSignature,
+	}
+}
+
+func toolUseEventKey(id, itemID string, index, outputIndex *int) string {
+	switch {
+	case id != "":
+		return "id:" + id
+	case itemID != "":
+		return "item:" + itemID
+	case index != nil:
+		return fmt.Sprintf("index:%d", *index)
+	case outputIndex != nil:
+		return fmt.Sprintf("output:%d", *outputIndex)
+	default:
+		return ""
 	}
 }
 

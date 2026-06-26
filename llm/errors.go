@@ -12,9 +12,9 @@ import (
 // providerError adapts a litellm error to the agentcore kernel's
 // provider-agnostic error contract. It lets the kernel read retry and
 // classification facts (agentcore.RetryableError / RetryHinter, and the
-// ErrContextOverflow / ErrProviderStreamIdle sentinels via errors.Is) without
-// importing litellm. Unwrap exposes the original error, so callers that DO
-// know litellm can still match it with errors.As(&litellm.LiteLLMError{}).
+// ErrContextOverflow / ErrProvider* sentinels via errors.Is) without importing
+// litellm. Unwrap exposes the original error, so callers that DO know litellm
+// can still match it with errors.As(&litellm.LiteLLMError{}).
 type providerError struct{ err error }
 
 // wrapProviderError wraps a raw litellm error for kernel consumption. Control
@@ -47,15 +47,32 @@ func (e *providerError) RetryAfter() time.Duration {
 	return 0
 }
 
-// Is maps litellm's category checks onto the kernel's sentinels so the loop
-// can detect overflow and stream-idle with a plain errors.Is. Other targets
-// fall through to the unwrapped litellm error's own matching.
+// Is maps litellm's category checks onto the kernel's sentinels so callers can
+// classify provider failures with a plain errors.Is. Other targets fall through
+// to the unwrapped litellm error's own matching.
 func (e *providerError) Is(target error) bool {
 	switch target {
 	case agentcore.ErrContextOverflow:
 		return litellm.IsContextOverflowError(e.err)
+	case agentcore.ErrProviderRateLimit:
+		return litellm.IsRateLimitError(e.err)
+	case agentcore.ErrProviderQuota:
+		return isQuotaError(e.err)
+	case agentcore.ErrProviderTimeout:
+		return litellm.IsTimeoutError(e.err)
 	case agentcore.ErrProviderStreamIdle:
 		return litellm.IsStreamIdleError(e.err)
+	case agentcore.ErrProviderNetwork:
+		return litellm.IsNetworkError(e.err)
+	case agentcore.ErrProviderAuth:
+		return litellm.IsAuthError(e.err)
+	case agentcore.ErrProviderOverloaded:
+		return litellm.IsOverloadedError(e.err)
 	}
 	return false
+}
+
+func isQuotaError(err error) bool {
+	var e *litellm.LiteLLMError
+	return errors.As(err, &e) && e.Type == litellm.ErrorTypeQuota
 }

@@ -45,10 +45,12 @@ var (
 // an error chain, or match directly with errors.Is.
 var (
 	ErrProviderRateLimit  = errors.New("provider rate limit")
+	ErrProviderQuota      = errors.New("provider quota exhausted")
 	ErrProviderTimeout    = errors.New("provider timeout")
 	ErrProviderStreamIdle = errors.New("provider stream idle")
 	ErrProviderNetwork    = errors.New("provider network")
 	ErrProviderAuth       = errors.New("provider auth")
+	ErrProviderOverloaded = errors.New("provider overloaded")
 )
 
 // RetryableError when implemented by an error in the chain, tells the loop
@@ -157,8 +159,9 @@ func IsContextOverflow(err error) bool {
 
 // ErrorKind returns a stable, log-friendly label for err: "canceled",
 // "stop_guard", "max_turns", "context_overflow", "stream_partial",
-// "tool_validation", "stream_idle", "rate_limit", "timeout", "auth",
-// "network". Returns "" for nil and "unknown" when nothing matches.
+// "tool_validation", "stream_idle", "quota", "rate_limit", "timeout",
+// "auth", "network", "overloaded". Returns "" for nil and "unknown" when
+// nothing matches.
 //
 // Labels are part of the public API contract — they will not change between
 // minor versions, so harnesses can key alert routing and log filters on them
@@ -184,6 +187,8 @@ func ErrorKind(err error) string {
 	switch classifyProviderSentinel(err) {
 	case ErrProviderStreamIdle:
 		return "stream_idle"
+	case ErrProviderQuota:
+		return "quota"
 	case ErrProviderRateLimit:
 		return "rate_limit"
 	case ErrProviderTimeout:
@@ -192,6 +197,8 @@ func ErrorKind(err error) string {
 		return "auth"
 	case ErrProviderNetwork:
 		return "network"
+	case ErrProviderOverloaded:
+		return "overloaded"
 	}
 	return "unknown"
 }
@@ -233,6 +240,12 @@ func classifyProviderSentinel(err error) error {
 	if errors.Is(err, ErrProviderStreamIdle) {
 		return ErrProviderStreamIdle
 	}
+	if errors.Is(err, ErrProviderQuota) {
+		return ErrProviderQuota
+	}
+	if errors.Is(err, ErrProviderOverloaded) {
+		return ErrProviderOverloaded
+	}
 	if errors.Is(err, context.DeadlineExceeded) {
 		return ErrProviderTimeout
 	}
@@ -241,6 +254,8 @@ func classifyProviderSentinel(err error) error {
 	switch {
 	case strings.Contains(msg, streamIdleMsgPattern):
 		return ErrProviderStreamIdle
+	case containsAny(msg, "insufficient_quota", "quota exceeded", "quota exhausted", "usage_limit_reached", "usage limit"):
+		return ErrProviderQuota
 	case containsAny(msg, "rate limit", "too many requests", "429"):
 		return ErrProviderRateLimit
 	case containsAny(msg, "deadline exceeded", "timeout", "timed out"):
@@ -249,6 +264,8 @@ func classifyProviderSentinel(err error) error {
 		return ErrProviderAuth
 	case containsAny(msg, "connection refused", "connection reset", "no such host", "dial tcp", "tls handshake timeout", "server misbehaving", "broken pipe", "eof"):
 		return ErrProviderNetwork
+	case containsAny(msg, "overloaded", "over capacity", "529"):
+		return ErrProviderOverloaded
 	}
 	return nil
 }
@@ -265,12 +282,13 @@ func IsFailoverEligible(err error) bool {
 	return errors.Is(classified, ErrProviderRateLimit) ||
 		errors.Is(classified, ErrProviderTimeout) ||
 		errors.Is(classified, ErrProviderNetwork) ||
-		errors.Is(classified, ErrProviderStreamIdle)
+		errors.Is(classified, ErrProviderStreamIdle) ||
+		errors.Is(classified, ErrProviderOverloaded)
 }
 
 // FailoverReason returns a stable short label ("rate_limit" / "timeout" /
-// "stream_idle" / "network") suitable for structured logging. Returns "" when
-// err is not failover-eligible.
+// "stream_idle" / "network" / "overloaded") suitable for structured logging.
+// Returns "" when err is not failover-eligible.
 func FailoverReason(err error) string {
 	if err == nil {
 		return ""
@@ -285,6 +303,8 @@ func FailoverReason(err error) string {
 		return "timeout"
 	case errors.Is(classified, ErrProviderNetwork):
 		return "network"
+	case errors.Is(classified, ErrProviderOverloaded):
+		return "overloaded"
 	}
 	return ""
 }

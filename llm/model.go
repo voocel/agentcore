@@ -92,7 +92,23 @@ func NewBaseModel(info ModelInfo, config *GenerationConfig) *BaseModel {
 	if config == nil {
 		config = DefaultGenerationConfig
 	}
+	config = cloneGenerationConfig(config)
 	return &BaseModel{info: info, config: config}
+}
+
+func cloneGenerationConfig(config *GenerationConfig) *GenerationConfig {
+	if config == nil {
+		return nil
+	}
+	out := *config
+	if config.StopSequences != nil {
+		out.StopSequences = append([]string(nil), config.StopSequences...)
+	}
+	if config.Seed != nil {
+		seed := *config.Seed
+		out.Seed = &seed
+	}
+	return &out
 }
 
 func (m *BaseModel) Info() ModelInfo              { return m.info }
