@@ -50,6 +50,7 @@ func (p ThinkingPolicy) Allows(level agentcore.ThinkingLevel) bool {
 }
 
 func (p ThinkingPolicy) Resolve(level agentcore.ThinkingLevel) (agentcore.ThinkingLevel, bool) {
+	level = agentcore.NormalizeThinkingLevel(level)
 	if p.Allows(level) {
 		return level, true
 	}

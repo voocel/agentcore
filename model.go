@@ -219,7 +219,7 @@ func ResolveCallConfig(opts []CallOption) CallConfig {
 
 // WithThinking sets the thinking level for a single LLM call.
 func WithThinking(level ThinkingLevel) CallOption {
-	return func(c *CallConfig) { c.ThinkingLevel = level }
+	return func(c *CallConfig) { c.ThinkingLevel = NormalizeThinkingLevel(level) }
 }
 
 // WithThinkingBudget sets the max thinking tokens for a single LLM call.

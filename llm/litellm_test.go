@@ -58,6 +58,21 @@ func TestLiteLLMAdapterSendsNonDefaultTemperature(t *testing.T) {
 	}
 }
 
+func TestLiteLLMAdapterTreatsAutoThinkingAsUnspecified(t *testing.T) {
+	provider := &captureProvider{}
+	model := NewLiteLLMAdapter("m", mustClient(t, provider))
+	_, err := model.Generate(context.Background(), []agentcore.Message{agentcore.UserMsg("hi")}, nil, agentcore.WithThinking("auto"))
+	if err != nil {
+		t.Fatalf("Generate: %v", err)
+	}
+	if provider.lastReq == nil {
+		t.Fatal("provider was not called")
+	}
+	if provider.lastReq.Thinking != nil {
+		t.Fatalf("auto thinking should be omitted, got %#v", provider.lastReq.Thinking)
+	}
+}
+
 func TestNewBaseModelClonesDefaultConfig(t *testing.T) {
 	a := NewBaseModel(ModelInfo{Name: "a"}, nil)
 	b := NewBaseModel(ModelInfo{Name: "b"}, nil)

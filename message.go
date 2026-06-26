@@ -171,6 +171,8 @@ func (u *Usage) Add(other *Usage) {
 type ThinkingLevel string
 
 const (
+	// ThinkingAuto leaves thinking/reasoning behavior to the provider/model default.
+	ThinkingAuto    ThinkingLevel = ""
 	ThinkingOff     ThinkingLevel = "off"
 	ThinkingMinimal ThinkingLevel = "minimal"
 	ThinkingLow     ThinkingLevel = "low"
@@ -179,6 +181,16 @@ const (
 	ThinkingXHigh   ThinkingLevel = "xhigh"
 	ThinkingMax     ThinkingLevel = "max"
 )
+
+// NormalizeThinkingLevel returns the canonical level used internally.
+// Empty and "auto" both mean "do not send a thinking override".
+func NormalizeThinkingLevel(level ThinkingLevel) ThinkingLevel {
+	level = ThinkingLevel(strings.ToLower(strings.TrimSpace(string(level))))
+	if level == "auto" {
+		return ThinkingAuto
+	}
+	return level
+}
 
 // ---------------------------------------------------------------------------
 // Messages

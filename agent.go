@@ -560,7 +560,7 @@ func (a *Agent) SetTools(tools ...Tool) {
 func (a *Agent) SetThinkingLevel(level ThinkingLevel) {
 	a.mu.Lock()
 	defer a.mu.Unlock()
-	a.thinkingLevel = level
+	a.thinkingLevel = NormalizeThinkingLevel(level)
 }
 
 // ClearSteeringQueue removes all queued steering messages.

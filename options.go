@@ -58,7 +58,7 @@ func WithAbortMarkerText(inference, toolUse string) AgentOption {
 
 // WithThinkingLevel sets the reasoning depth for models that support it.
 func WithThinkingLevel(level ThinkingLevel) AgentOption {
-	return func(a *Agent) { a.thinkingLevel = level }
+	return func(a *Agent) { a.thinkingLevel = NormalizeThinkingLevel(level) }
 }
 
 // WithCacheLastMessage tags the last non-system message with cache_control
