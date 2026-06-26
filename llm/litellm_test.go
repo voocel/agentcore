@@ -250,3 +250,57 @@ func TestGenerateStreamFinalizesArglessToolCall(t *testing.T) {
 		t.Fatalf("argless tool call args = %q, want {}", string(tc.Args))
 	}
 }
+
+func TestGenerateStreamMarksMalformedToolArgumentsInvalid(t *testing.T) {
+	sse := strings.Join([]string{
+		`data: {"choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"id":"call_bad","function":{"name":"subagent","arguments":"{\"agent\":\"writer\","}}]}}]}`,
+		`data: {"choices":[{"index":0,"delta":{},"finish_reason":"tool_calls"}]}`,
+		`data: [DONE]`,
+		``,
+	}, "\n")
+	provider, err := compat.New(compat.Config{
+		BaseURL: "https://compat.test/v1",
+		HTTPClient: roundTripFunc(func(*http.Request) (*http.Response, error) {
+			return &http.Response{
+				StatusCode: http.StatusOK,
+				Body:       io.NopCloser(strings.NewReader(sse)),
+				Header:     make(http.Header),
+			}, nil
+		}),
+	}, compat.Spec{Name: "compat"})
+	if err != nil {
+		t.Fatalf("compat.New: %v", err)
+	}
+	model := NewLiteLLMAdapter("deepseek-v4-flash-free", mustClient(t, provider))
+	ch, err := model.GenerateStream(context.Background(), []agentcore.Message{agentcore.UserMsg("hi")}, nil)
+	if err != nil {
+		t.Fatalf("GenerateStream: %v", err)
+	}
+	var final agentcore.Message
+	for ev := range ch {
+		if ev.Type == agentcore.StreamEventError {
+			t.Fatalf("stream error: %v", ev.Err)
+		}
+		if ev.Type == agentcore.StreamEventDone {
+			final = ev.Message
+		}
+	}
+	var tc *agentcore.ToolCall
+	for _, b := range final.Content {
+		if b.ToolCall != nil {
+			tc = b.ToolCall
+		}
+	}
+	if tc == nil {
+		t.Fatal("no tool call in final message")
+	}
+	if !tc.ArgsInvalid {
+		t.Fatalf("ArgsInvalid = false, tool call = %+v", tc)
+	}
+	if got := string(tc.Args); got != "{}" {
+		t.Fatalf("args = %q, want {}", got)
+	}
+	if tc.ArgsRawText == "" || tc.ArgsParseError == "" {
+		t.Fatalf("missing malformed args diagnostics: %+v", tc)
+	}
+}
