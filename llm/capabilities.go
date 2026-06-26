@@ -166,3 +166,7 @@ func fromLiteLLMThinkingEfforts(efforts []string) []agentcore.ThinkingLevel {
 	}
 	return out
 }
+
+func (c Capabilities) ThinkingPolicy() ThinkingPolicy {
+	return ThinkingPolicyFromCapabilities(c)
+}
