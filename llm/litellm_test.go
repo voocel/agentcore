@@ -2,6 +2,7 @@ package llm
 
 import (
 	"context"
+	"encoding/json"
 	"io"
 	"net/http"
 	"strings"
@@ -26,6 +27,46 @@ func (p *captureProvider) Chat(_ context.Context, req *litellm.Request) (*litell
 func (p *captureProvider) Stream(context.Context, *litellm.Request) (litellm.Stream, error) {
 	return nil, nil
 }
+
+type captureStreamProvider struct {
+	lastReq *litellm.Request
+	events  []litellm.Event
+}
+
+func (p *captureStreamProvider) Name() string { return "capture" }
+
+func (p *captureStreamProvider) Chat(context.Context, *litellm.Request) (*litellm.Response, error) {
+	return nil, nil
+}
+
+func (p *captureStreamProvider) Stream(_ context.Context, req *litellm.Request) (litellm.Stream, error) {
+	p.lastReq = req
+	events := p.events
+	if len(events) == 0 {
+		events = []litellm.Event{
+			litellm.ContentDelta{Text: "ok"},
+			litellm.DoneEvent{FinishReason: litellm.FinishReasonStop, Provider: "capture", Model: req.Model},
+		}
+	}
+	return &staticStream{
+		events: events,
+	}, nil
+}
+
+type staticStream struct {
+	events []litellm.Event
+}
+
+func (s *staticStream) Next() (litellm.Event, error) {
+	if len(s.events) == 0 {
+		return nil, io.EOF
+	}
+	ev := s.events[0]
+	s.events = s.events[1:]
+	return ev, nil
+}
+
+func (s *staticStream) Close() error { return nil }
 
 func TestLiteLLMAdapterOmitsDefaultTemperature(t *testing.T) {
 	provider := &captureProvider{}
@@ -302,5 +343,86 @@ func TestGenerateStreamMarksMalformedToolArgumentsInvalid(t *testing.T) {
 	}
 	if tc.ArgsRawText == "" || tc.ArgsParseError == "" {
 		t.Fatalf("missing malformed args diagnostics: %+v", tc)
+	}
+}
+
+func TestGenerateStreamNormalizesMalformedHistoricalToolArguments(t *testing.T) {
+	provider := &captureStreamProvider{}
+	model := NewLiteLLMAdapter("m", mustClient(t, provider))
+	msgs := []agentcore.Message{
+		agentcore.UserMsg("hi"),
+		{
+			Role: agentcore.RoleAssistant,
+			Content: []agentcore.ContentBlock{
+				agentcore.ToolCallBlock(agentcore.ToolCall{
+					ID:   "call_bad",
+					Name: "subagent",
+					Args: json.RawMessage(`{"agent":"writer",`),
+				}),
+			},
+		},
+		agentcore.ToolResultMsg("call_bad", json.RawMessage(`"invalid subagent params: unexpected end of JSON input"`), true),
+		agentcore.UserMsg("continue"),
+	}
+
+	ch, err := model.GenerateStream(context.Background(), msgs, nil)
+	if err != nil {
+		t.Fatalf("GenerateStream rejected malformed historical args: %v", err)
+	}
+	for range ch {
+	}
+
+	if provider.lastReq == nil {
+		t.Fatal("provider was not called")
+	}
+	assistant := provider.lastReq.Messages[1]
+	if len(assistant.Blocks) != 1 {
+		t.Fatalf("assistant block count = %d, want 1", len(assistant.Blocks))
+	}
+	call, ok := assistant.Blocks[0].(litellm.ToolUseBlock)
+	if !ok {
+		t.Fatalf("assistant block = %T, want ToolUseBlock", assistant.Blocks[0])
+	}
+	if got := string(call.Arguments); got != "{}" {
+		t.Fatalf("historical args = %q, want {}", got)
+	}
+}
+
+func TestGenerateStreamFinalMessageNormalizesToolArgumentsWithoutDoneEvent(t *testing.T) {
+	provider := &captureStreamProvider{
+		events: []litellm.Event{
+			litellm.ToolUseStart{ID: "call_bad", Name: "subagent"},
+			litellm.ToolUseDelta{ID: "call_bad", ArgumentsDelta: []byte(`{"agent":"writer",`)},
+			litellm.DoneEvent{FinishReason: litellm.FinishReasonToolCall, Provider: "capture", Model: "m"},
+		},
+	}
+	model := NewLiteLLMAdapter("m", mustClient(t, provider))
+	ch, err := model.GenerateStream(context.Background(), []agentcore.Message{agentcore.UserMsg("hi")}, nil)
+	if err != nil {
+		t.Fatalf("GenerateStream: %v", err)
+	}
+
+	var final agentcore.Message
+	for ev := range ch {
+		if ev.Type == agentcore.StreamEventError {
+			t.Fatalf("stream error: %v", ev.Err)
+		}
+		if ev.Type == agentcore.StreamEventDone {
+			final = ev.Message
+		}
+	}
+
+	calls := final.ToolCalls()
+	if len(calls) != 1 {
+		t.Fatalf("tool call count = %d, want 1", len(calls))
+	}
+	if !calls[0].ArgsInvalid {
+		t.Fatalf("ArgsInvalid = false, call = %+v", calls[0])
+	}
+	if got := string(calls[0].Args); got != "{}" {
+		t.Fatalf("args = %q, want {}", got)
+	}
+	if calls[0].ArgsRawText == "" || calls[0].ArgsParseError == "" {
+		t.Fatalf("missing malformed args diagnostics: %+v", calls[0])
 	}
 }

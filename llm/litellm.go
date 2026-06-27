@@ -423,6 +423,7 @@ func (l *LiteLLMAdapter) GenerateStream(ctx context.Context, messages []agentcor
 			return
 		}
 
+		partial.Content = finalizePendingStreamToolCalls(partial.Content, toolBlockIndices, toolArgs)
 		if resp != nil && resp.Usage.HasTokens() {
 			u := resp.Usage
 			provider, model := responseUsageModel(resp)
@@ -444,6 +445,25 @@ func (l *LiteLLMAdapter) GenerateStream(ctx context.Context, messages []agentcor
 	}()
 
 	return eventChan, nil
+}
+
+func finalizePendingStreamToolCalls(content []agentcore.ContentBlock, indices map[string]int, argsByKey map[string][]byte) []agentcore.ContentBlock {
+	if len(indices) == 0 {
+		return content
+	}
+	for key, idx := range indices {
+		if idx < 0 || idx >= len(content) {
+			continue
+		}
+		block := content[idx]
+		if block.ToolCall == nil || len(block.ToolCall.Args) > 0 {
+			continue
+		}
+		tc := *block.ToolCall
+		completed := buildToolCall(tc.ID, tc.Name, string(argsByKey[key]), tc.ThoughtSignature)
+		content[idx] = agentcore.ToolCallBlock(completed)
+	}
+	return content
 }
 
 // convertMessages converts agentcore.Message to litellm.Message.
@@ -559,11 +579,12 @@ func convertAgentBlocks(content []agentcore.ContentBlock, cache *litellm.CacheCo
 			}
 		case agentcore.ContentToolCall:
 			if b.ToolCall != nil {
+				tc := sanitizeOutgoingToolCall(*b.ToolCall)
 				blocks = append(blocks, litellm.ToolUseBlock{
-					ID:        b.ToolCall.ID,
-					Name:      b.ToolCall.Name,
-					Arguments: b.ToolCall.Args,
-					Signature: b.ToolCall.ThoughtSignature,
+					ID:        tc.ID,
+					Name:      tc.Name,
+					Arguments: tc.Args,
+					Signature: tc.ThoughtSignature,
 					Cache:     cloneCacheControl(cache),
 				})
 			}
@@ -576,6 +597,28 @@ func convertAgentBlocks(content []agentcore.ContentBlock, cache *litellm.CacheCo
 	return blocks
 }
 
+func sanitizeOutgoingToolCall(tc agentcore.ToolCall) agentcore.ToolCall {
+	if len(tc.Args) > 0 && json.Valid(tc.Args) {
+		return tc
+	}
+	raw := string(tc.Args)
+	if raw == "" {
+		raw = tc.ArgsRawText
+	}
+	n := normalizeArgs(raw)
+	tc.Args = n.Args
+	if n.Invalid {
+		tc.ArgsInvalid = true
+		if tc.ArgsRawText == "" {
+			tc.ArgsRawText = n.RawText
+		}
+		if tc.ArgsParseError == "" {
+			tc.ArgsParseError = n.ParseErr
+		}
+	}
+	return tc
+}
+
 func convertImageBlock(img agentcore.ImageData) litellm.ImageBlock {
 	if img.URL != "" {
 		return litellm.ImageBlock{URL: img.URL, MIME: img.MimeType}
@@ -585,21 +628,7 @@ func convertImageBlock(img agentcore.ImageData) litellm.ImageBlock {
 
 // convertResponse converts litellm.Response to agentcore.Message with content blocks.
 func convertResponse(response *litellm.Response) agentcore.Message {
-	var content []agentcore.ContentBlock
-	if response != nil {
-		for _, block := range response.Blocks {
-			switch b := block.(type) {
-			case litellm.TextBlock:
-				content = append(content, agentcore.TextBlock(b.Text))
-			case litellm.ReasoningBlock:
-				if b.Text != "" {
-					content = append(content, agentcore.ThinkingBlock(b.Text))
-				}
-			case litellm.ToolUseBlock:
-				content = append(content, agentcore.ToolCallBlock(buildToolCall(b.ID, b.Name, string(b.Arguments), b.Signature)))
-			}
-		}
-	}
+	content := convertResponseContent(response)
 
 	var usage *agentcore.Usage
 	if response != nil && response.Usage.HasTokens() {
@@ -625,6 +654,26 @@ func convertResponse(response *litellm.Response) agentcore.Message {
 		StopReason: finish,
 		Usage:      usage,
 	}
+}
+
+func convertResponseContent(response *litellm.Response) []agentcore.ContentBlock {
+	if response == nil {
+		return nil
+	}
+	var content []agentcore.ContentBlock
+	for _, block := range response.Blocks {
+		switch b := block.(type) {
+		case litellm.TextBlock:
+			content = append(content, agentcore.TextBlock(b.Text))
+		case litellm.ReasoningBlock:
+			if b.Text != "" {
+				content = append(content, agentcore.ThinkingBlock(b.Text))
+			}
+		case litellm.ToolUseBlock:
+			content = append(content, agentcore.ToolCallBlock(buildToolCall(b.ID, b.Name, string(b.Arguments), b.Signature)))
+		}
+	}
+	return content
 }
 
 func responseUsageModel(response *litellm.Response) (provider, model string) {
