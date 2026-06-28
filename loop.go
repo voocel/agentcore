@@ -272,7 +272,7 @@ func runLoop(ctx context.Context, currentCtx *AgentContext, newMessages *[]Agent
 					sink.emit(Event{Type: EventAgentEnd, NewMessages: *newMessages, Summary: buildSummary(turnCount, EndReasonAborted)})
 					return
 				}
-				sink.emitError(fmt.Errorf("llm call failed: %w", err), buildSummary(turnCount, EndReasonError))
+				sink.emitError(err, buildSummary(turnCount, EndReasonError))
 				return
 			}
 
@@ -737,7 +737,7 @@ func markLastMessageForCache(messages []Message, cacheControl string) []Message 
 func callLLMStream(ctx context.Context, model ChatModel, messages []Message, tools []ToolSpec, opts []CallOption, sink eventSink, hooks llmCallHooks) (Message, llmCallInfo, error) {
 	streamCh, err := model.GenerateStream(ctx, messages, tools, opts...)
 	if err != nil {
-		return Message{}, llmCallInfo{}, fmt.Errorf("stream init failed: %w", err)
+		return Message{}, llmCallInfo{}, err
 	}
 
 	var (

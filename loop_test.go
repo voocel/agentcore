@@ -1525,7 +1525,7 @@ func TestMarkLastMessageForCache_TagsLastNonSystemMessage(t *testing.T) {
 		{
 			name:      "user input",
 			lastRole:  RoleUser,
-			buildLast: func() Message { return UserMsg("改一下登录") },
+			buildLast: func() Message { return UserMsg("Change the login flow") },
 		},
 		{
 			name:      "tool result",
@@ -1633,8 +1633,8 @@ func TestCallLLMStream_StreamInitErrorBubbles(t *testing.T) {
 	if err == nil {
 		t.Fatal("expected stream init error, got nil")
 	}
-	if !strings.Contains(err.Error(), "stream init failed") || !strings.Contains(err.Error(), "provider unavailable") {
-		t.Fatalf("expected wrapped stream init error, got %v", err)
+	if err.Error() != "provider unavailable" {
+		t.Fatalf("expected original stream init error, got %v", err)
 	}
 	for ev := range events {
 		if ev.Type == EventMessageStart || ev.Type == EventMessageEnd {

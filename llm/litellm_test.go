@@ -14,13 +14,17 @@ import (
 )
 
 type captureProvider struct {
-	lastReq *litellm.Request
+	lastReq  *litellm.Request
+	chatFunc func(context.Context, *litellm.Request) (*litellm.Response, error)
 }
 
 func (p *captureProvider) Name() string { return "capture" }
 
-func (p *captureProvider) Chat(_ context.Context, req *litellm.Request) (*litellm.Response, error) {
+func (p *captureProvider) Chat(ctx context.Context, req *litellm.Request) (*litellm.Response, error) {
 	p.lastReq = req
+	if p.chatFunc != nil {
+		return p.chatFunc(ctx, req)
+	}
 	return &litellm.Response{Blocks: []litellm.Block{litellm.TextBlock{Text: "ok"}}}, nil
 }
 
@@ -111,6 +115,39 @@ func TestLiteLLMAdapterTreatsAutoThinkingAsUnspecified(t *testing.T) {
 	}
 	if provider.lastReq.Thinking != nil {
 		t.Fatalf("auto thinking should be omitted, got %#v", provider.lastReq.Thinking)
+	}
+}
+
+func TestGenerateNormalizesMalformedToolArgumentsFromModel(t *testing.T) {
+	provider := &captureProvider{}
+	provider.chatFunc = func(context.Context, *litellm.Request) (*litellm.Response, error) {
+		return &litellm.Response{
+			Provider:     "capture",
+			Model:        "m",
+			FinishReason: litellm.FinishReasonToolCall,
+			Blocks: []litellm.Block{
+				litellm.ToolUseBlock{ID: "call_bad", Name: "lookup", Arguments: json.RawMessage(`{"q":`)},
+			},
+		}, nil
+	}
+	model := NewLiteLLMAdapter("m", mustClient(t, provider))
+
+	resp, err := model.Generate(context.Background(), []agentcore.Message{agentcore.UserMsg("hi")}, nil)
+	if err != nil {
+		t.Fatalf("Generate returned error: %v", err)
+	}
+	calls := resp.Message.ToolCalls()
+	if len(calls) != 1 {
+		t.Fatalf("tool calls len = %d, want 1", len(calls))
+	}
+	if !calls[0].ArgsInvalid {
+		t.Fatalf("ArgsInvalid = false, call = %+v", calls[0])
+	}
+	if got := string(calls[0].Args); got != "{}" {
+		t.Fatalf("args = %q, want {}", got)
+	}
+	if calls[0].ArgsRawText != `{"q":` || calls[0].ArgsParseError == "" {
+		t.Fatalf("missing malformed args diagnostics: %+v", calls[0])
 	}
 }
 
