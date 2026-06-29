@@ -853,7 +853,7 @@ func newProvider(name string, cfg ProviderConfig) (litellm.Provider, error) {
 	userAgent := stringFromExtra(cfg.Extra, "user_agent")
 	switch name {
 	case "openai":
-		return openai.New(openai.Config{APIKeyFunc: apiKeyFunc(cfg.APIKey), BaseURL: cfg.BaseURL, Retry: cfg.Retry, Headers: headers, UserAgent: userAgent})
+		return openai.New(openai.Config{APIKeyFunc: apiKeyFunc(cfg.APIKey), BaseURL: cfg.BaseURL, Retry: cfg.Retry, API: firstStringFromExtra(cfg.Extra, "api", "api_mode"), Headers: headers, UserAgent: userAgent})
 	case "anthropic":
 		return anthropic.New(anthropic.Config{APIKeyFunc: apiKeyFunc(cfg.APIKey), BaseURL: cfg.BaseURL, Retry: cfg.Retry, Beta: stringFromExtra(cfg.Extra, "anthropic_beta"), Headers: headers, UserAgent: userAgent})
 	case "bedrock":
