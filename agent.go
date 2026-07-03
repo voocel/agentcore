@@ -48,6 +48,7 @@ type Agent struct {
 	onMessage            func(AgentMessage)
 	stopGuard            StopGuard
 	cacheLastMessage     string
+	promptCacheKey       string
 
 	// State
 	messages         []AgentMessage
@@ -563,6 +564,17 @@ func (a *Agent) SetThinkingLevel(level ThinkingLevel) {
 	a.thinkingLevel = NormalizeThinkingLevel(level)
 }
 
+// SetPromptCacheKey changes the prompt-cache routing identity at runtime.
+// Takes effect on the next turn. Hosts that reuse one Agent across logical
+// conversations (session switch / reset) must update the key so a new
+// conversation doesn't inherit the previous one's cache lineage. See
+// WithPromptCacheKey for semantics.
+func (a *Agent) SetPromptCacheKey(key string) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	a.promptCacheKey = key
+}
+
 // ClearSteeringQueue removes all queued steering messages.
 func (a *Agent) ClearSteeringQueue() {
 	a.mu.Lock()
@@ -666,6 +678,7 @@ func (a *Agent) buildConfig() LoopConfig {
 		AbortMarkerToolText:   a.abortMarkerToolText,
 		ToolsAreIdempotent:    a.toolsAreIdempotent,
 		CacheLastMessage:      a.cacheLastMessage,
+		PromptCacheKey:        a.promptCacheKey,
 	}
 }
 

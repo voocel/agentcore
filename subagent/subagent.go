@@ -8,6 +8,8 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"maps"
+	"slices"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -73,6 +75,20 @@ type Config struct {
 	ContextManager        agentcore.ContextManager
 	ContextManagerFactory func(model agentcore.ChatModel) agentcore.ContextManager
 	ConvertToLLM          func(msgs []agentcore.AgentMessage) []agentcore.Message
+
+	// CacheLastMessage, when non-empty, tags the last non-system message of
+	// every LLM request in this sub-agent's loop with the given cache_control
+	// value ("ephemeral", or "ephemeral:1h" for extended TTL). Mirrors
+	// agentcore.WithCacheLastMessage for top-level agents; see that option
+	// for placement semantics.
+	CacheLastMessage string
+
+	// PromptCacheKey is the base prompt-cache routing identity for this
+	// sub-agent's LLM requests. Each spawn appends "#<seq>" so every run gets
+	// its own cache lineage — one conversation, one key — which providers
+	// with key-routed prefix caching (OpenAI prompt_cache_key) use to keep a
+	// session's requests on the same cache shard. Empty sends no hint.
+	PromptCacheKey string
 
 	// StopGuardFactory, if non-nil, creates a fresh StopGuard for each run.
 	StopGuardFactory func(agentName, task string) agentcore.StopGuard
@@ -319,9 +335,18 @@ func (t *Tool) SetBgOutputFactory(fn func(taskID, agentName string) (io.WriteClo
 func (t *Tool) Name() string  { return "subagent" }
 func (t *Tool) Label() string { return "Delegate to SubAgent" }
 
+// sortedAgentNames returns registered agent names in deterministic order.
+// Description and Schema are rebuilt on every LLM call; iterating the map
+// directly would shuffle their bytes across requests and defeat provider
+// prefix caching (tools serialize into the cached prompt prefix).
+func (t *Tool) sortedAgentNames() []string {
+	return slices.Sorted(maps.Keys(t.agents))
+}
+
 func (t *Tool) Description() string {
 	names := make([]string, 0, len(t.agents))
-	for _, a := range t.agents {
+	for _, name := range t.sortedAgentNames() {
+		a := t.agents[name]
 		names = append(names, fmt.Sprintf("%s (%s)", a.Name, a.Description))
 	}
 	return fmt.Sprintf(
@@ -335,10 +360,7 @@ func (t *Tool) Description() string {
 }
 
 func (t *Tool) Schema() map[string]any {
-	agentNames := make([]string, 0, len(t.agents))
-	for name := range t.agents {
-		agentNames = append(agentNames, name)
-	}
+	agentNames := t.sortedAgentNames()
 	taskItem := schema.Object(
 		schema.Property("agent", schema.Enum("Agent name", agentNames...)).Required(),
 		schema.Property("task", schema.String("Task description")).Required(),
@@ -744,14 +766,37 @@ func (t *Tool) runAgent(ctx context.Context, agentName, taskStr string, modelOve
 		contextManager = cfg.ContextManagerFactory(runModel)
 	}
 
+	// Mirror NewAgent's auto-wiring: a ContextManager that implements
+	// ContextLLMConverter owns the AgentMessage→Message projection (e.g. to
+	// render summary entries). Without this, DefaultConvertToLLM silently
+	// drops manager-specific message kinds from the LLM request.
+	convertToLLM := cfg.ConvertToLLM
+	if convertToLLM == nil && contextManager != nil {
+		if c, ok := contextManager.(agentcore.ContextLLMConverter); ok {
+			convertToLLM = c.ConvertToLLM
+		}
+	}
+
+	runSeq := t.runSeq.Add(1)
+
+	// One conversation, one cache key: suffix the per-run sequence so each
+	// spawn forms its own cache lineage instead of piling every run of this
+	// agent into a single routing bucket.
+	promptCacheKey := cfg.PromptCacheKey
+	if promptCacheKey != "" {
+		promptCacheKey = fmt.Sprintf("%s#%d", promptCacheKey, runSeq)
+	}
+
 	loopCfg := agentcore.LoopConfig{
 		Model:              runModel,
 		MaxTurns:           cfg.MaxTurns,
 		MaxRetries:         cfg.MaxRetries,
 		ToolsAreIdempotent: cfg.ToolsAreIdempotent,
 		ContextManager:     contextManager,
-		ConvertToLLM:       cfg.ConvertToLLM,
+		ConvertToLLM:       convertToLLM,
 		ThinkingLevel:      t.resolveThinking(agentName, cfg.ThinkingLevel),
+		CacheLastMessage:   cfg.CacheLastMessage,
+		PromptCacheKey:     promptCacheKey,
 	}
 
 	// Drain parent→child messages at every steering tick so a SendToSubAgent
@@ -801,7 +846,7 @@ func (t *Tool) runAgent(ctx context.Context, agentName, taskStr string, modelOve
 	if t.eventObserver != nil {
 		meta := RunMeta{
 			Agent:      agentName,
-			InstanceID: fmt.Sprintf("%s#%d", agentName, t.runSeq.Add(1)),
+			InstanceID: fmt.Sprintf("%s#%d", agentName, runSeq),
 			Mode:       mode,
 		}
 		observe = func(ev agentcore.Event) { t.eventObserver(meta, ev) }

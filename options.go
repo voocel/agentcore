@@ -72,11 +72,28 @@ func WithThinkingLevel(level ThinkingLevel) AgentOption {
 // tool_use+tool_result, so the next call reads them from cache instead of
 // re-uploading.
 //
+// When the agent uses a plain SystemPrompt (not SystemBlocks), the loop also
+// pins the system message with the same cache_control as a stable floor, so
+// fresh sessions sharing the prompt reuse the system+tools prefix. SystemBlocks
+// users keep explicit control via SystemBlock.CacheControl.
+//
 // Pass "" (default) to leave messages untouched. Pass "ephemeral" for the
-// standard 5-minute TTL, or any provider-recognized value. Use this when the
-// application — not the LLM library — owns cache placement.
+// standard 5-minute TTL, or "ephemeral:1h" for the extended TTL where the
+// provider supports it (use for conversations whose turn gaps regularly
+// exceed 5 minutes). Use this when the application — not the LLM library —
+// owns cache placement.
 func WithCacheLastMessage(cacheControl string) AgentOption {
 	return func(a *Agent) { a.cacheLastMessage = cacheControl }
+}
+
+// WithPromptCacheKey sets the prompt-cache routing identity attached to every
+// LLM request of this agent (e.g. OpenAI prompt_cache_key). Keep one key per
+// long-lived conversation: requests sharing a key are routed to the same
+// provider cache shard, so each turn can read the previous turn's prefix from
+// cache. The adapter drops the hint for providers without key-routed caching.
+// Empty (default) sends no hint.
+func WithPromptCacheKey(key string) AgentOption {
+	return func(a *Agent) { a.promptCacheKey = key }
 }
 
 // ---------------------------------------------------------------------------

@@ -146,6 +146,13 @@ type LoopConfig struct {
 	// The breakpoint follows the freshest turn (user input, tool_result, or
 	// assistant) and skips trailing per-turn system reminders.
 	CacheLastMessage string
+
+	// PromptCacheKey, when non-empty, is attached to every LLM request as the
+	// provider's prompt-cache routing identity (e.g. OpenAI prompt_cache_key).
+	// Use one key per conversation so all requests of a session land on the
+	// same cache shard. The adapter drops the hint for providers without
+	// key-routed caching. Empty (default) sends nothing.
+	PromptCacheKey string
 }
 
 // ---------------------------------------------------------------------------
@@ -178,6 +185,7 @@ type CallConfig struct {
 	ThinkingBudget int    // max thinking tokens, 0 = use provider default
 	APIKey         string // per-call API key override, empty = use model default
 	SessionID      string // provider session caching identifier
+	PromptCacheKey string // prompt-cache routing identity, empty = no hint
 	MaxTokens      int    // per-call max tokens override, 0 = use model default
 	ToolChoice     any    // "auto" / "required" / "none" / {"type":"tool","name":"xxx"}, nil = provider default
 	ResponseFormat *ResponseFormat
@@ -231,6 +239,14 @@ func WithThinkingBudget(tokens int) CallOption {
 // Enables key rotation, OAuth short-lived tokens, and multi-tenant scenarios.
 func WithAPIKey(key string) CallOption {
 	return func(c *CallConfig) { c.APIKey = key }
+}
+
+// WithCallPromptCacheKey sets the prompt-cache routing identity for a single
+// LLM call. Providers with key-routed prefix caching (OpenAI prompt_cache_key)
+// route requests sharing a key to the same cache shard; the adapter drops the
+// hint for providers without support.
+func WithCallPromptCacheKey(key string) CallOption {
+	return func(c *CallConfig) { c.PromptCacheKey = key }
 }
 
 // WithCallSessionID sets a session identifier for a single LLM call.

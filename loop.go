@@ -665,7 +665,16 @@ func callLLM(ctx context.Context, agentCtx *AgentContext, config LoopConfig, sin
 			prefix = append(prefix, m)
 		}
 	} else if agentCtx.SystemPrompt != "" {
-		prefix = append(prefix, SystemMsg(agentCtx.SystemPrompt))
+		m := SystemMsg(agentCtx.SystemPrompt)
+		if config.CacheLastMessage != "" {
+			// Cache floor: pin the static system prompt with its own
+			// breakpoint so a fresh session — or a turn whose tail entry was
+			// evicted — still reads the system+tools prefix from cache.
+			// SystemBlocks users control placement explicitly and are left
+			// untouched.
+			m.Metadata = map[string]any{"cache_control": config.CacheLastMessage}
+		}
+		prefix = append(prefix, m)
 	}
 	if len(prefix) > 0 {
 		llmMessages = append(prefix, llmMessages...)
@@ -695,6 +704,12 @@ func callLLM(ctx context.Context, agentCtx *AgentContext, config LoopConfig, sin
 	// "unset": leave it to the provider/model default.
 	if config.ThinkingLevel != "" {
 		callOpts = append(callOpts, WithThinking(config.ThinkingLevel))
+	}
+
+	// Prompt-cache routing identity — forwarded per call so the adapter can
+	// gate it on provider capability.
+	if config.PromptCacheKey != "" {
+		callOpts = append(callOpts, WithCallPromptCacheKey(config.PromptCacheKey))
 	}
 
 	// Use streaming for real-time token deltas

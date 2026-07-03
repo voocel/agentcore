@@ -260,7 +260,7 @@ func (l *LiteLLMAdapter) Generate(ctx context.Context, messages []agentcore.Mess
 	applySamplingConfig(ltReq, cfg)
 
 	var err error
-	ctx, err = applyCallConfig(ctx, ltReq, opts)
+	ctx, err = applyCallConfig(ctx, ltReq, opts, l.client.Capabilities(l.model))
 	if err != nil {
 		return nil, err
 	}
@@ -298,7 +298,7 @@ func (l *LiteLLMAdapter) GenerateStream(ctx context.Context, messages []agentcor
 	applySamplingConfig(request, cfg)
 
 	var err error
-	ctx, err = applyCallConfig(ctx, request, opts)
+	ctx, err = applyCallConfig(ctx, request, opts, l.client.Capabilities(l.model))
 	if err != nil {
 		if cancel != nil {
 			cancel()
@@ -535,7 +535,9 @@ func convertSingleMessage(msg agentcore.Message) litellm.Message {
 	if msg.Role == agentcore.RoleTool {
 		toolCallID, _ := msg.Metadata["tool_call_id"].(string)
 		isError, _ := msg.Metadata["is_error"].(bool)
-		content := convertAgentBlocks(msg.Content, cache)
+		// Cache lands on the outer tool_result block only; nested content
+		// cannot carry provider cache breakpoints.
+		content := convertAgentBlocks(msg.Content, nil)
 		blocks = append(blocks, litellm.ToolResultBlock{ToolUseID: toolCallID, Content: content, IsError: isError, Cache: cache})
 	} else {
 		blocks = convertAgentBlocks(msg.Content, cache)
@@ -544,10 +546,17 @@ func convertSingleMessage(msg agentcore.Message) litellm.Message {
 	return llmMsg
 }
 
+// cacheControlFromMetadata parses the "cache_control" metadata value into a
+// litellm CacheControl. The value is "type" or "type:ttl" — e.g. "ephemeral"
+// (provider-default TTL) or "ephemeral:1h" (extended TTL where supported).
+// TTL validity is enforced by the provider layer.
 func cacheControlFromMetadata(metadata map[string]any) *litellm.CacheControl {
 	value, _ := metadata["cache_control"].(string)
 	if value == "" {
 		return nil
+	}
+	if typ, ttl, ok := strings.Cut(value, ":"); ok {
+		return &litellm.CacheControl{Type: typ, TTL: ttl}
 	}
 	return &litellm.CacheControl{Type: value}
 }
@@ -559,23 +568,26 @@ func cloneCacheControl(cache *litellm.CacheControl) *litellm.CacheControl {
 	return &litellm.CacheControl{Type: cache.Type, TTL: cache.TTL}
 }
 
+// convertAgentBlocks converts content blocks to litellm blocks. A non-nil
+// cache is attached to the LAST converted block only: message-level
+// cache_control means "write one breakpoint after this message", and marking
+// every block would burn one provider breakpoint per block (Anthropic allows
+// at most 4 per request).
 func convertAgentBlocks(content []agentcore.ContentBlock, cache *litellm.CacheControl) []litellm.Block {
 	blocks := make([]litellm.Block, 0, len(content))
 	for _, b := range content {
 		switch b.Type {
 		case agentcore.ContentText:
 			if b.Text != "" {
-				blocks = append(blocks, litellm.TextBlock{Text: b.Text, Cache: cloneCacheControl(cache)})
+				blocks = append(blocks, litellm.TextBlock{Text: b.Text})
 			}
 		case agentcore.ContentThinking:
 			if b.Thinking != "" {
-				blocks = append(blocks, litellm.ReasoningBlock{Text: b.Thinking, Cache: cloneCacheControl(cache)})
+				blocks = append(blocks, litellm.ReasoningBlock{Text: b.Thinking})
 			}
 		case agentcore.ContentImage:
 			if b.Image != nil {
-				block := convertImageBlock(*b.Image)
-				block.Cache = cloneCacheControl(cache)
-				blocks = append(blocks, block)
+				blocks = append(blocks, convertImageBlock(*b.Image))
 			}
 		case agentcore.ContentToolCall:
 			if b.ToolCall != nil {
@@ -585,16 +597,47 @@ func convertAgentBlocks(content []agentcore.ContentBlock, cache *litellm.CacheCo
 					Name:      tc.Name,
 					Arguments: tc.Args,
 					Signature: tc.ThoughtSignature,
-					Cache:     cloneCacheControl(cache),
 				})
 			}
 		case agentcore.ContentToolRef:
 			if b.ToolName != "" {
-				blocks = append(blocks, litellm.ToolReferenceBlock{ToolName: b.ToolName, Cache: cloneCacheControl(cache)})
+				blocks = append(blocks, litellm.ToolReferenceBlock{ToolName: b.ToolName})
 			}
 		}
 	}
+	if cache != nil {
+		// Anthropic rejects cache_control on thinking blocks — land the
+		// breakpoint on the last cacheable block instead.
+		for i := len(blocks) - 1; i >= 0; i-- {
+			if _, isReasoning := blocks[i].(litellm.ReasoningBlock); isReasoning {
+				continue
+			}
+			blocks[i] = withBlockCache(blocks[i], cache)
+			break
+		}
+	}
 	return blocks
+}
+
+// withBlockCache returns a copy of the block with cache_control attached.
+// Blocks are value types, so mutating the copy never touches the caller's.
+func withBlockCache(b litellm.Block, cache *litellm.CacheControl) litellm.Block {
+	cc := cloneCacheControl(cache)
+	switch v := b.(type) {
+	case litellm.TextBlock:
+		v.Cache = cc
+		return v
+	case litellm.ImageBlock:
+		v.Cache = cc
+		return v
+	case litellm.ToolUseBlock:
+		v.Cache = cc
+		return v
+	case litellm.ToolReferenceBlock:
+		v.Cache = cc
+		return v
+	}
+	return b
 }
 
 func sanitizeOutgoingToolCall(tc agentcore.ToolCall) agentcore.ToolCall {
@@ -739,8 +782,10 @@ func applySamplingConfig(req *litellm.Request, cfg *GenerationConfig) {
 }
 
 // applyCallConfig resolves CallOptions once and applies API key, thinking,
-// session config, and response format to the litellm request.
-func applyCallConfig(ctx context.Context, req *litellm.Request, opts []agentcore.CallOption) (context.Context, error) {
+// session config, cache routing, and response format to the litellm request.
+// caps carries the provider's declared capabilities so capability-gated
+// options are dropped instead of tripping strict provider-option validation.
+func applyCallConfig(ctx context.Context, req *litellm.Request, opts []agentcore.CallOption, caps litellm.Capabilities) (context.Context, error) {
 	callCfg := agentcore.ResolveCallConfig(opts)
 	ctx = contextWithAPIKey(ctx, callCfg.APIKey)
 
@@ -768,6 +813,16 @@ func applyCallConfig(ctx context.Context, req *litellm.Request, opts []agentcore
 			req.ProviderOptions = make(litellm.ProviderOptions)
 		}
 		req.ProviderOptions["session_id"] = callCfg.SessionID
+	}
+
+	// Prompt-cache routing identity. Capability-gated: litellm providers
+	// validate provider options strictly, so an unsupported key must be
+	// dropped here rather than rejected there.
+	if callCfg.PromptCacheKey != "" && caps.Cache.PromptKey == litellm.SupportYes {
+		if req.ProviderOptions == nil {
+			req.ProviderOptions = make(litellm.ProviderOptions)
+		}
+		req.ProviderOptions["prompt_cache_key"] = callCfg.PromptCacheKey
 	}
 
 	if callCfg.MaxTokens > 0 {
@@ -853,7 +908,7 @@ func newProvider(name string, cfg ProviderConfig) (litellm.Provider, error) {
 	userAgent := stringFromExtra(cfg.Extra, "user_agent")
 	switch name {
 	case "openai":
-		return openai.New(openai.Config{APIKeyFunc: apiKeyFunc(cfg.APIKey), BaseURL: cfg.BaseURL, Retry: cfg.Retry, API: firstStringFromExtra(cfg.Extra, "api", "api_mode"), Headers: headers, UserAgent: userAgent})
+		return openai.New(openai.Config{APIKeyFunc: apiKeyFunc(cfg.APIKey), BaseURL: cfg.BaseURL, Retry: cfg.Retry, API: firstStringFromExtra(cfg.Extra, "api", "api_mode"), Headers: headers, UserAgent: userAgent, PromptCacheParams: boolFromExtra(cfg.Extra, "prompt_cache_params")})
 	case "anthropic":
 		return anthropic.New(anthropic.Config{APIKeyFunc: apiKeyFunc(cfg.APIKey), BaseURL: cfg.BaseURL, Retry: cfg.Retry, Beta: stringFromExtra(cfg.Extra, "anthropic_beta"), Headers: headers, UserAgent: userAgent})
 	case "bedrock":
@@ -941,6 +996,19 @@ func headersFromExtra(extra map[string]any) (map[string]string, error) {
 func stringFromExtra(extra map[string]any, key string) string {
 	v, _ := extra[key].(string)
 	return v
+}
+
+// boolFromExtra accepts both JSON booleans and "true" strings so that
+// stringly-typed config files work without surprises.
+func boolFromExtra(extra map[string]any, key string) bool {
+	switch v := extra[key].(type) {
+	case bool:
+		return v
+	case string:
+		return strings.EqualFold(v, "true")
+	default:
+		return false
+	}
 }
 
 func firstStringFromExtra(extra map[string]any, keys ...string) string {
