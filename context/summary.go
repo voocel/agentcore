@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"math"
 	"strings"
+	"unicode/utf8"
 
 	"github.com/voocel/agentcore"
 )
@@ -283,25 +284,35 @@ func truncateOldestUserGroups(msgs []agentcore.AgentMessage, fraction float64) [
 	return result
 }
 
+// truncateForSummary caps s at roughly max bytes for summarization input,
+// backing the cut up to a rune boundary so multi-byte UTF-8 sequences (e.g.
+// CJK text) are never split. A half rune here poisons the summarization
+// request: providers reject invalid UTF-8, the whole compaction fails, and —
+// because history is deterministic — keeps failing at the same byte on every
+// retry.
+func truncateForSummary(s string, max int) string {
+	if len(s) <= max {
+		return s
+	}
+	cut := max
+	for cut > 0 && !utf8.RuneStart(s[cut]) {
+		cut--
+	}
+	return s[:cut] + "..."
+}
+
 // formatArgsKeyValue formats JSON tool args as key=value pairs.
 // More token-efficient than raw JSON for LLM summarization input.
 func formatArgsKeyValue(raw json.RawMessage) string {
 	var obj map[string]any
 	if json.Unmarshal(raw, &obj) != nil {
-		s := string(raw)
-		if len(s) > 200 {
-			return s[:197] + "..."
-		}
-		return s
+		return truncateForSummary(string(raw), 197)
 	}
 
 	var pairs []string
 	for k, v := range obj {
 		s := fmt.Sprintf("%v", v)
-		if len(s) > 100 {
-			s = s[:97] + "..."
-		}
-		pairs = append(pairs, k+"="+s)
+		pairs = append(pairs, k+"="+truncateForSummary(s, 97))
 	}
 	return strings.Join(pairs, ", ")
 }
@@ -333,10 +344,7 @@ func serializeConversation(msgs []agentcore.AgentMessage) string {
 					parts = append(parts, "[Assistant tool calls]: "+strings.Join(calls, "; "))
 				}
 			case agentcore.RoleTool:
-				content := v.TextContent()
-				if len(content) > 500 {
-					content = content[:497] + "..."
-				}
+				content := truncateForSummary(v.TextContent(), 497)
 				if content != "" {
 					parts = append(parts, "[Tool result]: "+content)
 				}

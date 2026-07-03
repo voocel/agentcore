@@ -14,6 +14,7 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
+	"unicode/utf8"
 
 	"github.com/voocel/agentcore"
 	"github.com/voocel/agentcore/schema"
@@ -929,7 +930,14 @@ func (t *Tool) runAgent(ctx context.Context, agentName, taskStr string, modelOve
 				if ev.IsError {
 					errMsg := string(ev.Result)
 					if len(errMsg) > 200 {
-						errMsg = errMsg[:200]
+						// Back the cut up to a rune boundary: splitting a
+						// multi-byte UTF-8 sequence would render mojibake
+						// in progress displays.
+						cut := 200
+						for cut > 0 && !utf8.RuneStart(errMsg[cut]) {
+							cut--
+						}
+						errMsg = errMsg[:cut]
 					}
 					agentcore.ReportToolProgress(ctx, agentcore.ProgressPayload{
 						Kind:    agentcore.ProgressToolError,
