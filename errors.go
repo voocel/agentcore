@@ -44,13 +44,14 @@ var (
 // responses). Use ClassifyProvider to derive the most specific sentinel from
 // an error chain, or match directly with errors.Is.
 var (
-	ErrProviderRateLimit  = errors.New("provider rate limit")
-	ErrProviderQuota      = errors.New("provider quota exhausted")
-	ErrProviderTimeout    = errors.New("provider timeout")
-	ErrProviderStreamIdle = errors.New("provider stream idle")
-	ErrProviderNetwork    = errors.New("provider network")
-	ErrProviderAuth       = errors.New("provider auth")
-	ErrProviderOverloaded = errors.New("provider overloaded")
+	ErrProviderRateLimit     = errors.New("provider rate limit")
+	ErrProviderQuota         = errors.New("provider quota exhausted")
+	ErrProviderTimeout       = errors.New("provider timeout")
+	ErrProviderStreamIdle    = errors.New("provider stream idle")
+	ErrProviderNetwork       = errors.New("provider network")
+	ErrProviderAuth          = errors.New("provider auth")
+	ErrProviderOverloaded    = errors.New("provider overloaded")
+	ErrProviderContentFilter = errors.New("provider content filter")
 )
 
 // RetryableError when implemented by an error in the chain, tells the loop
@@ -160,7 +161,8 @@ func IsContextOverflow(err error) bool {
 // ErrorKind returns a stable, log-friendly label for err: "canceled",
 // "stop_guard", "max_turns", "context_overflow", "stream_partial",
 // "tool_validation", "stream_idle", "quota", "rate_limit", "timeout",
-// "auth", "network", "overloaded". Returns "" for nil and "unknown" when
+// "auth", "network", "overloaded", "content_filter". Returns "" for nil and
+// "unknown" when
 // nothing matches.
 //
 // Labels are part of the public API contract — they will not change between
@@ -199,6 +201,8 @@ func ErrorKind(err error) string {
 		return "network"
 	case ErrProviderOverloaded:
 		return "overloaded"
+	case ErrProviderContentFilter:
+		return "content_filter"
 	}
 	return "unknown"
 }
@@ -237,6 +241,9 @@ func ClassifyProvider(err error) error {
 }
 
 func classifyProviderSentinel(err error) error {
+	if errors.Is(err, ErrProviderContentFilter) {
+		return ErrProviderContentFilter
+	}
 	if errors.Is(err, ErrProviderStreamIdle) {
 		return ErrProviderStreamIdle
 	}
@@ -272,8 +279,8 @@ func classifyProviderSentinel(err error) error {
 
 // IsFailoverEligible reports whether err matches a transient provider error
 // suitable for cross-provider failover: rate_limit, timeout, network, or
-// stream_idle. Returns false for auth errors, context_overflow, user
-// cancellation, or unclassified errors.
+// stream_idle. Returns false for auth errors, content filters,
+// context_overflow, user cancellation, or unclassified errors.
 func IsFailoverEligible(err error) bool {
 	if err == nil || errors.Is(err, context.Canceled) {
 		return false

@@ -68,6 +68,8 @@ func (e *providerError) Is(target error) bool {
 		return litellm.IsAuthError(e.err)
 	case agentcore.ErrProviderOverloaded:
 		return litellm.IsOverloadedError(e.err)
+	case agentcore.ErrProviderContentFilter:
+		return litellm.IsContentFilterError(e.err)
 	}
 	return false
 }
