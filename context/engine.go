@@ -16,8 +16,8 @@ import (
 )
 
 const (
-	defaultEngineReserveTokens      = 16384
-	defaultMaxConsecutiveFailures   = 3
+	defaultEngineReserveTokens    = 16384
+	defaultMaxConsecutiveFailures = 3
 )
 
 // EngineConfig configures the default strategy-driven ContextEngine.

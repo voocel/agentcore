@@ -20,7 +20,7 @@ func TestEditFuzzyMatchTrailingUnicodeSpace(t *testing.T) {
 
 	tool := NewEdit(dir, NewFileReadState())
 	args, err := json.Marshal(map[string]any{
-		"file_path": "test.txt",
+		"file_path":  "test.txt",
 		"old_string": "line\n",
 		"new_string": "repl\n",
 	})
@@ -53,7 +53,7 @@ func TestEditFuzzyDoesNotChangeUnrelatedSameLineText(t *testing.T) {
 
 	tool := NewEdit(dir, NewFileReadState())
 	args, err := json.Marshal(map[string]any{
-		"file_path": "test.txt",
+		"file_path":  "test.txt",
 		"old_string": "target='old'",
 		"new_string": "target='new'",
 	})
@@ -87,7 +87,7 @@ func TestEditPreviewFuzzyNoMutation(t *testing.T) {
 
 	tool := NewEdit(dir, NewFileReadState())
 	args, err := json.Marshal(map[string]any{
-		"file_path": "test.txt",
+		"file_path":  "test.txt",
 		"old_string": "target='old'",
 		"new_string": "target='new'",
 	})
@@ -131,7 +131,7 @@ func TestEditIndentAwareMatch(t *testing.T) {
 
 	tool := NewEdit(dir, NewFileReadState())
 	args, err := json.Marshal(map[string]any{
-		"file_path": "test.txt",
+		"file_path":  "test.txt",
 		"old_string": "if true {\n\tprintln(\"old\")\n}",
 		"new_string": "if true {\n\tprintln(\"new\")\n}",
 	})
@@ -165,7 +165,7 @@ func TestEditIndentAwareRequiresUniqueMatch(t *testing.T) {
 
 	tool := NewEdit(dir, NewFileReadState())
 	args, err := json.Marshal(map[string]any{
-		"file_path": "test.txt",
+		"file_path":  "test.txt",
 		"old_string": "if true {\n\tprintln(\"old\")\n}",
 		"new_string": "if true {\n\tprintln(\"new\")\n}",
 	})
@@ -190,7 +190,7 @@ func TestEditFailureIncludesClosestMatchHint(t *testing.T) {
 
 	tool := NewEdit(dir, NewFileReadState())
 	args, err := json.Marshal(map[string]any{
-		"file_path": "test.txt",
+		"file_path":  "test.txt",
 		"old_string": "if true {\n\tprintln(\"old\")\n}",
 		"new_string": "if true {\n\tprintln(\"new\")\n}",
 	})

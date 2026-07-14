@@ -38,8 +38,8 @@ type SessionMemoryConfig struct {
 }
 
 const (
-	defaultMaxSeedRunes         = 20000
-	sessionMemoryStrategyName   = "session_memory"
+	defaultMaxSeedRunes          = 20000
+	sessionMemoryStrategyName    = "session_memory"
 	sessionMemoryTruncatedNotice = "\n\n[... session memory truncated for compact budget ...]"
 )
 

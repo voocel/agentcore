@@ -111,7 +111,9 @@ func TestSessionMemoryStrategyAppliesSeedWithoutLLM(t *testing.T) {
 	if !strings.Contains(cs.Summary, "Harness optimization in progress") {
 		t.Fatalf("summary body must be sourced from the seed, got %q", cs.Summary)
 	}
-	if res.Info == nil || res.Info.Duration <= 0 {
+	// Duration may be 0 on Windows: the no-LLM seed path finishes within the
+	// clock's tick granularity. Populated Info is the contract, not elapsed time.
+	if res.Info == nil || res.Info.Duration < 0 {
 		t.Fatal("SummaryInfo must be populated for observability")
 	}
 	if res.Info.IsIncremental != true {

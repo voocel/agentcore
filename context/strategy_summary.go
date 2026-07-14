@@ -24,10 +24,10 @@ type FullSummaryConfig struct {
 	// Custom summary prompts. Empty strings fall back to the built-in defaults
 	// (code-assistant oriented). Set these to override with domain-specific
 	// prompts — e.g., novel-writing prompts that preserve narrative continuity.
-	SystemPrompt      string
-	SummaryPrompt     string
+	SystemPrompt        string
+	SummaryPrompt       string
 	UpdateSummaryPrompt string
-	TurnPrefixPrompt  string
+	TurnPrefixPrompt    string
 }
 
 // FullSummaryStrategy rewrites older context into a ContextSummary checkpoint

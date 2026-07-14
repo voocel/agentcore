@@ -39,10 +39,10 @@ type summaryRunConfig struct {
 	ReserveTokens    int
 	KeepRecentTokens int
 	// Custom prompts — empty means use built-in defaults.
-	SystemPrompt      string
-	SummaryPrompt     string
+	SystemPrompt        string
+	SummaryPrompt       string
 	UpdateSummaryPrompt string
-	TurnPrefixPrompt  string
+	TurnPrefixPrompt    string
 }
 
 func runSummaryCompaction(ctx context.Context, cfg summaryRunConfig, msgs []agentcore.AgentMessage, stripImages bool) ([]agentcore.AgentMessage, *SummaryInfo, error) {

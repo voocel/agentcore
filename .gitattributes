@@ -1,0 +1,5 @@
+# Normalize all text files to LF in repo and working tree, independent of
+# each contributor's local core.autocrlf setting.
+* text=auto eol=lf
+
+*.gif binary

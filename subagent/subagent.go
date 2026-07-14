@@ -1,11 +1,18 @@
 // Package subagent implements a Tool that delegates work to specialized
 // sub-agents with isolated contexts. Four execution modes are supported:
 // single, parallel, chain, and background.
+//
+// Two calling surfaces share the same execution core: the LLM tool-call
+// surface (Tool.Execute, JSON in/out for a coordinating agent) and the
+// programmatic surface (Tool.Run, typed in/out for host code that schedules
+// agents itself). Hosts that route control flow in code should prefer Run —
+// it skips JSON marshalling and returns typed results and error chains.
 package subagent
 
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"maps"
@@ -130,7 +137,8 @@ type chainStep struct {
 	Task  string `json:"task"`
 }
 
-// result captures one sub-agent's execution outcome.
+// result captures one sub-agent's execution outcome for the LLM-facing
+// JSON surface (chain/parallel modes).
 type result struct {
 	Agent          string          `json:"agent"`
 	Task           string          `json:"task"`
@@ -138,11 +146,11 @@ type result struct {
 	TerminalResult json.RawMessage `json:"terminal_result,omitempty"`
 	IsError        bool            `json:"is_error,omitempty"`
 	Step           int             `json:"step,omitempty"`
-	Usage          *usage          `json:"usage,omitempty"`
+	Usage          *Usage          `json:"usage,omitempty"`
 }
 
-// usage tracks token consumption and cost for a sub-agent run.
-type usage struct {
+// Usage aggregates token consumption and loop counters for one sub-agent run.
+type Usage struct {
 	Input      int     `json:"input"`
 	Output     int     `json:"output"`
 	CacheRead  int     `json:"cache_read"`
@@ -150,6 +158,65 @@ type usage struct {
 	Cost       float64 `json:"cost"`
 	Turns      int     `json:"turns"`
 	Tools      int     `json:"tools"`
+}
+
+// ErrUnknownAgent is the sentinel for "agent name not registered with this
+// Tool". Match with errors.Is; use errors.As with *UnknownAgentError to read
+// the requested name and the available set. A host scheduler branches on this
+// to classify the failure as deterministic (retrying the same run cannot
+// succeed) without matching error strings.
+var ErrUnknownAgent = errors.New("unknown agent")
+
+// UnknownAgentError reports a lookup failure against the Tool's registry.
+// errors.Is matches ErrUnknownAgent.
+type UnknownAgentError struct {
+	Agent     string
+	Available []string
+}
+
+func (e *UnknownAgentError) Error() string {
+	return fmt.Sprintf("unknown agent %q, available: %s", e.Agent, strings.Join(e.Available, ", "))
+}
+
+func (e *UnknownAgentError) Is(target error) bool { return target == ErrUnknownAgent }
+
+// RunResult is the typed outcome of one sub-agent run.
+type RunResult struct {
+	// Agent is the registered agent definition that ran.
+	Agent string
+
+	// Output is the final assistant text. Unlike the LLM tool-call surface,
+	// it is NOT concatenated with TerminalResult and has no "(no output)"
+	// placeholder — an agent that only called tools yields "".
+	Output string
+
+	// TerminalResult is the successful result of the tool that triggered a
+	// StopAfterTools / StopAfterToolResult exit, nil when the run ended some
+	// other way.
+	TerminalResult json.RawMessage
+
+	// Usage carries aggregated counters. Populated on both success and
+	// failure paths (a run that errors mid-way still consumed tokens);
+	// zero-valued when the run never started (e.g. unknown agent).
+	Usage Usage
+}
+
+// displayOutput renders the run for the LLM-facing tool-call surface:
+// terminal tool result appended after the assistant text, with a
+// "(no output)" placeholder when both are empty. Programmatic callers use
+// the raw fields instead.
+func (r RunResult) displayOutput() string {
+	out := r.Output
+	if len(r.TerminalResult) > 0 {
+		if out != "" {
+			out += "\n\n"
+		}
+		out += string(r.TerminalResult)
+	}
+	if out == "" {
+		return "(no output)"
+	}
+	return out
 }
 
 // TeamSpawnRequest is the contract between the subagent tool and the
@@ -443,6 +510,22 @@ func (t *Tool) Execute(ctx context.Context, args json.RawMessage) (json.RawMessa
 	}
 }
 
+// Run executes one registered sub-agent programmatically — the host-code
+// counterpart of the LLM calling this tool with agent+task. It bypasses the
+// JSON tool shell entirely: inputs are typed parameters, outputs are a typed
+// RunResult, and failures are Go errors carrying the loop's full chain
+// (errors.Is(err, ErrUnknownAgent) for lookup failures,
+// agentcore.ErrStopGuard / ErrMaxTurns / provider sentinels for loop
+// failures — see agentcore.ErrorKind for the stable taxonomy).
+//
+// Everything configured on the agent's Config applies exactly as in the
+// tool-call path: StopGuard, StopAfterTools, OnMessage, context management,
+// prompt-cache keys. Progress reporting via agentcore.WithToolProgress on ctx
+// works identically.
+func (t *Tool) Run(ctx context.Context, agent, task string) (RunResult, error) {
+	return t.runAgent(ctx, agent, task, nil, nil, ModeSingle)
+}
+
 // executeTeamSpawn delegates to the installed TeamSpawner. The subagent tool
 // validates the requested agent definition exists and prepares a TeamSpawnRequest
 // from params; the spawner owns the actual goroutine launch, tool-set
@@ -566,14 +649,13 @@ func (t *Tool) executeBackground(callerCtx context.Context, agentName, taskStr, 
 			}
 		}
 
-		output, _, u, err := t.runAgent(bgCtx, agentName, taskStr, modelOverride, &bgRunOpts{taskID: taskID, rt: rt, outFile: outFile}, ModeBackground)
+		res, err := t.runAgent(bgCtx, agentName, taskStr, modelOverride, &bgRunOpts{taskID: taskID, rt: rt, outFile: outFile}, ModeBackground)
 		if outFile != nil {
 			outFile.Close()
 		}
 
 		rt.Update(taskID, func(e *task.Entry) {
 			e.EndedAt = time.Now()
-			e.Result = output
 			switch {
 			case err != nil && bgCtx.Err() != nil:
 				// Cancellation observed: this was an explicit Stop, not a failure.
@@ -583,12 +665,11 @@ func (t *Tool) executeBackground(callerCtx context.Context, agentName, taskStr, 
 				e.Error = err.Error()
 			default:
 				e.Status = task.Completed
+				e.Result = res.displayOutput()
 			}
-			if u != nil {
-				e.TokensIn = u.Input
-				e.TokensOut = u.Output
-				e.ToolCount = u.Tools
-			}
+			e.TokensIn = res.Usage.Input
+			e.TokensOut = res.Usage.Output
+			e.ToolCount = res.Usage.Tools
 		})
 		t.notify(taskID)
 	}()
@@ -615,19 +696,20 @@ func (t *Tool) notify(taskID string) {
 
 // executeSingle runs one sub-agent with an isolated context.
 func (t *Tool) executeSingle(ctx context.Context, agentName, taskStr string, modelOverride agentcore.ChatModel) (json.RawMessage, error) {
-	output, terminalResult, u, err := t.runAgent(ctx, agentName, taskStr, modelOverride, nil, ModeSingle)
+	res, err := t.runAgent(ctx, agentName, taskStr, modelOverride, nil, ModeSingle)
 	if err != nil {
-		if u != nil {
-			return nil, fmt.Errorf("agent %q failed: %w (turns=%d tools=%d)", agentName, err, u.Turns, u.Tools)
+		if res.Usage.Turns > 0 || res.Usage.Tools > 0 {
+			return nil, fmt.Errorf("agent %q failed: %w (turns=%d tools=%d)", agentName, err, res.Usage.Turns, res.Usage.Tools)
 		}
 		return nil, fmt.Errorf("agent %q failed: %w", agentName, err)
 	}
+	u := res.Usage
 	out := map[string]any{
-		"output": output,
-		"usage":  u,
+		"output": res.displayOutput(),
+		"usage":  &u,
 	}
-	if len(terminalResult) > 0 {
-		out["terminal_result"] = terminalResult
+	if len(res.TerminalResult) > 0 {
+		out["terminal_result"] = res.TerminalResult
 	}
 	return json.Marshal(out)
 }
@@ -644,14 +726,15 @@ func (t *Tool) executeChain(ctx context.Context, chain []chainStep, modelOverrid
 		}
 
 		taskStr := strings.ReplaceAll(step.Task, "{previous}", previous)
-		output, terminalResult, u, err := t.runAgent(ctx, step.Agent, taskStr, modelOverride, nil, ModeChain)
+		res, err := t.runAgent(ctx, step.Agent, taskStr, modelOverride, nil, ModeChain)
 
+		u := res.Usage
 		r := result{
 			Agent:          step.Agent,
 			Task:           taskStr,
 			Step:           i + 1,
-			Usage:          u,
-			TerminalResult: terminalResult,
+			Usage:          &u,
+			TerminalResult: res.TerminalResult,
 		}
 
 		if err != nil {
@@ -664,9 +747,9 @@ func (t *Tool) executeChain(ctx context.Context, chain []chainStep, modelOverrid
 			})
 		}
 
-		r.Output = output
+		r.Output = res.displayOutput()
 		results = append(results, r)
-		previous = output
+		previous = r.Output
 	}
 
 	return json.Marshal(map[string]any{
@@ -693,18 +776,19 @@ func (t *Tool) executeParallel(ctx context.Context, tasks []taskItem, modelOverr
 			sem <- struct{}{}
 			defer func() { <-sem }()
 
-			output, terminalResult, u, err := t.runAgent(ctx, st.Agent, st.Task, modelOverride, nil, ModeParallel)
+			res, err := t.runAgent(ctx, st.Agent, st.Task, modelOverride, nil, ModeParallel)
+			u := res.Usage
 			r := result{
 				Agent:          st.Agent,
 				Task:           st.Task,
-				Usage:          u,
-				TerminalResult: terminalResult,
+				Usage:          &u,
+				TerminalResult: res.TerminalResult,
 			}
 			if err != nil {
 				r.Output = err.Error()
 				r.IsError = true
 			} else {
-				r.Output = output
+				r.Output = res.displayOutput()
 			}
 			results[idx] = r
 		}(i, ti)
@@ -735,15 +819,16 @@ type bgRunOpts struct {
 
 // runAgent executes an isolated agent loop for the given agent config and
 // task. Includes panic recovery to prevent a subagent crash from taking down
-// the parent.
-func (t *Tool) runAgent(ctx context.Context, agentName, taskStr string, modelOverride agentcore.ChatModel, bg *bgRunOpts, mode string) (output string, terminalResult json.RawMessage, u *usage, err error) {
+// the parent. On error the returned RunResult carries only Usage (counters
+// consumed before the failure); Output/TerminalResult stay empty.
+func (t *Tool) runAgent(ctx context.Context, agentName, taskStr string, modelOverride agentcore.ChatModel, bg *bgRunOpts, mode string) (res RunResult, err error) {
 	cfg, ok := t.agents[agentName]
 	if !ok {
 		available := make([]string, 0, len(t.agents))
 		for name := range t.agents {
 			available = append(available, name)
 		}
-		return "", nil, nil, fmt.Errorf("unknown agent %q, available: %s", agentName, strings.Join(available, ", "))
+		return res, &UnknownAgentError{Agent: agentName, Available: available}
 	}
 
 	// Panic recovery — isolated subagent should never crash the parent.
@@ -858,7 +943,7 @@ func (t *Tool) runAgent(ctx context.Context, agentName, taskStr string, modelOve
 	var lastAssistantContent string
 	var terminalToolResult json.RawMessage // result from StopAfterTool trigger
 	var lastErr error
-	su := &usage{}
+	su := &Usage{}
 
 	for ev := range events {
 		// Fan to the observer first — before any case below can `continue`
@@ -1022,19 +1107,14 @@ func (t *Tool) runAgent(ctx context.Context, agentName, taskStr string, modelOve
 	}
 
 	if lastErr != nil {
-		return "", nil, su, lastErr
+		return RunResult{Agent: agentName, Usage: *su}, lastErr
 	}
-	output = lastAssistantContent
-	if len(terminalToolResult) > 0 {
-		if output != "" {
-			output += "\n\n"
-		}
-		output += string(terminalToolResult)
-	}
-	if output == "" {
-		return "(no output)", terminalToolResult, su, nil
-	}
-	return output, terminalToolResult, su, nil
+	return RunResult{
+		Agent:          agentName,
+		Output:         lastAssistantContent,
+		TerminalResult: terminalToolResult,
+		Usage:          *su,
+	}, nil
 }
 
 func reportContext(ctx context.Context, agentName string, mgr agentcore.ContextManager) {
