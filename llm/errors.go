@@ -3,6 +3,8 @@ package llm
 import (
 	"context"
 	"errors"
+	"fmt"
+	"strings"
 	"time"
 
 	"github.com/voocel/agentcore"
@@ -31,7 +33,37 @@ func wrapProviderError(err error) error {
 	return &providerError{err: err}
 }
 
-func (e *providerError) Error() string { return e.err.Error() }
+// Error appends the structured facts litellm carries but keeps out of its own
+// Error() text (error type, HTTP status, provider, model). Gateway messages
+// are often as vague as "Provider returned error"; without these facts users
+// cannot tell a config mistake from an upstream outage. This is the single
+// seam every provider error string flows through (engine retry events, host
+// surfaces, logs), so enriching here fixes them all at once.
+func (e *providerError) Error() string {
+	msg := e.err.Error()
+	var le *litellm.LiteLLMError
+	if !errors.As(e.err, &le) {
+		return msg
+	}
+	facts := make([]string, 0, 4)
+	if le.Type != "" {
+		facts = append(facts, string(le.Type))
+	}
+	if le.StatusCode != 0 {
+		facts = append(facts, fmt.Sprintf("HTTP %d", le.StatusCode))
+	}
+	if le.Provider != "" {
+		facts = append(facts, le.Provider)
+	}
+	if le.Model != "" {
+		facts = append(facts, le.Model)
+	}
+	if len(facts) == 0 {
+		return msg
+	}
+	return msg + " [" + strings.Join(facts, ", ") + "]"
+}
+
 func (e *providerError) Unwrap() error { return e.err }
 
 // Retryable reports litellm's own retryability verdict (network, timeout,
