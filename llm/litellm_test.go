@@ -151,6 +151,31 @@ func TestGenerateNormalizesMalformedToolArgumentsFromModel(t *testing.T) {
 	}
 }
 
+func TestGeneratePreservesRefusalMetadata(t *testing.T) {
+	provider := &captureProvider{}
+	provider.chatFunc = func(context.Context, *litellm.Request) (*litellm.Response, error) {
+		return &litellm.Response{
+			Provider:        "capture",
+			Model:           "m",
+			FinishReason:    litellm.FinishReasonSafety,
+			FinishReasonRaw: "content_filter",
+			Refusal:         "I can't help.",
+			Blocks:          []litellm.Block{litellm.Text("I can't help.")},
+		}, nil
+	}
+	model := NewLiteLLMAdapter("m", mustClient(t, provider))
+	resp, err := model.Generate(context.Background(), []agentcore.Message{agentcore.UserMsg("hi")}, nil)
+	if err != nil {
+		t.Fatalf("Generate: %v", err)
+	}
+	if resp.Message.StopReason != agentcore.StopReasonSafety || resp.Message.TextContent() != "I can't help." {
+		t.Fatalf("stop/text = %q/%q", resp.Message.StopReason, resp.Message.TextContent())
+	}
+	if resp.Message.Metadata["refusal"] != "I can't help." || resp.Message.Metadata["finish_reason_raw"] != "content_filter" {
+		t.Fatalf("metadata = %#v", resp.Message.Metadata)
+	}
+}
+
 func TestNewBaseModelClonesDefaultConfig(t *testing.T) {
 	a := NewBaseModel(ModelInfo{Name: "a"}, nil)
 	b := NewBaseModel(ModelInfo{Name: "b"}, nil)
@@ -461,5 +486,32 @@ func TestGenerateStreamFinalMessageNormalizesToolArgumentsWithoutDoneEvent(t *te
 	}
 	if calls[0].ArgsRawText == "" || calls[0].ArgsParseError == "" {
 		t.Fatalf("missing malformed args diagnostics: %+v", calls[0])
+	}
+}
+
+func TestGenerateStreamPreservesRefusal(t *testing.T) {
+	provider := &captureStreamProvider{events: []litellm.Event{
+		litellm.RefusalDelta{Text: "I can't help."},
+		litellm.DoneEvent{FinishReason: litellm.FinishReasonStop, FinishReasonRaw: "completed", Provider: "capture", Model: "m"},
+	}}
+	model := NewLiteLLMAdapter("m", mustClient(t, provider))
+	ch, err := model.GenerateStream(context.Background(), []agentcore.Message{agentcore.UserMsg("hi")}, nil)
+	if err != nil {
+		t.Fatalf("GenerateStream: %v", err)
+	}
+	var final agentcore.Message
+	for ev := range ch {
+		if ev.Type == agentcore.StreamEventError {
+			t.Fatalf("stream error: %v", ev.Err)
+		}
+		if ev.Type == agentcore.StreamEventDone {
+			final = ev.Message
+		}
+	}
+	if final.StopReason != agentcore.StopReasonSafety || final.TextContent() != "I can't help." {
+		t.Fatalf("stop/text = %q/%q", final.StopReason, final.TextContent())
+	}
+	if final.Metadata["refusal"] != "I can't help." || final.Metadata["finish_reason_raw"] != "completed" {
+		t.Fatalf("metadata = %#v", final.Metadata)
 	}
 }

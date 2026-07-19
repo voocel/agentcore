@@ -358,6 +358,22 @@ func (l *LiteLLMAdapter) GenerateStream(ctx context.Context, messages []agentcor
 				}
 				partial.Content[textIdx].Text += e.Text
 				eventChan <- agentcore.StreamEvent{Type: agentcore.StreamEventTextDelta, ContentIndex: textIdx, Delta: e.Text, Message: partial}
+			case litellm.RefusalDelta:
+				if e.Text == "" {
+					return nil
+				}
+				if textIdx < 0 {
+					partial.Content = append(partial.Content, agentcore.TextBlock(""))
+					textIdx = len(partial.Content) - 1
+					eventChan <- agentcore.StreamEvent{Type: agentcore.StreamEventTextStart, ContentIndex: textIdx, Message: partial}
+				}
+				partial.Content[textIdx].Text += e.Text
+				if partial.Metadata == nil {
+					partial.Metadata = make(map[string]any)
+				}
+				refusal, _ := partial.Metadata["refusal"].(string)
+				partial.Metadata["refusal"] = refusal + e.Text
+				eventChan <- agentcore.StreamEvent{Type: agentcore.StreamEventTextDelta, ContentIndex: textIdx, Delta: e.Text, Message: partial}
 			case litellm.ToolUseStart:
 				key := toolUseEventKey(e.ID, e.ItemID, e.Index, e.OutputIndex)
 				partial.Content = append(partial.Content, agentcore.ToolCallBlock(agentcore.ToolCall{ID: e.ID, Name: e.Name, ThoughtSignature: e.Signature}))
@@ -440,6 +456,7 @@ func (l *LiteLLMAdapter) GenerateStream(ctx context.Context, messages []agentcor
 		}
 		if resp != nil {
 			partial.StopReason = mapStopReason(resp.FinishReason)
+			mergeResponseMetadata(&partial, resp)
 		}
 		eventChan <- agentcore.StreamEvent{Type: agentcore.StreamEventDone, Message: partial, StopReason: partial.StopReason}
 	}()
@@ -696,6 +713,36 @@ func convertResponse(response *litellm.Response) agentcore.Message {
 		Content:    content,
 		StopReason: finish,
 		Usage:      usage,
+		Metadata:   responseMetadata(response),
+	}
+}
+
+func responseMetadata(response *litellm.Response) map[string]any {
+	if response == nil {
+		return nil
+	}
+	var metadata map[string]any
+	if response.Refusal != "" {
+		metadata = map[string]any{"refusal": response.Refusal}
+	}
+	if response.FinishReasonRaw != "" {
+		if metadata == nil {
+			metadata = make(map[string]any)
+		}
+		metadata["finish_reason_raw"] = response.FinishReasonRaw
+	}
+	return metadata
+}
+
+func mergeResponseMetadata(message *agentcore.Message, response *litellm.Response) {
+	if message == nil {
+		return
+	}
+	for key, value := range responseMetadata(response) {
+		if message.Metadata == nil {
+			message.Metadata = make(map[string]any)
+		}
+		message.Metadata[key] = value
 	}
 }
 
@@ -749,6 +796,8 @@ func mapStopReason(reason litellm.FinishReason) agentcore.StopReason {
 		return agentcore.StopReasonToolUse
 	case litellm.FinishReasonError:
 		return agentcore.StopReasonError
+	case litellm.FinishReasonSafety:
+		return agentcore.StopReasonSafety
 	default:
 		return agentcore.StopReason(string(reason))
 	}

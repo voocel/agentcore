@@ -95,6 +95,7 @@ const (
 	StopReasonLength  StopReason = "length"
 	StopReasonToolUse StopReason = "toolUse"
 	StopReasonError   StopReason = "error"
+	StopReasonSafety  StopReason = "safety"
 	StopReasonAborted StopReason = "aborted"
 )
 
