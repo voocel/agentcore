@@ -3,6 +3,9 @@ package agentcore
 import (
 	"context"
 	"encoding/json"
+	"fmt"
+	"math"
+	"strings"
 )
 
 // ---------------------------------------------------------------------------
@@ -128,9 +131,9 @@ type ToolLabeler interface {
 // normalisation in compatible providers; returning false explicitly disables
 // strict on providers that default to it (e.g. OpenAI Responses API).
 //
-// The tool author is responsible for providing a strict-compatible schema:
-// every property listed in `required`, no unsupported keywords. See the
-// litellm provider docs for the exact subset.
+// Provider adapters own strict-schema normalization and validation because the
+// supported subset differs by provider. Tool authors should consult the
+// adapter documentation for provider-specific restrictions.
 type StrictSchemaTool interface {
 	StrictSchema() bool
 }
@@ -368,4 +371,264 @@ func (t *FuncTool) Description() string    { return t.description }
 func (t *FuncTool) Schema() map[string]any { return t.schema }
 func (t *FuncTool) Execute(ctx context.Context, args json.RawMessage) (json.RawMessage, error) {
 	return t.fn(ctx, args)
+}
+
+// ---------------------------------------------------------------------------
+// Tool Argument Validation
+// ---------------------------------------------------------------------------
+
+// validateToolArgs validates a tool call against the schema without changing
+// the model's arguments. Validation failures are returned to the model as tool
+// results so it can correct the complete set of issues on the next turn.
+func validateToolArgs(tool Tool, call ToolCall) error {
+	if call.ArgsInvalid {
+		return fmt.Errorf(
+			"%w: %s received malformed JSON arguments: %s\nraw args: %s",
+			ErrToolValidation, tool.Name(), call.ArgsParseError, call.ArgsRawText,
+		)
+	}
+
+	schema := tool.Schema()
+	if schema == nil {
+		return nil
+	}
+
+	args := call.Args
+	if len(args) == 0 {
+		args = []byte("{}")
+	}
+	var value any
+	if err := json.Unmarshal(args, &value); err != nil {
+		return fmt.Errorf("%w: %s received invalid JSON arguments: %v",
+			ErrToolValidation, tool.Name(), err)
+	}
+
+	issues := validateSchemaValue(value, schema, "")
+	if len(issues) > 0 {
+		return &ToolValidationError{ToolName: tool.Name(), Issues: issues}
+	}
+	return nil
+}
+
+func validateSchemaValue(value any, schema map[string]any, path string) []ValidationIssue {
+	var issues []ValidationIssue
+	issuePath := path
+	if issuePath == "" {
+		issuePath = "arguments"
+	}
+	types, hasTypes := schemaTypeNames(schema["type"])
+	if hasTypes && !matchesSchemaType(value, types) {
+		return []ValidationIssue{{
+			Kind:     IssueType,
+			Path:     issuePath,
+			Expected: strings.Join(types, " or "),
+			Received: jsonTypeName(value),
+			Hint:     mismatchHint(value, types),
+		}}
+	}
+
+	if values, ok := enumValues(schema["enum"]); ok && !containsJSONValue(values, value) {
+		issues = append(issues, ValidationIssue{
+			Kind:     IssueValue,
+			Path:     issuePath,
+			Expected: formatValues(values),
+			Received: formatValue(value),
+		})
+	}
+
+	object, isObject := value.(map[string]any)
+	if isObject && (containsString(types, "object") || schema["properties"] != nil || schema["required"] != nil) {
+		properties, _ := schema["properties"].(map[string]any)
+		if required, ok := stringValues(schema["required"]); ok {
+			for _, name := range required {
+				if _, exists := object[name]; !exists {
+					issues = append(issues, ValidationIssue{
+						Kind: IssueMissing,
+						Path: propertyPath(path, name),
+					})
+				}
+			}
+		}
+
+		for name, child := range object {
+			childPath := propertyPath(path, name)
+			if rawSchema, exists := properties[name]; exists {
+				if childSchema, ok := rawSchema.(map[string]any); ok {
+					issues = append(issues, validateSchemaValue(child, childSchema, childPath)...)
+				}
+				continue
+			}
+
+			additional := schema["additionalProperties"]
+			if additional == false {
+				issues = append(issues, ValidationIssue{Kind: IssueUnknown, Path: childPath})
+			} else if additionalSchema, ok := additional.(map[string]any); ok {
+				issues = append(issues, validateSchemaValue(child, additionalSchema, childPath)...)
+			}
+		}
+	}
+
+	array, isArray := value.([]any)
+	if isArray && (containsString(types, "array") || schema["items"] != nil) {
+		if itemSchema, ok := schema["items"].(map[string]any); ok {
+			for i, item := range array {
+				issues = append(issues, validateSchemaValue(item, itemSchema, itemPath(path, i))...)
+			}
+		}
+	}
+
+	return issues
+}
+
+func schemaTypeNames(value any) ([]string, bool) {
+	switch value := value.(type) {
+	case string:
+		return []string{value}, value != ""
+	case []string:
+		return value, len(value) > 0
+	case []any:
+		types := make([]string, 0, len(value))
+		for _, item := range value {
+			typ, ok := item.(string)
+			if !ok || typ == "" {
+				return nil, false
+			}
+			types = append(types, typ)
+		}
+		return types, len(types) > 0
+	default:
+		return nil, false
+	}
+}
+
+func stringValues(value any) ([]string, bool) {
+	switch value := value.(type) {
+	case nil:
+		return nil, false
+	case []string:
+		return value, true
+	case []any:
+		values := make([]string, 0, len(value))
+		for _, item := range value {
+			text, ok := item.(string)
+			if !ok {
+				return nil, false
+			}
+			values = append(values, text)
+		}
+		return values, true
+	default:
+		return nil, false
+	}
+}
+
+func enumValues(value any) ([]any, bool) {
+	switch value := value.(type) {
+	case []any:
+		return value, true
+	case []string:
+		values := make([]any, len(value))
+		for i, item := range value {
+			values[i] = item
+		}
+		return values, true
+	default:
+		return nil, false
+	}
+}
+
+func matchesSchemaType(value any, types []string) bool {
+	actual := jsonTypeName(value)
+	for _, typ := range types {
+		if typ == actual || typ == "number" && actual == "integer" {
+			return true
+		}
+	}
+	return false
+}
+
+func containsJSONValue(values []any, target any) bool {
+	targetJSON, err := json.Marshal(target)
+	if err != nil {
+		return false
+	}
+	for _, value := range values {
+		valueJSON, err := json.Marshal(value)
+		if err == nil && string(valueJSON) == string(targetJSON) {
+			return true
+		}
+	}
+	return false
+}
+
+func mismatchHint(value any, types []string) string {
+	text, ok := value.(string)
+	if !ok {
+		return ""
+	}
+	trimmed := strings.TrimSpace(text)
+	if containsString(types, "array") && strings.HasPrefix(trimmed, "[") {
+		return `Looks like a JSON-encoded array — pass the value directly (e.g. ["a","b"]), not wrapped in quotes.`
+	}
+	if containsString(types, "object") && strings.HasPrefix(trimmed, "{") {
+		return `Looks like a JSON-encoded object — pass the value directly (e.g. {"k":"v"}), not wrapped in quotes.`
+	}
+	return ""
+}
+
+func jsonTypeName(value any) string {
+	switch value := value.(type) {
+	case nil:
+		return "null"
+	case bool:
+		return "boolean"
+	case string:
+		return "string"
+	case float64:
+		if value == math.Trunc(value) {
+			return "integer"
+		}
+		return "number"
+	case []any:
+		return "array"
+	case map[string]any:
+		return "object"
+	default:
+		return fmt.Sprintf("%T", value)
+	}
+}
+
+func propertyPath(parent, property string) string {
+	if parent == "" {
+		return property
+	}
+	return parent + "." + property
+}
+
+func itemPath(parent string, index int) string {
+	return fmt.Sprintf("%s[%d]", parent, index)
+}
+
+func containsString(values []string, target string) bool {
+	for _, value := range values {
+		if value == target {
+			return true
+		}
+	}
+	return false
+}
+
+func formatValues(values []any) string {
+	formatted := make([]string, len(values))
+	for i, value := range values {
+		formatted[i] = formatValue(value)
+	}
+	return "[" + strings.Join(formatted, ", ") + "]"
+}
+
+func formatValue(value any) string {
+	if text, ok := value.(string); ok {
+		return fmt.Sprintf("%q", text)
+	}
+	return fmt.Sprint(value)
 }

@@ -8,7 +8,6 @@ import (
 	"maps"
 	"math"
 	"slices"
-	"strconv"
 	"strings"
 	"time"
 )
@@ -17,7 +16,6 @@ const (
 	defaultMaxTurns            = 100
 	defaultMaxRetries          = 3
 	defaultMaxLengthRecoveries = 3
-	defaultMaxToolErrors       = 3
 	defaultMaxRetryDelay       = 60 * time.Second
 )
 
@@ -894,7 +892,7 @@ func executeSingleToolCall(ctx context.Context, tools []Tool, call ToolCall, con
 			Content:    errContent,
 			IsError:    true,
 		}
-	} else if fixed, err := validateToolArgs(tool, call); err != nil {
+	} else if err := validateToolArgs(tool, call); err != nil {
 		errContent, _ := json.Marshal(err.Error())
 		result = ToolResult{
 			ToolCallID: call.ID,
@@ -903,13 +901,6 @@ func executeSingleToolCall(ctx context.Context, tools []Tool, call ToolCall, con
 			IsError:    true,
 		}
 	} else {
-		// Schema validation may have coerced trivially mis-typed args (e.g. a
-		// stringified number or JSON array) into clean values; run the tool with
-		// the corrected payload so downstream Validators and the tool itself see
-		// well-typed input.
-		if fixed != nil {
-			call.Args = fixed
-		}
 		// Stage 1: business-level input validation. Distinct from schema
 		// validation above — Validators check semantics (write-before-read,
 		// mtime drift, ...) using state the tool was constructed with.
@@ -1178,9 +1169,9 @@ func buildToolSpecs(tools []Tool) []ToolSpec {
 	}
 
 	var filter DeferFilter
-	for _, t := range tools {
-		if f, ok := t.(DeferFilter); ok {
-			filter = f
+	for _, tool := range tools {
+		if candidate, ok := tool.(DeferFilter); ok {
+			filter = candidate
 			break
 		}
 	}
@@ -1205,229 +1196,6 @@ func buildToolSpecs(tools []Tool) []ToolSpec {
 		specs = append(specs, spec)
 	}
 	return specs
-}
-
-// validateToolArgs validates tool call arguments against the tool's JSON Schema.
-// Collects every missing-required and type-mismatch issue in one pass so weaker
-// models can self-correct in a single follow-up turn instead of trial-and-error.
-// Error text is natural-language, one line per issue — empirically recovers
-// faster than terse errors.
-//
-// When call.ArgsInvalid is set (LLM emitted unparseable args; raw payload
-// captured upstream in call.ArgsRawText / call.ArgsParseError), schema checks
-// are skipped and the captured diagnostic is surfaced directly — running
-// schema validation against the "{}" placeholder would otherwise mislead the
-// model with a "missing field" error.
-func validateToolArgs(tool Tool, call ToolCall) (json.RawMessage, error) {
-	if call.ArgsInvalid {
-		return nil, fmt.Errorf(
-			"%w: %s received malformed JSON arguments: %s\nraw args: %s",
-			ErrToolValidation, tool.Name(), call.ArgsParseError, call.ArgsRawText,
-		)
-	}
-
-	schema := tool.Schema()
-	if schema == nil {
-		return nil, nil
-	}
-
-	args := call.Args
-	if len(args) == 0 {
-		args = []byte("{}")
-	}
-	var parsed map[string]any
-	if err := json.Unmarshal(args, &parsed); err != nil {
-		return nil, fmt.Errorf("%w: %s received invalid JSON arguments: %v",
-			ErrToolValidation, tool.Name(), err)
-	}
-
-	var issues []ValidationIssue
-
-	if reqSlice, ok := schema["required"]; ok {
-		if required, ok := reqSlice.([]string); ok {
-			for _, field := range required {
-				if _, exists := parsed[field]; !exists {
-					issues = append(issues, ValidationIssue{Kind: IssueMissing, Path: field})
-				}
-			}
-		}
-	}
-
-	// coerced tracks whether any value was recovered from a trivially-fixable
-	// type mismatch (e.g. a stringified number or JSON array). When set, the
-	// corrected args are re-marshaled and returned so the tool receives clean
-	// values instead of the loop stalling on a model that keeps re-sending the
-	// same mis-typed call. The original (mis-typed) args remain visible in the
-	// preceding EventToolExecStart, so the recovery stays observable.
-	coerced := false
-	if props, ok := schema["properties"].(map[string]any); ok {
-		for key, val := range parsed {
-			// JSON null on an optional field is equivalent to omitting the field.
-			// Some LLMs emit "field": null instead of dropping the key; rejecting
-			// those as type mismatches derails tool use on the very first call.
-			if val == nil {
-				continue
-			}
-			propSchema, exists := props[key]
-			if !exists {
-				continue
-			}
-			ps, ok := propSchema.(map[string]any)
-			if !ok {
-				continue
-			}
-			expectedType, _ := ps["type"].(string)
-			if expectedType == "" {
-				continue
-			}
-			if received, hint, mismatch := typeMismatch(val, expectedType); mismatch {
-				if fixed, ok := coerceArg(val, expectedType); ok {
-					parsed[key] = fixed
-					coerced = true
-					continue
-				}
-				issues = append(issues, ValidationIssue{
-					Kind:     IssueType,
-					Path:     key,
-					Expected: expectedType,
-					Received: received,
-					Hint:     hint,
-				})
-			}
-		}
-	}
-
-	if len(issues) > 0 {
-		return nil, &ToolValidationError{ToolName: tool.Name(), Issues: issues}
-	}
-	if coerced {
-		if fixed, err := json.Marshal(parsed); err == nil {
-			return fixed, nil
-		}
-		// Re-marshaling a freshly-unmarshaled map should never fail; if it
-		// somehow does, fall through and let the tool run with original args.
-	}
-	return nil, nil
-}
-
-// coerceArg recovers a trivially-fixable type mismatch: a value the model
-// emitted as a JSON string when the schema wants a number, array, or object.
-// It returns the corrected Go value and true only when the string parses
-// unambiguously into the expected type — e.g. "119" → 119 for an integer, or
-// `["a","b"]` → []any for an array. Anything ambiguous is left untouched so the
-// caller still surfaces a validation error. This rescues weaker models and
-// providers that stringify tool-call arguments and would otherwise loop forever
-// re-sending the same mis-typed call.
-func coerceArg(val any, expected string) (any, bool) {
-	s, ok := val.(string)
-	if !ok {
-		return nil, false
-	}
-	t := strings.TrimSpace(s)
-	switch expected {
-	case "integer":
-		if n, err := strconv.ParseInt(t, 10, 64); err == nil {
-			return float64(n), true
-		}
-	case "number":
-		if f, err := strconv.ParseFloat(t, 64); err == nil {
-			return f, true
-		}
-	case "array":
-		var a []any
-		if json.Unmarshal([]byte(t), &a) == nil {
-			return a, true
-		}
-	case "object":
-		var m map[string]any
-		if json.Unmarshal([]byte(t), &m) == nil {
-			return m, true
-		}
-	}
-	return nil, false
-}
-
-// typeMismatch reports whether val conflicts with the JSON Schema type. When it
-// does, the returned name is the user-facing JSON type name of the actual value
-// ("string" / "integer" / "number" / "boolean" / "array" / "object"). The hint
-// is non-empty only for known LLM mistake patterns — currently the
-// "JSON-encoded literal passed as a string" mistake that weaker models repeat
-// across turns without nudging.
-func typeMismatch(val any, expected string) (received string, hint string, mismatch bool) {
-	switch expected {
-	case "string":
-		if _, ok := val.(string); ok {
-			return "", "", false
-		}
-	case "integer":
-		if f, ok := val.(float64); ok && f == float64(int64(f)) {
-			return "", "", false
-		}
-	case "number":
-		if _, ok := val.(float64); ok {
-			return "", "", false
-		}
-	case "boolean":
-		if _, ok := val.(bool); ok {
-			return "", "", false
-		}
-	case "array":
-		if _, ok := val.([]any); ok {
-			return "", "", false
-		}
-	case "object":
-		if _, ok := val.(map[string]any); ok {
-			return "", "", false
-		}
-	default:
-		return "", "", false
-	}
-	return jsonTypeName(val), mismatchHint(val, expected), true
-}
-
-// mismatchHint catches the single most common LLM mistake: serializing an
-// array/object to a JSON string and passing the string. The hint nudges the
-// model to drop the surrounding quotes on the next turn. Other mismatches get
-// no hint to keep the error message terse.
-func mismatchHint(val any, expected string) string {
-	if expected != "array" && expected != "object" {
-		return ""
-	}
-	s, ok := val.(string)
-	if !ok {
-		return ""
-	}
-	trimmed := strings.TrimSpace(s)
-	if expected == "array" && strings.HasPrefix(trimmed, "[") {
-		return `Looks like a JSON-encoded array — pass the value directly (e.g. ["a","b"]), not wrapped in quotes.`
-	}
-	if expected == "object" && strings.HasPrefix(trimmed, "{") {
-		return `Looks like a JSON-encoded object — pass the value directly (e.g. {"k":"v"}), not wrapped in quotes.`
-	}
-	return ""
-}
-
-// jsonTypeName returns the JSON Schema type name for val.
-func jsonTypeName(val any) string {
-	switch v := val.(type) {
-	case nil:
-		return "null"
-	case bool:
-		return "boolean"
-	case string:
-		return "string"
-	case float64:
-		if v == float64(int64(v)) {
-			return "integer"
-		}
-		return "number"
-	case []any:
-		return "array"
-	case map[string]any:
-		return "object"
-	default:
-		return fmt.Sprintf("%T", val)
-	}
 }
 
 // buildMiddlewareChain wraps a tool execution function with the middleware stack.

@@ -137,16 +137,18 @@ func (e *ToolValidationError) Is(target error) bool { return target == ErrToolVa
 
 // ValidationIssue describes a single schema mismatch from tool arg validation.
 type ValidationIssue struct {
-	Kind     string // IssueMissing or IssueType
+	Kind     string
 	Path     string
-	Expected string // for IssueType only
-	Received string // for IssueType only
+	Expected string
+	Received string
 	Hint     string // optional fix hint, appended to the rendered message
 }
 
 const (
 	IssueMissing = "missing"
 	IssueType    = "type"
+	IssueValue   = "value"
+	IssueUnknown = "unknown"
 )
 
 // IsContextOverflow reports whether err indicates a context-overflow condition.
@@ -326,14 +328,14 @@ func containsAny(msg string, patterns ...string) bool {
 }
 
 // formatValidationIssues renders issues as a single multi-line block.
-// Missing params come first (most fundamental error), then type mismatches;
-// within each group, paths sort alphabetically for stable output.
+// Missing params come first; within each group, paths sort alphabetically for
+// stable output.
 func formatValidationIssues(toolName string, issues []ValidationIssue) string {
 	// Sort a copy: Error() must not mutate the caller's Issues slice.
 	issues = append([]ValidationIssue(nil), issues...)
 	sort.SliceStable(issues, func(i, j int) bool {
 		if issues[i].Kind != issues[j].Kind {
-			return issues[i].Kind == IssueMissing
+			return validationIssueRank(issues[i].Kind) < validationIssueRank(issues[j].Kind)
 		}
 		return issues[i].Path < issues[j].Path
 	})
@@ -349,6 +351,13 @@ func formatValidationIssues(toolName string, issues []ValidationIssue) string {
 				"The parameter `%s` type is expected as `%s` but provided as `%s`",
 				it.Path, it.Expected, it.Received,
 			)
+		case IssueValue:
+			line = fmt.Sprintf(
+				"The parameter `%s` must be one of %s but provided as %s",
+				it.Path, it.Expected, it.Received,
+			)
+		case IssueUnknown:
+			line = fmt.Sprintf("The parameter `%s` is not allowed", it.Path)
 		default:
 			continue
 		}
@@ -364,4 +373,19 @@ func formatValidationIssues(toolName string, issues []ValidationIssue) string {
 	}
 	header := fmt.Sprintf("InputValidationError: %s failed due to the following %s:", toolName, noun)
 	return header + "\n" + strings.Join(lines, "\n")
+}
+
+func validationIssueRank(kind string) int {
+	switch kind {
+	case IssueMissing:
+		return 0
+	case IssueType:
+		return 1
+	case IssueValue:
+		return 2
+	case IssueUnknown:
+		return 3
+	default:
+		return 4
+	}
 }

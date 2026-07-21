@@ -81,7 +81,6 @@ func NewAgent(opts ...AgentOption) *Agent {
 	a := &Agent{
 		maxTurns:         defaultMaxTurns,
 		maxRetries:       defaultMaxRetries,
-		maxToolErrors:    defaultMaxToolErrors,
 		pendingToolCalls: make(map[string]struct{}),
 	}
 	for _, opt := range opts {
