@@ -693,7 +693,11 @@ type editCandidate struct {
 	score     int
 }
 
-const candidatePreviewLines = 8
+const (
+	candidatePreviewLines      = 8
+	candidateSimilarityScale   = 100
+	minimumCandidateSimilarity = candidateSimilarityScale / 2
+)
 
 func formatEditCandidates(content, oldText string) string {
 	candidates := suggestEditCandidates(content, oldText)
@@ -801,15 +805,15 @@ func scoreCandidateBlock(candidateLines, targetLines []string) int {
 	}
 
 	if trimmedLine(candidateLines[0]) == trimmedLine(targetLines[0]) {
-		score += 2
+		score += candidateSimilarityScale / 2
 	}
 	last := len(targetLines) - 1
 	if trimmedLine(candidateLines[last]) == trimmedLine(targetLines[last]) {
-		score += 2
+		score += candidateSimilarityScale / 2
 	}
 
 	if normalizeLinesForIndentAware(candidateLines) == normalizeLinesForIndentAware(targetLines) {
-		score += 4
+		score += candidateSimilarityScale
 	}
 	return score
 }
@@ -821,16 +825,17 @@ func scoreCandidateLine(candidate, target string) int {
 		return 0
 	}
 	if c == t {
-		return 4
+		return candidateSimilarityScale
 	}
-	if collapseWhitespace(candidate) == collapseWhitespace(target) {
-		return 3
+
+	c = collapseWhitespace(c)
+	t = collapseWhitespace(t)
+	if c == t {
+		return candidateSimilarityScale - 1
 	}
-	if strings.Contains(c, t) || strings.Contains(t, c) {
-		return 2
-	}
-	if tokenOverlap(c, t) > 0 {
-		return 1
+	similarity := runeBigramSimilarity(c, t)
+	if similarity >= minimumCandidateSimilarity {
+		return similarity
 	}
 	return 0
 }
@@ -844,18 +849,33 @@ func collapseWhitespace(text string) string {
 	return strings.Join(strings.Fields(normalizeSearchText(text)), " ")
 }
 
-func tokenOverlap(a, b string) int {
-	seen := make(map[string]struct{})
-	for _, part := range strings.Fields(a) {
-		seen[part] = struct{}{}
+type runeBigram struct {
+	first  rune
+	second rune
+}
+
+func runeBigramSimilarity(a, b string) int {
+	ar := []rune(a)
+	br := []rune(b)
+	if len(ar) < 2 || len(br) < 2 {
+		return 0
 	}
+
+	counts := make(map[runeBigram]int, len(ar)-1)
+	for i := 1; i < len(ar); i++ {
+		counts[runeBigram{first: ar[i-1], second: ar[i]}]++
+	}
+
 	overlap := 0
-	for _, part := range strings.Fields(b) {
-		if _, ok := seen[part]; ok {
+	for i := 1; i < len(br); i++ {
+		pair := runeBigram{first: br[i-1], second: br[i]}
+		if counts[pair] > 0 {
 			overlap++
+			counts[pair]--
 		}
 	}
-	return overlap
+
+	return overlap * 2 * candidateSimilarityScale / (len(ar) + len(br) - 2)
 }
 
 func trimmedLine(text string) string {

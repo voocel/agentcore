@@ -216,3 +216,72 @@ func TestEditFailureIncludesClosestMatchHint(t *testing.T) {
 		t.Fatalf("expected candidate snippet, got %q", msg)
 	}
 }
+
+func TestEditFailureIncludesClosestChineseMatchHint(t *testing.T) {
+	t.Parallel()
+
+	dir := t.TempDir()
+	path := filepath.Join(dir, "chapter.md")
+	input := "她没有立刻回答，只是看向窗外。\n她说这话的时候语气很平，没有愤怒，也没有嘲讽，只是在陈述事实。\n沈渡没有再问。\n"
+	if err := os.WriteFile(path, []byte(input), 0o644); err != nil {
+		t.Fatalf("write fixture: %v", err)
+	}
+
+	tool := NewEdit(dir, NewFileReadState())
+	args, err := json.Marshal(map[string]any{
+		"file_path":  "chapter.md",
+		"old_string": "她说这话的时候，语气很平，没有愤怒，没有嘲讽，只是在陈述。",
+		"new_string": "她的语气依然平静。",
+	})
+	if err != nil {
+		t.Fatalf("marshal args: %v", err)
+	}
+
+	_, err = tool.Execute(context.Background(), args)
+	if err == nil {
+		t.Fatalf("expected edit error")
+	}
+	msg := err.Error()
+	if !strings.Contains(msg, "Possible old_string candidates (copy one exactly):") {
+		t.Fatalf("expected closest match hint, got %q", msg)
+	}
+	if !strings.Contains(msg, "她说这话的时候语气很平，没有愤怒，也没有嘲讽，只是在陈述事实。") {
+		t.Fatalf("expected exact Chinese candidate, got %q", msg)
+	}
+
+	got, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("read result: %v", err)
+	}
+	if string(got) != input {
+		t.Fatalf("failed edit mutated file:\nwant %q\ngot  %q", input, string(got))
+	}
+}
+
+func TestEditFailureOmitsUnrelatedChineseCandidate(t *testing.T) {
+	t.Parallel()
+
+	dir := t.TempDir()
+	path := filepath.Join(dir, "chapter.md")
+	if err := os.WriteFile(path, []byte("雨落在青石板上。\n远处传来晚钟。\n"), 0o644); err != nil {
+		t.Fatalf("write fixture: %v", err)
+	}
+
+	tool := NewEdit(dir, NewFileReadState())
+	args, err := json.Marshal(map[string]any{
+		"file_path":  "chapter.md",
+		"old_string": "实验数据已经完成全部校验。",
+		"new_string": "实验结束。",
+	})
+	if err != nil {
+		t.Fatalf("marshal args: %v", err)
+	}
+
+	_, err = tool.Execute(context.Background(), args)
+	if err == nil {
+		t.Fatalf("expected edit error")
+	}
+	if strings.Contains(err.Error(), "Possible old_string candidates") {
+		t.Fatalf("unexpected unrelated candidate hint: %q", err)
+	}
+}
