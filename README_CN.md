@@ -158,10 +158,18 @@ worker := subagent.Config{
     Tools:        []agentcore.Tool{tools.NewRead(".", workerState), tools.NewWrite(".", workerState), tools.NewEdit(".", workerState), tools.NewBash(".")},
 }
 
+runner := subagent.NewRunner(scout, worker)
+subagentTool := runner.AsTool()
 agent := agentcore.NewAgent(
     agentcore.WithModel(model),
-    agentcore.WithTools(subagent.New(scout, worker)),
+    agentcore.WithTools(subagentTool),
 )
+```
+
+如果流程由宿主代码调度，可以绕过 JSON 工具协议直接调用：
+
+```go
+result, err := runner.Run(ctx, "worker", "实现指定修改")
 ```
 
 要启用 background 模式（异步 subagent + 完成后通知主 Agent），需要再接一个共享任务运行时：
@@ -170,9 +178,8 @@ agent := agentcore.NewAgent(
 import "github.com/voocel/agentcore/task"
 
 rt := task.NewRuntime()
-sat := subagent.New(scout, worker)
-sat.SetTaskRuntime(rt)
-sat.SetNotifyFn(agent.FollowUp) // 完成后把通知作为 follow-up 送回父 Agent
+subagentTool.SetTaskRuntime(rt)
+subagentTool.SetNotifyFn(agent.FollowUp) // 完成后把通知作为 follow-up 送回父 Agent
 ```
 
 LLM 通过工具调用触发四种执行模式：

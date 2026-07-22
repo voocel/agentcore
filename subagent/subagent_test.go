@@ -4,6 +4,8 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
+	"io"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -108,7 +110,7 @@ func parseResult(t *testing.T, raw json.RawMessage) map[string]any {
 }
 
 func TestTool_Single(t *testing.T) {
-	tool := New(simpleAgent("writer", "hello"))
+	tool := NewRunner(simpleAgent("writer", "hello")).AsTool()
 	result, err := tool.Execute(context.Background(), json.RawMessage(`{"agent":"writer","task":"greet"}`))
 	if err != nil {
 		t.Fatal(err)
@@ -119,8 +121,50 @@ func TestTool_Single(t *testing.T) {
 	}
 }
 
+func TestRunner_Run(t *testing.T) {
+	runner := NewRunner(simpleAgent("writer", "hello"))
+	result, err := runner.Run(context.Background(), "writer", "greet")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.Agent != "writer" || result.Output != "hello" {
+		t.Fatalf("unexpected result: %+v", result)
+	}
+}
+
+func TestNewRunnerRejectsInvalidRegistry(t *testing.T) {
+	tests := []struct {
+		name   string
+		agents []Config
+		want   string
+	}{
+		{name: "empty name", agents: []Config{{}}, want: "agent name is required"},
+		{name: "duplicate name", agents: []Config{{Name: "writer"}, {Name: "writer"}}, want: `duplicate agent "writer"`},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			defer func() {
+				recovered := recover()
+				if recovered == nil || !strings.Contains(fmt.Sprint(recovered), tt.want) {
+					t.Fatalf("NewRunner panic = %v, want containing %q", recovered, tt.want)
+				}
+			}()
+			NewRunner(tt.agents...)
+		})
+	}
+}
+
+func TestTool_ModelOverrideRequiresResolver(t *testing.T) {
+	tool := NewRunner(simpleAgent("writer", "hello")).AsTool()
+	_, err := tool.Execute(context.Background(), json.RawMessage(`{"agent":"writer","task":"greet","model":"other"}`))
+	if err == nil || !strings.Contains(err.Error(), "no model resolver configured") {
+		t.Fatalf("expected explicit model resolver error, got %v", err)
+	}
+}
+
 func TestTool_UnknownAgent(t *testing.T) {
-	tool := New(simpleAgent("writer", "x"))
+	tool := NewRunner(simpleAgent("writer", "x")).AsTool()
 	_, err := tool.Execute(context.Background(), json.RawMessage(`{"agent":"unknown","task":"hi"}`))
 	if err == nil || !strings.Contains(err.Error(), "unknown agent") {
 		t.Fatalf("expected unknown agent error, got %v", err)
@@ -131,7 +175,7 @@ func TestTool_UnknownAgent(t *testing.T) {
 // degradation to synchronous execution would violate the "return immediately,
 // notify on completion" contract callers expect from background mode.
 func TestTool_BackgroundRequiresTaskRuntime(t *testing.T) {
-	tool := New(simpleAgent("writer", "x"))
+	tool := NewRunner(simpleAgent("writer", "x")).AsTool()
 	_, err := tool.Execute(context.Background(), json.RawMessage(`{"agent":"writer","task":"go","background":true}`))
 	if err == nil {
 		t.Fatal("expected error when background=true and TaskRuntime is missing, got nil")
@@ -168,7 +212,7 @@ func TestTool_SinglePropagatesFinalErrorAfterPartialOutput(t *testing.T) {
 		MaxTurns: 3,
 	}
 
-	tool := New(cfg)
+	tool := NewRunner(cfg).AsTool()
 	result, err := tool.Execute(context.Background(), json.RawMessage(`{"agent":"writer","task":"write"}`))
 	if err == nil {
 		t.Fatalf("expected final LLM error to propagate, got result %s", string(result))
@@ -179,10 +223,10 @@ func TestTool_SinglePropagatesFinalErrorAfterPartialOutput(t *testing.T) {
 }
 
 func TestTool_Chain(t *testing.T) {
-	tool := New(
+	tool := NewRunner(
 		simpleAgent("step1", "first-output"),
 		simpleAgent("step2", "final-output"),
-	)
+	).AsTool()
 	args := `{"chain":[{"agent":"step1","task":"do A"},{"agent":"step2","task":"continue from {previous}"}]}`
 	result, err := tool.Execute(context.Background(), json.RawMessage(args))
 	if err != nil {
@@ -199,10 +243,10 @@ func TestTool_Chain(t *testing.T) {
 }
 
 func TestTool_Parallel(t *testing.T) {
-	tool := New(
+	tool := NewRunner(
 		simpleAgent("a", "result-a"),
 		simpleAgent("b", "result-b"),
-	)
+	).AsTool()
 	args := `{"tasks":[{"agent":"a","task":"t1"},{"agent":"b","task":"t2"}]}`
 	result, err := tool.Execute(context.Background(), json.RawMessage(args))
 	if err != nil {
@@ -215,7 +259,7 @@ func TestTool_Parallel(t *testing.T) {
 }
 
 func TestTool_ModeValidation(t *testing.T) {
-	tool := New(simpleAgent("x", "y"))
+	tool := NewRunner(simpleAgent("x", "y")).AsTool()
 
 	// No mode
 	_, err := tool.Execute(context.Background(), json.RawMessage(`{}`))
@@ -248,7 +292,7 @@ func TestTool_ModelOverrideRebuildsContextManager(t *testing.T) {
 		MaxTurns: 3,
 	}
 
-	tool := New(cfg)
+	tool := NewRunner(cfg).AsTool()
 	tool.SetCreateModel(func(name string) (agentcore.ChatModel, error) {
 		return overrideModel, nil
 	})
@@ -285,7 +329,7 @@ func (m *fakeNamedModel) SupportsTools() bool { return true }
 // depth into ctx, then asserting the spawn either succeeds with childDepth=N+1
 // or rejects when N+1 > MaxAgentDepth.
 func TestTool_BackgroundRespectsMaxAgentDepth(t *testing.T) {
-	tool := New(simpleAgent("writer", "ok"))
+	tool := NewRunner(simpleAgent("writer", "ok")).AsTool()
 	tool.SetTaskRuntime(task.NewRuntime())
 
 	cases := []struct {
@@ -340,12 +384,91 @@ func TestTool_BackgroundRespectsMaxAgentDepth(t *testing.T) {
 	}
 }
 
+type errorWriteCloser struct {
+	writeErr error
+	closeErr error
+}
+
+func (w *errorWriteCloser) Write(p []byte) (int, error) {
+	if w.writeErr != nil {
+		return 0, w.writeErr
+	}
+	return len(p), nil
+}
+
+func (w *errorWriteCloser) Close() error { return w.closeErr }
+
+func TestTool_BackgroundOutputErrorsFailTask(t *testing.T) {
+	tests := []struct {
+		name    string
+		factory func(string, string) (io.WriteCloser, string, error)
+		want    string
+	}{
+		{
+			name: "create",
+			factory: func(string, string) (io.WriteCloser, string, error) {
+				return nil, "", errors.New("disk unavailable")
+			},
+			want: "create background output: disk unavailable",
+		},
+		{
+			name: "write",
+			factory: func(string, string) (io.WriteCloser, string, error) {
+				return &errorWriteCloser{writeErr: errors.New("disk full")}, "output.jsonl", nil
+			},
+			want: "write background output: disk full",
+		},
+		{
+			name: "close",
+			factory: func(string, string) (io.WriteCloser, string, error) {
+				return &errorWriteCloser{closeErr: errors.New("flush failed")}, "output.jsonl", nil
+			},
+			want: "close background output: flush failed",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			rt := task.NewRuntime()
+			tool := NewRunner(simpleAgent("writer", "done")).AsTool()
+			tool.SetTaskRuntime(rt)
+			tool.SetBgOutputFactory(tt.factory)
+
+			raw, err := tool.Execute(context.Background(), json.RawMessage(`{"agent":"writer","task":"write","background":true}`))
+			if err != nil {
+				t.Fatal(err)
+			}
+			result := parseResult(t, raw)
+			taskID, _ := result["task_id"].(string)
+			if taskID == "" {
+				t.Fatalf("missing task_id: %s", raw)
+			}
+
+			deadline := time.Now().Add(3 * time.Second)
+			var entry *task.Entry
+			for time.Now().Before(deadline) {
+				entry = rt.Get(taskID)
+				if entry != nil && entry.Status.IsTerminal() {
+					break
+				}
+				time.Sleep(10 * time.Millisecond)
+			}
+			if entry == nil || entry.Status != task.Failed {
+				t.Fatalf("task status = %+v, want failed", entry)
+			}
+			if !strings.Contains(entry.Error, tt.want) {
+				t.Fatalf("task error = %q, want containing %q", entry.Error, tt.want)
+			}
+		})
+	}
+}
+
 // Verifies the parent→child wiring end-to-end: a message queued via
 // task.Runtime.AppendPending while the background sub-agent is running must
 // reach the sub-agent's next LLM call. The chain under test is:
 //
 //	AppendPending → Runtime.pendingMessages
-//	             → loopCfg.GetSteeringMessages (bound in runAgent)
+//	             → loopCfg.GetSteeringMessages (bound in Runner.run)
 //	             → injected as UserMsg before turn 2
 //
 // If any link breaks, the second LLM call won't see "follow-up steered".
@@ -407,7 +530,7 @@ func TestTool_BackgroundDrainsPendingMessagesIntoNextTurn(t *testing.T) {
 		MaxTurns: 5,
 	}
 
-	tool := New(cfg)
+	tool := NewRunner(cfg).AsTool()
 	tool.SetTaskRuntime(rt)
 
 	raw, err := tool.Execute(context.Background(), json.RawMessage(`{"agent":"writer","task":"start","background":true}`))
@@ -488,7 +611,7 @@ func (m *thinkingCaptureModel) SupportsTools() bool { return true }
 // Config.ThinkingLevel must reach the LLM call as the resolved reasoning level.
 func TestTool_ThinkingLevelFromConfig(t *testing.T) {
 	model := &thinkingCaptureModel{}
-	tool := New(Config{Name: "writer", Description: "w", Model: model, MaxTurns: 3, ThinkingLevel: agentcore.ThinkingHigh})
+	tool := NewRunner(Config{Name: "writer", Description: "w", Model: model, MaxTurns: 3, ThinkingLevel: agentcore.ThinkingHigh}).AsTool()
 	if _, err := tool.Execute(context.Background(), json.RawMessage(`{"agent":"writer","task":"go"}`)); err != nil {
 		t.Fatal(err)
 	}
@@ -498,10 +621,11 @@ func TestTool_ThinkingLevelFromConfig(t *testing.T) {
 }
 
 // SetThinkingLevel installs a runtime override that wins over Config.ThinkingLevel.
-func TestTool_SetThinkingLevelOverridesConfig(t *testing.T) {
+func TestRunner_SetThinkingLevelOverridesConfig(t *testing.T) {
 	model := &thinkingCaptureModel{}
-	tool := New(Config{Name: "writer", Description: "w", Model: model, MaxTurns: 3, ThinkingLevel: agentcore.ThinkingLow})
-	tool.SetThinkingLevel("writer", agentcore.ThinkingXHigh)
+	runner := NewRunner(Config{Name: "writer", Description: "w", Model: model, MaxTurns: 3, ThinkingLevel: agentcore.ThinkingLow})
+	runner.SetThinkingLevel("writer", agentcore.ThinkingXHigh)
+	tool := runner.AsTool()
 	if _, err := tool.Execute(context.Background(), json.RawMessage(`{"agent":"writer","task":"go"}`)); err != nil {
 		t.Fatal(err)
 	}
@@ -515,7 +639,7 @@ func TestTool_SetThinkingLevelOverridesConfig(t *testing.T) {
 // that think by default.
 func TestTool_ThinkingOffIsForwarded(t *testing.T) {
 	model := &thinkingCaptureModel{}
-	tool := New(Config{Name: "writer", Description: "w", Model: model, MaxTurns: 3, ThinkingLevel: agentcore.ThinkingOff})
+	tool := NewRunner(Config{Name: "writer", Description: "w", Model: model, MaxTurns: 3, ThinkingLevel: agentcore.ThinkingOff}).AsTool()
 	if _, err := tool.Execute(context.Background(), json.RawMessage(`{"agent":"writer","task":"go"}`)); err != nil {
 		t.Fatal(err)
 	}

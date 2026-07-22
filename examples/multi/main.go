@@ -74,7 +74,7 @@ func main() {
 			tools.NewWrite(".", mainState),
 			tools.NewEdit(".", mainState),
 			tools.NewBash("."),
-			subagent.New(scout, reviewer),
+			subagent.NewRunner(scout, reviewer).AsTool(),
 		),
 		agentcore.WithMaxTurns(20),
 	)

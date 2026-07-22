@@ -28,7 +28,7 @@ func (c *captureSpawner) fn() TeamSpawner {
 }
 
 func newToolWithAgent(name string) *Tool {
-	return New(Config{Name: name, Description: "test agent for spawn routing"})
+	return NewRunner(Config{Name: name, Description: "test agent for spawn routing"}).AsTool()
 }
 
 func TestSubAgentTool_TeamSpawn_RoutesWhenTeamNameSet(t *testing.T) {
@@ -66,6 +66,31 @@ func TestSubAgentTool_TeamSpawn_RoutesWhenTeamNameSet(t *testing.T) {
 	}
 }
 
+func TestSubAgentTool_TeamSpawn_RoutesWhenOnlyNameSet(t *testing.T) {
+	tl := newToolWithAgent("researcher")
+	sp := &captureSpawner{res: &TeamSpawnResult{TaskID: "tm-1", AgentID: "alice@default"}}
+	tl.SetTeamSpawner(sp.fn())
+
+	args, _ := json.Marshal(map[string]any{
+		"agent": "researcher",
+		"task":  "find clue",
+		"name":  "alice",
+	})
+	out, err := tl.Execute(context.Background(), args)
+	if err != nil {
+		t.Fatalf("Execute: %v", err)
+	}
+	if len(sp.calls) != 1 {
+		t.Fatalf("expected exactly 1 spawn call, got %d", len(sp.calls))
+	}
+	if got := sp.calls[0]; got.Name != "alice" || got.TeamName != "" {
+		t.Errorf("unexpected request: %+v", got)
+	}
+	if result := parseResult(t, out); strings.Contains(result["message"].(string), `team ""`) {
+		t.Errorf("default-team response should not report an empty team name: %v", result)
+	}
+}
+
 func TestSubAgentTool_TeamSpawn_NameDefaultsToAgent(t *testing.T) {
 	tl := newToolWithAgent("researcher")
 	sp := &captureSpawner{res: &TeamSpawnResult{TaskID: "tm-1", AgentID: "researcher@alpha"}}
@@ -93,16 +118,9 @@ func TestSubAgentTool_TeamSpawn_RejectsUnknownAgent(t *testing.T) {
 		"task":      "x",
 		"team_name": "alpha",
 	})
-	out, err := tl.Execute(context.Background(), args)
-	if err != nil {
-		t.Fatalf("Execute: %v", err)
-	}
-	var got map[string]any
-	if err := json.Unmarshal(out, &got); err != nil {
-		t.Fatalf("unmarshal: %v", err)
-	}
-	if errStr, _ := got["error"].(string); !strings.Contains(errStr, `unknown agent "ghost"`) {
-		t.Errorf("expected unknown-agent error, got %v", got)
+	_, err := tl.Execute(context.Background(), args)
+	if !errors.Is(err, ErrUnknownAgent) || !strings.Contains(err.Error(), `unknown agent "ghost"`) {
+		t.Errorf("expected typed unknown-agent error, got %v", err)
 	}
 }
 

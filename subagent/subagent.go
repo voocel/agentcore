@@ -1,12 +1,6 @@
-// Package subagent implements a Tool that delegates work to specialized
-// sub-agents with isolated contexts. Four execution modes are supported:
-// single, parallel, chain, and background.
-//
-// Two calling surfaces share the same execution core: the LLM tool-call
-// surface (Tool.Execute, JSON in/out for a coordinating agent) and the
-// programmatic surface (Tool.Run, typed in/out for host code that schedules
-// agents itself). Hosts that route control flow in code should prefer Run —
-// it skips JSON marshalling and returns typed results and error chains.
+// Package subagent runs specialized agents with isolated contexts.
+// Runner is the typed host-facing API. Tool adapts a Runner for model-driven
+// delegation, including parallel, chain, background, and team execution.
 package subagent
 
 import (
@@ -27,11 +21,6 @@ import (
 	"github.com/voocel/agentcore/schema"
 	"github.com/voocel/agentcore/task"
 	"github.com/voocel/agentcore/tools"
-)
-
-const (
-	maxParallelTasks = 8
-	maxConcurrency   = 4
 )
 
 // Config defines a sub-agent's identity and capabilities.
@@ -57,7 +46,7 @@ type Config struct {
 	// ThinkingLevel sets the reasoning depth for this sub-agent's runs.
 	// Empty ("") leaves it unspecified (model/provider default). Mirrors
 	// agentcore.WithThinkingLevel for top-level agents. A runtime override
-	// installed via Tool.SetThinkingLevel takes precedence over this baseline.
+	// installed via Runner.SetThinkingLevel takes precedence over this baseline.
 	ThinkingLevel agentcore.ThinkingLevel
 
 	// MaxRetries caps the LLM call retry count for retryable errors within
@@ -118,10 +107,9 @@ type params struct {
 	Description string      `json:"description,omitempty"`
 	Model       string      `json:"model,omitempty"`
 
-	// Team-spawn parameters. TeamName is the switch: when non-empty the
-	// subagent tool delegates to the configured TeamSpawner instead of
-	// running a one-shot loop. Name is the teammate's identifier inside the
-	// team (defaults to Agent if omitted). Color is an optional UI hint.
+	// Team-spawn parameters. Name or TeamName selects team mode. Name is the
+	// teammate's identifier inside the team (defaults to Agent if omitted);
+	// TeamName may be empty when the host provides a default team.
 	TeamName string `json:"team_name,omitempty"`
 	Name     string `json:"name,omitempty"`
 	Color    string `json:"color,omitempty"`
@@ -161,13 +149,13 @@ type Usage struct {
 }
 
 // ErrUnknownAgent is the sentinel for "agent name not registered with this
-// Tool". Match with errors.Is; use errors.As with *UnknownAgentError to read
+// Runner". Match with errors.Is; use errors.As with *UnknownAgentError to read
 // the requested name and the available set. A host scheduler branches on this
 // to classify the failure as deterministic (retrying the same run cannot
 // succeed) without matching error strings.
 var ErrUnknownAgent = errors.New("unknown agent")
 
-// UnknownAgentError reports a lookup failure against the Tool's registry.
+// UnknownAgentError reports a lookup failure against the Runner's registry.
 // errors.Is matches ErrUnknownAgent.
 type UnknownAgentError struct {
 	Agent     string
@@ -269,14 +257,14 @@ type TeamSpawnResult struct {
 // needs one method and call sites are simpler with a closure.
 type TeamSpawner func(ctx context.Context, req TeamSpawnRequest) (*TeamSpawnResult, error)
 
-// RunMeta identifies one sub-agent run (one runAgent invocation) for an
+// RunMeta identifies one sub-agent run for an
 // external event observer. It lets a harness route a run's raw AgentLoop
 // events to a per-run sink (e.g. a live-preview transcript) without the
 // subagent tool knowing anything about that sink.
 //
 //   - Agent:      the agent definition/type name (e.g. "explore"). Not unique
 //     when the same type runs more than once concurrently (parallel mode).
-//   - InstanceID: unique per runAgent invocation within this Tool's lifetime.
+//   - InstanceID: unique per run invocation within this Runner's lifetime.
 //     Use this — not Agent — as the routing key.
 //   - Mode:       one of the Mode* constants below.
 type RunMeta struct {
@@ -294,28 +282,47 @@ const (
 	ModeBackground = "background"
 )
 
-// Tool implements agentcore.Tool. The main agent calls this tool to delegate
-// tasks to specialized sub-agents with isolated contexts.
+// Runner executes registered agents through AgentLoop. It owns only agent
+// definitions and per-run behavior; model-facing JSON and background/team
+// orchestration live in Tool.
+type Runner struct {
+	agents        map[string]Config
+	thinkMu       sync.RWMutex
+	thinkOverride map[string]agentcore.ThinkingLevel
+	eventObserver func(meta RunMeta, ev agentcore.Event)
+	runSeq        atomic.Int64
+}
+
+// NewRunner creates a Runner from the supplied agent definitions. It panics
+// when an agent name is empty or duplicated because the registry is static
+// program configuration and either condition is a programming error.
+func NewRunner(agents ...Config) *Runner {
+	m := make(map[string]Config, len(agents))
+	for _, agent := range agents {
+		if agent.Name == "" {
+			panic("subagent: agent name is required")
+		}
+		if _, exists := m[agent.Name]; exists {
+			panic(fmt.Sprintf("subagent: duplicate agent %q", agent.Name))
+		}
+		m[agent.Name] = agent
+	}
+	return &Runner{agents: m}
+}
+
+// AsTool exposes model-driven delegation backed by this Runner.
+func (r *Runner) AsTool() *Tool {
+	return &Tool{runner: r}
+}
+
+// Tool implements agentcore.Tool as an adapter over Runner.
 type Tool struct {
-	agents          map[string]Config
-	thinkMu         sync.RWMutex                                                   // guards thinkOverride (runtime reconfiguration)
-	thinkOverride   map[string]agentcore.ThinkingLevel                             // runtime thinking-level overrides keyed by agent name; nil until first SetThinkingLevel
+	runner          *Runner
 	notifyFn        func(agentcore.AgentMessage)                                   // called when a background task completes
 	createModel     func(name string) (agentcore.ChatModel, error)                 // resolves model name to ChatModel at runtime
 	bgOutputFactory func(taskID, agentName string) (io.WriteCloser, string, error) // creates output writer for background tasks
 	taskRT          *task.Runtime                                                  // shared background task registry
 	teamSpawner     TeamSpawner                                                    // routes team-mode calls; nil means team spawn is rejected
-	eventObserver   func(meta RunMeta, ev agentcore.Event)                         // optional: observes every run's raw AgentLoop events; nil disables
-	runSeq          atomic.Int64                                                   // mints unique RunMeta.InstanceID values
-}
-
-// New creates a subagent tool from a set of agent configs.
-func New(agents ...Config) *Tool {
-	m := make(map[string]Config, len(agents))
-	for _, a := range agents {
-		m[a.Name] = a
-	}
-	return &Tool{agents: m}
 }
 
 // SetTaskRuntime sets the shared task runtime for background task
@@ -343,28 +350,28 @@ func (t *Tool) SetCreateModel(fn func(name string) (agentcore.ChatModel, error))
 // Config.ThinkingLevel baseline. Safe to call concurrently with running agents:
 // the override lives in an isolated map and never mutates the immutable agents
 // config map. Empty level ("") means model/provider default.
-func (t *Tool) SetThinkingLevel(agentName string, level agentcore.ThinkingLevel) {
-	t.thinkMu.Lock()
-	defer t.thinkMu.Unlock()
-	if t.thinkOverride == nil {
-		t.thinkOverride = make(map[string]agentcore.ThinkingLevel)
+func (r *Runner) SetThinkingLevel(agentName string, level agentcore.ThinkingLevel) {
+	r.thinkMu.Lock()
+	defer r.thinkMu.Unlock()
+	if r.thinkOverride == nil {
+		r.thinkOverride = make(map[string]agentcore.ThinkingLevel)
 	}
-	t.thinkOverride[agentName] = level
+	r.thinkOverride[agentName] = level
 }
 
 // resolveThinking returns the runtime override for agentName if one was
 // installed via SetThinkingLevel, otherwise the config baseline.
-func (t *Tool) resolveThinking(agentName string, base agentcore.ThinkingLevel) agentcore.ThinkingLevel {
-	t.thinkMu.RLock()
-	defer t.thinkMu.RUnlock()
-	if lv, ok := t.thinkOverride[agentName]; ok {
+func (r *Runner) resolveThinking(agentName string, base agentcore.ThinkingLevel) agentcore.ThinkingLevel {
+	r.thinkMu.RLock()
+	defer r.thinkMu.RUnlock()
+	if lv, ok := r.thinkOverride[agentName]; ok {
 		return lv
 	}
 	return base
 }
 
 // SetTeamSpawner installs the closure that handles team-spawn mode. Without
-// it, calls that set team_name are rejected with a clear error so the LLM
+// it, calls that set name or team_name are rejected with a clear error so the LLM
 // learns the feature is unavailable rather than silently downgrading to a
 // regular subagent run.
 func (t *Tool) SetTeamSpawner(fn TeamSpawner) {
@@ -380,16 +387,16 @@ func (t *Tool) SetTeamSpawner(fn TeamSpawner) {
 // The callback MUST be non-blocking: it runs inline on the sub-agent's
 // execution goroutine (and on parallel/background goroutines concurrently), so
 // a slow observer stalls the run. Sinks that may block should buffer + drop.
-func (t *Tool) SetEventObserver(fn func(meta RunMeta, ev agentcore.Event)) {
-	t.eventObserver = fn
+func (r *Runner) SetEventObserver(fn func(meta RunMeta, ev agentcore.Event)) {
+	r.eventObserver = fn
 }
 
 // AgentConfig returns the registered sub-agent definition for name, or
 // (zero, false) if none is registered. Exposed read-only so a harness can
 // rebuild a TeamSpawnRequest when resuming a teammate by its agent type
 // without re-deriving the config from scratch.
-func (t *Tool) AgentConfig(name string) (Config, bool) {
-	cfg, ok := t.agents[name]
+func (r *Runner) AgentConfig(name string) (Config, bool) {
+	cfg, ok := r.agents[name]
 	return cfg, ok
 }
 
@@ -407,28 +414,28 @@ func (t *Tool) Label() string { return "Delegate to SubAgent" }
 // Description and Schema are rebuilt on every LLM call; iterating the map
 // directly would shuffle their bytes across requests and defeat provider
 // prefix caching (tools serialize into the cached prompt prefix).
-func (t *Tool) sortedAgentNames() []string {
-	return slices.Sorted(maps.Keys(t.agents))
+func (r *Runner) sortedAgentNames() []string {
+	return slices.Sorted(maps.Keys(r.agents))
 }
 
 func (t *Tool) Description() string {
-	names := make([]string, 0, len(t.agents))
-	for _, name := range t.sortedAgentNames() {
-		a := t.agents[name]
+	names := make([]string, 0, len(t.runner.agents))
+	for _, name := range t.runner.sortedAgentNames() {
+		a := t.runner.agents[name]
 		names = append(names, fmt.Sprintf("%s (%s)", a.Name, a.Description))
 	}
 	return fmt.Sprintf(
 		"Delegate tasks to specialized subagents with isolated context. "+
 			"Modes: single (agent+task), parallel (tasks array), chain (sequential with {previous} placeholder), "+
 			"background (agent+task+background=true, returns immediately and notifies on completion), "+
-			"team (agent+task+team_name spawns a long-lived teammate that communicates via send_message). "+
+			"team (agent+task+name; team_name optional, spawns a long-lived teammate that communicates via send_message). "+
 			"Available agents: %s",
 		strings.Join(names, ", "),
 	)
 }
 
 func (t *Tool) Schema() map[string]any {
-	agentNames := t.sortedAgentNames()
+	agentNames := t.runner.sortedAgentNames()
 	taskItem := schema.Object(
 		schema.Property("agent", schema.Enum("Agent name", agentNames...)).Required(),
 		schema.Property("task", schema.String("Task description")).Required(),
@@ -441,8 +448,8 @@ func (t *Tool) Schema() map[string]any {
 		schema.Property("background", schema.Bool("Set true to run in background. Returns immediately; a notification is sent when the task completes.")),
 		schema.Property("description", schema.String("Short description of the background/team task (shown in notifications and listings).")),
 		schema.Property("model", schema.String("Optional model override for this call (e.g. model ID or alias). If not set, uses the agent's default model.")),
-		schema.Property("team_name", schema.String("Name of the active team. When set, spawns a long-lived teammate instead of running a one-shot subagent.")),
-		schema.Property("name", schema.String("Teammate name inside the team (defaults to the agent's name). Must be unique and not 'team-lead'.")),
+		schema.Property("team_name", schema.String("Optional active team name for teammate spawning. Omit when the host provides a default team.")),
+		schema.Property("name", schema.String("Teammate name. Setting this selects team mode; must be unique and not 'team-lead'.")),
 		schema.Property("color", schema.String("Optional UI color tag for the teammate.")),
 	)
 }
@@ -455,10 +462,13 @@ func (t *Tool) Execute(ctx context.Context, args json.RawMessage) (json.RawMessa
 
 	// Resolve model override once (applies to all subtasks in this call).
 	var modelOverride agentcore.ChatModel
-	if p.Model != "" && t.createModel != nil {
+	if p.Model != "" {
+		if t.createModel == nil {
+			return nil, fmt.Errorf("model override %q is unavailable: no model resolver configured", p.Model)
+		}
 		m, err := t.createModel(p.Model)
 		if err != nil {
-			return json.Marshal(map[string]any{"error": fmt.Sprintf("invalid model %q: %v", p.Model, err)})
+			return nil, fmt.Errorf("resolve model override %q: %w", p.Model, err)
 		}
 		modelOverride = m
 	}
@@ -468,12 +478,12 @@ func (t *Tool) Execute(ctx context.Context, args json.RawMessage) (json.RawMessa
 	hasSingle := p.Agent != "" && p.Task != ""
 
 	// Team-spawn mode: long-lived teammate. Mutually exclusive with the
-	// other modes — Background and team_name together is ambiguous, and
+	// other modes — Background and team fields together are ambiguous, and
 	// parallel/chain are conceptually one-shot. Check this BEFORE Background
 	// so a user calling with both keys gets the team-mode error path.
-	if p.TeamName != "" {
+	if p.Name != "" || p.TeamName != "" {
 		if p.Background || hasChain || hasParallel {
-			return nil, fmt.Errorf("team_name is mutually exclusive with background/tasks/chain")
+			return nil, fmt.Errorf("team mode is mutually exclusive with background/tasks/chain")
 		}
 		if !hasSingle {
 			return nil, fmt.Errorf("team mode requires agent + task")
@@ -510,10 +520,8 @@ func (t *Tool) Execute(ctx context.Context, args json.RawMessage) (json.RawMessa
 	}
 }
 
-// Run executes one registered sub-agent programmatically — the host-code
-// counterpart of the LLM calling this tool with agent+task. It bypasses the
-// JSON tool shell entirely: inputs are typed parameters, outputs are a typed
-// RunResult, and failures are Go errors carrying the loop's full chain
+// Run executes one registered sub-agent programmatically. Inputs and outputs
+// are typed, and failures are Go errors carrying the loop's full chain
 // (errors.Is(err, ErrUnknownAgent) for lookup failures,
 // agentcore.ErrStopGuard / ErrMaxTurns / provider sentinels for loop
 // failures — see agentcore.ErrorKind for the stable taxonomy).
@@ -522,8 +530,8 @@ func (t *Tool) Execute(ctx context.Context, args json.RawMessage) (json.RawMessa
 // tool-call path: StopGuard, StopAfterTools, OnMessage, context management,
 // prompt-cache keys. Progress reporting via agentcore.WithToolProgress on ctx
 // works identically.
-func (t *Tool) Run(ctx context.Context, agent, task string) (RunResult, error) {
-	return t.runAgent(ctx, agent, task, nil, nil, ModeSingle)
+func (r *Runner) Run(ctx context.Context, agent, task string) (RunResult, error) {
+	return r.run(ctx, agent, task, nil, runOptions{mode: ModeSingle, reportProgress: true})
 }
 
 // executeTeamSpawn delegates to the installed TeamSpawner. The subagent tool
@@ -536,15 +544,9 @@ func (t *Tool) executeTeamSpawn(ctx context.Context, p params, modelOverride age
 	if t.teamSpawner == nil {
 		return nil, fmt.Errorf("team spawn is not configured in this environment")
 	}
-	cfg, ok := t.agents[p.Agent]
+	cfg, ok := t.runner.AgentConfig(p.Agent)
 	if !ok {
-		available := make([]string, 0, len(t.agents))
-		for name := range t.agents {
-			available = append(available, name)
-		}
-		return json.Marshal(map[string]any{
-			"error": fmt.Sprintf("unknown agent %q, available: %s", p.Agent, strings.Join(available, ", ")),
-		})
+		return nil, &UnknownAgentError{Agent: p.Agent, Available: t.runner.sortedAgentNames()}
 	}
 	name := p.Name
 	if name == "" {
@@ -564,12 +566,15 @@ func (t *Tool) executeTeamSpawn(ctx context.Context, p params, modelOverride age
 	if err != nil {
 		return nil, fmt.Errorf("team spawn failed: %w", err)
 	}
+	message := fmt.Sprintf("Teammate %q (agent=%s) spawned. Send messages with send_message.", res.AgentID, p.Agent)
+	if p.TeamName != "" {
+		message = fmt.Sprintf("Teammate %q (agent=%s) spawned in team %q. Send messages with send_message.", res.AgentID, p.Agent, p.TeamName)
+	}
 	return json.Marshal(map[string]any{
 		"task_id":  res.TaskID,
 		"agent_id": res.AgentID,
 		"status":   "running",
-		"message": fmt.Sprintf("Teammate %q (agent=%s) spawned in team %q. Send messages with send_message.",
-			res.AgentID, p.Agent, p.TeamName),
+		"message":  message,
 	})
 }
 
@@ -577,28 +582,13 @@ func (t *Tool) executeTeamSpawn(ctx context.Context, p params, modelOverride age
 // immediately. When the sub-agent finishes, a notification is sent via
 // notifyFn (typically Agent.FollowUp).
 func (t *Tool) executeBackground(callerCtx context.Context, agentName, taskStr, description string, modelOverride agentcore.ChatModel) (json.RawMessage, error) {
-	if _, ok := t.agents[agentName]; !ok {
-		available := make([]string, 0, len(t.agents))
-		for name := range t.agents {
-			available = append(available, name)
-		}
-		return json.Marshal(map[string]any{
-			"error": fmt.Sprintf("unknown agent %q, available: %s", agentName, strings.Join(available, ", ")),
-		})
+	if _, ok := t.runner.AgentConfig(agentName); !ok {
+		return nil, &UnknownAgentError{Agent: agentName, Available: t.runner.sortedAgentNames()}
 	}
 
 	rt := t.taskRT
-	if rt == nil {
-		return json.Marshal(map[string]any{
-			"error": "background mode requires a TaskRuntime; call SetTaskRuntime before use",
-		})
-	}
 
-	// Depth guard: refuse to spawn beyond MaxAgentDepth so a runaway recursion
-	// (e.g. a future team member accidentally given a spawn channel and looping)
-	// can't burn through tokens before someone notices. callerCtx carries the
-	// caller's depth via task.DepthFromContext — 0 when called from the main
-	// agent loop, n inside a depth-n sub-agent.
+	// Enforce the explicit recursion/resource boundary before registering work.
 	childDepth := task.DepthFromContext(callerCtx) + 1
 	if childDepth > task.MaxAgentDepth {
 		return json.Marshal(map[string]any{
@@ -641,17 +631,77 @@ func (t *Tool) executeBackground(callerCtx context.Context, agentName, taskStr, 
 		defer cancel()
 
 		var outFile io.WriteCloser
+		var outputErr error
 		if t.bgOutputFactory != nil {
 			w, path, ferr := t.bgOutputFactory(taskID, agentName)
-			if ferr == nil {
-				outFile = w
-				rt.Update(taskID, func(e *task.Entry) { e.OutputFile = path })
+			if ferr != nil {
+				rt.Update(taskID, func(e *task.Entry) {
+					e.Status = task.Failed
+					e.Error = fmt.Sprintf("create background output: %v", ferr)
+					e.EndedAt = time.Now()
+				})
+				t.notify(taskID)
+				return
 			}
+			outFile = w
+			rt.Update(taskID, func(e *task.Entry) { e.OutputFile = path })
 		}
 
-		res, err := t.runAgent(bgCtx, agentName, taskStr, modelOverride, &bgRunOpts{taskID: taskID, rt: rt, outFile: outFile}, ModeBackground)
+		res, err := t.runner.run(bgCtx, agentName, taskStr, modelOverride, runOptions{
+			mode: ModeBackground,
+			getSteeringMessages: func() []agentcore.AgentMessage {
+				drained := rt.DrainPending(taskID)
+				messages := make([]agentcore.AgentMessage, 0, len(drained))
+				for _, message := range drained {
+					messages = append(messages, agentcore.UserMsg(message))
+				}
+				return messages
+			},
+			onEvent: func(ev agentcore.Event) {
+				switch ev.Type {
+				case agentcore.EventToolExecStart:
+					rt.Update(taskID, func(e *task.Entry) { e.ToolCount++ })
+					if outFile != nil {
+						label := ev.Tool
+						if len(ev.Args) > 0 {
+							label += "(" + truncate(string(ev.Args), 60) + ")"
+						}
+						if _, err := fmt.Fprintf(outFile, "[tool] %s\n", label); err != nil && outputErr == nil {
+							outputErr = fmt.Errorf("write background output: %w", err)
+						}
+					}
+				case agentcore.EventMessageEnd:
+					message, ok := ev.Message.(agentcore.Message)
+					if !ok {
+						return
+					}
+					if outFile != nil {
+						line, marshalErr := json.Marshal(message)
+						if marshalErr != nil && outputErr == nil {
+							outputErr = fmt.Errorf("encode background output: %w", marshalErr)
+						} else if marshalErr == nil {
+							line = append(line, '\n')
+							if _, writeErr := outFile.Write(line); writeErr != nil && outputErr == nil {
+								outputErr = fmt.Errorf("write background output: %w", writeErr)
+							}
+						}
+					}
+					if message.GetRole() == agentcore.RoleAssistant && message.Usage != nil {
+						rt.Update(taskID, func(e *task.Entry) {
+							e.TokensIn += message.Usage.Input
+							e.TokensOut += message.Usage.Output
+						})
+					}
+				}
+			},
+		})
+		if err == nil && outputErr != nil {
+			err = outputErr
+		}
 		if outFile != nil {
-			outFile.Close()
+			if closeErr := outFile.Close(); err == nil && closeErr != nil {
+				err = fmt.Errorf("close background output: %w", closeErr)
+			}
 		}
 
 		rt.Update(taskID, func(e *task.Entry) {
@@ -696,7 +746,7 @@ func (t *Tool) notify(taskID string) {
 
 // executeSingle runs one sub-agent with an isolated context.
 func (t *Tool) executeSingle(ctx context.Context, agentName, taskStr string, modelOverride agentcore.ChatModel) (json.RawMessage, error) {
-	res, err := t.runAgent(ctx, agentName, taskStr, modelOverride, nil, ModeSingle)
+	res, err := t.runner.run(ctx, agentName, taskStr, modelOverride, runOptions{mode: ModeSingle, reportProgress: true})
 	if err != nil {
 		if res.Usage.Turns > 0 || res.Usage.Tools > 0 {
 			return nil, fmt.Errorf("agent %q failed: %w (turns=%d tools=%d)", agentName, err, res.Usage.Turns, res.Usage.Tools)
@@ -726,7 +776,7 @@ func (t *Tool) executeChain(ctx context.Context, chain []chainStep, modelOverrid
 		}
 
 		taskStr := strings.ReplaceAll(step.Task, "{previous}", previous)
-		res, err := t.runAgent(ctx, step.Agent, taskStr, modelOverride, nil, ModeChain)
+		res, err := t.runner.run(ctx, step.Agent, taskStr, modelOverride, runOptions{mode: ModeChain, reportProgress: true})
 
 		u := res.Usage
 		r := result{
@@ -758,25 +808,18 @@ func (t *Tool) executeChain(ctx context.Context, chain []chainStep, modelOverrid
 	})
 }
 
-// executeParallel runs multiple sub-agents concurrently with bounded
-// concurrency.
+// executeParallel runs all requested sub-agents concurrently. Provider and
+// transport concurrency policies remain the host's responsibility.
 func (t *Tool) executeParallel(ctx context.Context, tasks []taskItem, modelOverride agentcore.ChatModel) (json.RawMessage, error) {
-	if len(tasks) > maxParallelTasks {
-		return json.Marshal(fmt.Sprintf("Too many parallel tasks (%d). Max is %d.", len(tasks), maxParallelTasks))
-	}
-
 	results := make([]result, len(tasks))
 	var wg sync.WaitGroup
-	sem := make(chan struct{}, maxConcurrency)
 
 	for i, ti := range tasks {
 		wg.Add(1)
 		go func(idx int, st taskItem) {
 			defer wg.Done()
-			sem <- struct{}{}
-			defer func() { <-sem }()
 
-			res, err := t.runAgent(ctx, st.Agent, st.Task, modelOverride, nil, ModeParallel)
+			res, err := t.runner.run(ctx, st.Agent, st.Task, modelOverride, runOptions{mode: ModeParallel, reportProgress: true})
 			u := res.Usage
 			r := result{
 				Agent:          st.Agent,
@@ -809,34 +852,20 @@ func (t *Tool) executeParallel(ctx context.Context, tasks []taskItem, modelOverr
 	})
 }
 
-// bgRunOpts configures background-specific behavior for runAgent. When nil,
-// runAgent runs in foreground mode (reports progress to parent context).
-type bgRunOpts struct {
-	taskID  string        // task ID in the runtime
-	rt      *task.Runtime // shared runtime for updates
-	outFile io.Writer     // output stream for session persistence (optional)
+type runOptions struct {
+	mode                string
+	reportProgress      bool
+	getSteeringMessages func() []agentcore.AgentMessage
+	onEvent             func(agentcore.Event)
 }
 
-// runAgent executes an isolated agent loop for the given agent config and
-// task. Includes panic recovery to prevent a subagent crash from taking down
-// the parent. On error the returned RunResult carries only Usage (counters
-// consumed before the failure); Output/TerminalResult stay empty.
-func (t *Tool) runAgent(ctx context.Context, agentName, taskStr string, modelOverride agentcore.ChatModel, bg *bgRunOpts, mode string) (res RunResult, err error) {
-	cfg, ok := t.agents[agentName]
+// run executes an isolated agent loop for the given agent config and task.
+// On error the returned RunResult carries usage consumed before the failure.
+func (r *Runner) run(ctx context.Context, agentName, taskStr string, modelOverride agentcore.ChatModel, opts runOptions) (RunResult, error) {
+	cfg, ok := r.agents[agentName]
 	if !ok {
-		available := make([]string, 0, len(t.agents))
-		for name := range t.agents {
-			available = append(available, name)
-		}
-		return res, &UnknownAgentError{Agent: agentName, Available: available}
+		return RunResult{}, &UnknownAgentError{Agent: agentName, Available: r.sortedAgentNames()}
 	}
-
-	// Panic recovery — isolated subagent should never crash the parent.
-	defer func() {
-		if r := recover(); r != nil {
-			err = fmt.Errorf("subagent %q panicked: %v", agentName, r)
-		}
-	}()
 
 	agentCtx := agentcore.AgentContext{
 		SystemPrompt: cfg.SystemPrompt,
@@ -863,7 +892,7 @@ func (t *Tool) runAgent(ctx context.Context, agentName, taskStr string, modelOve
 		}
 	}
 
-	runSeq := t.runSeq.Add(1)
+	runSeq := r.runSeq.Add(1)
 
 	// One conversation, one cache key: suffix the per-run sequence so each
 	// spawn forms its own cache lineage instead of piling every run of this
@@ -880,30 +909,12 @@ func (t *Tool) runAgent(ctx context.Context, agentName, taskStr string, modelOve
 		ToolsAreIdempotent: cfg.ToolsAreIdempotent,
 		ContextManager:     contextManager,
 		ConvertToLLM:       convertToLLM,
-		ThinkingLevel:      t.resolveThinking(agentName, cfg.ThinkingLevel),
+		ThinkingLevel:      r.resolveThinking(agentName, cfg.ThinkingLevel),
 		CacheLastMessage:   cfg.CacheLastMessage,
 		PromptCacheKey:     promptCacheKey,
 	}
 
-	// Drain parent→child messages at every steering tick so a SendToSubAgent
-	// call mid-execution gets seen on the next turn rather than after the
-	// agent decides to stop. Foreground runs have no task entry to drain from,
-	// so this is only wired in the background path.
-	if bg != nil && bg.rt != nil {
-		taskID := bg.taskID
-		rt := bg.rt
-		loopCfg.GetSteeringMessages = func() []agentcore.AgentMessage {
-			drained := rt.DrainPending(taskID)
-			if len(drained) == 0 {
-				return nil
-			}
-			msgs := make([]agentcore.AgentMessage, 0, len(drained))
-			for _, m := range drained {
-				msgs = append(msgs, agentcore.UserMsg(m))
-			}
-			return msgs
-		}
-	}
+	loopCfg.GetSteeringMessages = opts.getSteeringMessages
 	if len(cfg.StopAfterTools) > 0 {
 		stopSet := make(map[string]struct{}, len(cfg.StopAfterTools))
 		for _, name := range cfg.StopAfterTools {
@@ -925,17 +936,15 @@ func (t *Tool) runAgent(ctx context.Context, agentName, taskStr string, modelOve
 
 	// Fan raw loop events to an external observer (e.g. a live preview),
 	// tagged with a unique per-run id. Built once so every event carries the
-	// same InstanceID; nil observer ⇒ no closure, zero overhead. Runs for
-	// background too — unlike the ProgressPayload relay below, which is
-	// foreground-only (bg == nil).
+	// same InstanceID; nil observer means no event fan-out.
 	var observe func(agentcore.Event)
-	if t.eventObserver != nil {
+	if r.eventObserver != nil {
 		meta := RunMeta{
 			Agent:      agentName,
 			InstanceID: fmt.Sprintf("%s#%d", agentName, runSeq),
-			Mode:       mode,
+			Mode:       opts.mode,
 		}
-		observe = func(ev agentcore.Event) { t.eventObserver(meta, ev) }
+		observe = func(ev agentcore.Event) { r.eventObserver(meta, ev) }
 	}
 
 	events := agentcore.AgentLoop(ctx, []agentcore.AgentMessage{agentcore.UserMsg(taskStr)}, agentCtx, loopCfg)
@@ -956,19 +965,13 @@ func (t *Tool) runAgent(ctx context.Context, agentName, taskStr string, modelOve
 		if observe != nil {
 			observe(ev)
 		}
+		if opts.onEvent != nil {
+			opts.onEvent(ev)
+		}
 		switch ev.Type {
 		case agentcore.EventToolExecStart:
 			su.Tools++
-			if bg != nil {
-				bg.rt.Update(bg.taskID, func(e *task.Entry) { e.ToolCount++ })
-				if bg.outFile != nil {
-					label := ev.Tool
-					if len(ev.Args) > 0 {
-						label += "(" + truncate(string(ev.Args), 60) + ")"
-					}
-					fmt.Fprintf(bg.outFile, "[tool] %s\n", label)
-				}
-			} else {
+			if opts.reportProgress {
 				agentcore.ReportToolProgress(ctx, agentcore.ProgressPayload{
 					Kind:    agentcore.ProgressToolStart,
 					Agent:   agentName,
@@ -978,7 +981,7 @@ func (t *Tool) runAgent(ctx context.Context, agentName, taskStr string, modelOve
 				})
 			}
 		case agentcore.EventMessageUpdate:
-			if bg == nil {
+			if opts.reportProgress {
 				if ev.DeltaKind == agentcore.DeltaThinking {
 					// Thinking deltas only go through ProgressThinking (cumulative).
 					if ev.Message != nil {
@@ -1011,7 +1014,7 @@ func (t *Tool) runAgent(ctx context.Context, agentName, taskStr string, modelOve
 				}
 			}
 		case agentcore.EventToolExecEnd:
-			if bg == nil {
+			if opts.reportProgress {
 				if ev.IsError {
 					errMsg := string(ev.Result)
 					if len(errMsg) > 200 {
@@ -1044,25 +1047,17 @@ func (t *Tool) runAgent(ctx context.Context, agentName, taskStr string, modelOve
 				(loopCfg.StopAfterToolResult != nil && loopCfg.StopAfterToolResult(ev.Tool, ev.Result))) {
 				terminalToolResult = append(terminalToolResult[:0], ev.Result...)
 			}
-			if bg == nil {
+			if opts.reportProgress {
 				reportContext(ctx, agentName, contextManager)
 			}
 		case agentcore.EventMessageEnd:
 			if ev.Message == nil {
 				continue
 			}
-			if bg != nil && bg.outFile != nil {
-				if msg, ok := ev.Message.(agentcore.Message); ok {
-					if line, je := json.Marshal(msg); je == nil {
-						line = append(line, '\n')
-						bg.outFile.Write(line)
-					}
-				}
-			}
 			if ev.Message.GetRole() == agentcore.RoleAssistant {
 				lastAssistantContent = ev.Message.TextContent()
 				su.Turns++
-				if bg == nil {
+				if opts.reportProgress {
 					agentcore.ReportToolProgress(ctx, agentcore.ProgressPayload{
 						Kind:    agentcore.ProgressTurnCounter,
 						Agent:   agentName,
@@ -1078,19 +1073,13 @@ func (t *Tool) runAgent(ctx context.Context, agentName, taskStr string, modelOve
 					if msg.Usage.Cost != nil {
 						su.Cost += msg.Usage.Cost.Total
 					}
-					if bg != nil {
-						bg.rt.Update(bg.taskID, func(e *task.Entry) {
-							e.TokensIn += msg.Usage.Input
-							e.TokensOut += msg.Usage.Output
-						})
-					}
 				}
-				if bg == nil {
+				if opts.reportProgress {
 					reportContext(ctx, agentName, contextManager)
 				}
 			}
 		case agentcore.EventRetry:
-			if bg == nil && ev.RetryInfo != nil {
+			if opts.reportProgress && ev.RetryInfo != nil {
 				agentcore.ReportToolProgress(ctx, agentcore.ProgressPayload{
 					Kind:       agentcore.ProgressRetry,
 					Agent:      agentName,

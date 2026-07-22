@@ -159,10 +159,18 @@ worker := subagent.Config{
     Tools:        []agentcore.Tool{tools.NewRead(".", workerState), tools.NewWrite(".", workerState), tools.NewEdit(".", workerState), tools.NewBash(".")},
 }
 
+runner := subagent.NewRunner(scout, worker)
+subagentTool := runner.AsTool()
 agent := agentcore.NewAgent(
     agentcore.WithModel(model),
-    agentcore.WithTools(subagent.New(scout, worker)),
+    agentcore.WithTools(subagentTool),
 )
+```
+
+Hosts that own scheduling can bypass the JSON tool protocol:
+
+```go
+result, err := runner.Run(ctx, "worker", "Implement the requested change")
 ```
 
 For background mode (async sub-agent runs that notify on completion), wire a
@@ -172,9 +180,8 @@ shared task runtime:
 import "github.com/voocel/agentcore/task"
 
 rt := task.NewRuntime()
-sat := subagent.New(scout, worker)
-sat.SetTaskRuntime(rt)
-sat.SetNotifyFn(agent.FollowUp) // route completion notifications back to the parent
+subagentTool.SetTaskRuntime(rt)
+subagentTool.SetNotifyFn(agent.FollowUp) // route completion notifications back to the parent
 ```
 
 Four execution modes via tool call:
