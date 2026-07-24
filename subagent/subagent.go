@@ -53,8 +53,8 @@ type Config struct {
 	// this sub-agent's loop. 0 (default) disables retry entirely.
 	MaxRetries int
 
-	// ToolsAreIdempotent declares this sub-agent's tools are safe to
-	// re-execute. See agentcore.WithToolsAreIdempotent for full rationale.
+	// ToolsAreIdempotent is retained for source compatibility.
+	// Deprecated: agentcore no longer executes tools before stream completion.
 	ToolsAreIdempotent bool
 
 	// StopAfterTools lists tool names that trigger early loop exit after
@@ -628,7 +628,10 @@ func (t *Tool) executeBackground(callerCtx context.Context, agentName, taskStr, 
 	rt.Register(entry)
 
 	go func() {
-		defer cancel()
+		defer func() {
+			cancel()
+			rt.Done(taskID)
+		}()
 
 		var outFile io.WriteCloser
 		var outputErr error
@@ -695,14 +698,12 @@ func (t *Tool) executeBackground(callerCtx context.Context, agentName, taskStr, 
 				}
 			},
 		})
-		if err == nil && outputErr != nil {
-			err = outputErr
-		}
 		if outFile != nil {
-			if closeErr := outFile.Close(); err == nil && closeErr != nil {
-				err = fmt.Errorf("close background output: %w", closeErr)
+			if closeErr := outFile.Close(); closeErr != nil {
+				outputErr = errors.Join(outputErr, fmt.Errorf("close background output: %w", closeErr))
 			}
 		}
+		err = errors.Join(err, outputErr)
 
 		rt.Update(taskID, func(e *task.Entry) {
 			e.EndedAt = time.Now()
@@ -710,6 +711,9 @@ func (t *Tool) executeBackground(callerCtx context.Context, agentName, taskStr, 
 			case err != nil && bgCtx.Err() != nil:
 				// Cancellation observed: this was an explicit Stop, not a failure.
 				e.Status = task.Killed
+				if outputErr != nil {
+					e.Error = outputErr.Error()
+				}
 			case err != nil:
 				e.Status = task.Failed
 				e.Error = err.Error()

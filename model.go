@@ -67,6 +67,11 @@ type LoopConfig struct {
 	// overflow recovery.
 	CommitContext func(msgs []AgentMessage, usage *ContextUsage) error
 
+	// CommitMessage durably records a message before it enters runtime context.
+	// Returning an error stops the run; tools requested by that message are not
+	// executed. OnMessage remains the post-commit observer hook.
+	CommitMessage func(msg AgentMessage) error
+
 	// ToolGate, when non-nil, is called once per tool call after argument
 	// validation and the optional Previewer pass. Allowed=false rejects the
 	// call (Reason becomes the tool result). The agent core does no permission
@@ -106,8 +111,9 @@ type LoopConfig struct {
 	// depending on its structured result.
 	StopAfterToolResult func(toolName string, result json.RawMessage) bool
 
-	// OnMessage, if non-nil, is called after each message is appended to
-	// context (assistant, tool result, steering). Use for session logging.
+	// OnMessage, if non-nil, is called after each committed message is appended
+	// to context (assistant, tool result, steering). It is observational; use
+	// CommitMessage when persistence failure must stop execution.
 	OnMessage func(msg AgentMessage)
 
 	// StopGuard is consulted on every normal stop (end_turn and
@@ -128,12 +134,9 @@ type LoopConfig struct {
 	// cancellation lands during tool execution. Empty uses a built-in default.
 	AbortMarkerToolText string
 
-	// ToolsAreIdempotent declares that all registered tools are safe to re-execute
-	// with the same arguments — i.e. running them twice produces the same observable
-	// state as running them once. When true, the retry loop will not bail out just
-	// because a tool_call already completed in the failed turn; instead it aborts
-	// the in-flight tool executions and retries the whole turn. Default false
-	// (conservative: assume tools may have non-idempotent side effects).
+	// ToolsAreIdempotent is retained for source compatibility.
+	// Deprecated: tool execution now starts only after a complete assistant
+	// response has been committed, so model-stream retries cannot replay tools.
 	ToolsAreIdempotent bool
 
 	// CacheLastMessage, when non-empty, instructs the loop to tag the last

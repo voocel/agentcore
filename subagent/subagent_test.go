@@ -401,36 +401,56 @@ func (w *errorWriteCloser) Close() error { return w.closeErr }
 func TestTool_BackgroundOutputErrorsFailTask(t *testing.T) {
 	tests := []struct {
 		name    string
+		config  Config
 		factory func(string, string) (io.WriteCloser, string, error)
-		want    string
+		want    []string
 	}{
 		{
 			name: "create",
 			factory: func(string, string) (io.WriteCloser, string, error) {
 				return nil, "", errors.New("disk unavailable")
 			},
-			want: "create background output: disk unavailable",
+			want: []string{"create background output: disk unavailable"},
 		},
 		{
 			name: "write",
 			factory: func(string, string) (io.WriteCloser, string, error) {
 				return &errorWriteCloser{writeErr: errors.New("disk full")}, "output.jsonl", nil
 			},
-			want: "write background output: disk full",
+			want: []string{"write background output: disk full"},
 		},
 		{
 			name: "close",
 			factory: func(string, string) (io.WriteCloser, string, error) {
 				return &errorWriteCloser{closeErr: errors.New("flush failed")}, "output.jsonl", nil
 			},
-			want: "close background output: flush failed",
+			want: []string{"close background output: flush failed"},
+		},
+		{
+			name: "run and close",
+			config: Config{
+				Name:        "writer",
+				Description: "writer",
+				Model: newSequential(func(int, *agentcore.LLMRequest) (*agentcore.LLMResponse, error) {
+					return nil, errors.New("llm failed")
+				}),
+				MaxTurns: 3,
+			},
+			factory: func(string, string) (io.WriteCloser, string, error) {
+				return &errorWriteCloser{closeErr: errors.New("flush failed")}, "output.jsonl", nil
+			},
+			want: []string{"llm failed", "close background output: flush failed"},
 		},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			rt := task.NewRuntime()
-			tool := NewRunner(simpleAgent("writer", "done")).AsTool()
+			cfg := tt.config
+			if cfg.Name == "" {
+				cfg = simpleAgent("writer", "done")
+			}
+			tool := NewRunner(cfg).AsTool()
 			tool.SetTaskRuntime(rt)
 			tool.SetBgOutputFactory(tt.factory)
 
@@ -456,8 +476,10 @@ func TestTool_BackgroundOutputErrorsFailTask(t *testing.T) {
 			if entry == nil || entry.Status != task.Failed {
 				t.Fatalf("task status = %+v, want failed", entry)
 			}
-			if !strings.Contains(entry.Error, tt.want) {
-				t.Fatalf("task error = %q, want containing %q", entry.Error, tt.want)
+			for _, want := range tt.want {
+				if !strings.Contains(entry.Error, want) {
+					t.Fatalf("task error = %q, want containing %q", entry.Error, want)
+				}
 			}
 		})
 	}

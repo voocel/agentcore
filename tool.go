@@ -149,6 +149,7 @@ type ContentTool interface {
 // Previewer is an optional interface for tools that can compute a preview
 // (e.g., diff) before execution. The agent loop calls Preview and emits the
 // result as EventToolExecUpdate so the UI can display it before the tool runs.
+// A preview error is returned to the model and prevents tool execution.
 type Previewer interface {
 	Preview(ctx context.Context, args json.RawMessage) (json.RawMessage, error)
 }

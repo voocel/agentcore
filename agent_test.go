@@ -314,3 +314,24 @@ func TestResumeFromAgentEndListenerSurvivesCleanup(t *testing.T) {
 		t.Fatalf("resumed run did not complete: last message = %q, want %q", got, "run 2")
 	}
 }
+
+func TestHasFollowUpsTracksOnlyFollowUpQueue(t *testing.T) {
+	agent := NewAgent()
+	agent.Steer(UserMsg("steer"))
+	if agent.HasFollowUps() {
+		t.Fatal("steering message must not count as a follow-up")
+	}
+
+	agent.FollowUp(UserMsg("follow up"))
+	if !agent.HasFollowUps() {
+		t.Fatal("queued follow-up was not reported")
+	}
+
+	agent.ClearFollowUpQueue()
+	if agent.HasFollowUps() {
+		t.Fatal("cleared follow-up queue was still reported")
+	}
+	if !agent.HasQueuedMessages() {
+		t.Fatal("clearing follow-ups must not clear steering messages")
+	}
+}

@@ -121,7 +121,10 @@ func Spawn(parentCtx context.Context, cfg SpawnConfig) (*SpawnResult, error) {
 	cfg.TaskRT.Register(entry)
 
 	go func() {
-		defer cancel()
+		defer func() {
+			cancel()
+			cfg.TaskRT.Done(taskID)
+		}()
 
 		err := Run(runCtx, RunConfig{
 			Identity:      identity,

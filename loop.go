@@ -57,8 +57,11 @@ func AgentLoop(ctx context.Context, prompts []AgentMessage, agentCtx AgentContex
 
 		for _, p := range prompts {
 			sink.emit(Event{Type: EventMessageStart, Message: p})
+			if err := commitMessage(&currentCtx, &newMessages, config, p); err != nil {
+				sink.emitError(fmt.Errorf("commit prompt message: %w", err), &RunSummary{EndReason: EndReasonError})
+				return
+			}
 			sink.emit(Event{Type: EventMessageEnd, Message: p})
-			commitMessage(&currentCtx, &newMessages, config, p)
 		}
 
 		runLoop(ctx, &currentCtx, &newMessages, config, sink)
@@ -119,14 +122,20 @@ func AgentLoopContinue(ctx context.Context, agentCtx AgentContext, config LoopCo
 }
 
 // commitMessage is the single entry point for "message enters agent context".
-// It appends the message to both the runtime context and the new-messages list,
-// and fires the OnMessage hook if configured.
-func commitMessage(currentCtx *AgentContext, newMessages *[]AgentMessage, config LoopConfig, msg AgentMessage) {
+// Durable persistence runs first; only a successful commit is appended to the
+// runtime context and exposed to the observational OnMessage hook.
+func commitMessage(currentCtx *AgentContext, newMessages *[]AgentMessage, config LoopConfig, msg AgentMessage) error {
+	if config.CommitMessage != nil {
+		if err := config.CommitMessage(msg); err != nil {
+			return err
+		}
+	}
 	currentCtx.Messages = append(currentCtx.Messages, msg)
 	*newMessages = append(*newMessages, msg)
 	if config.OnMessage != nil {
 		config.OnMessage(msg)
 	}
+	return nil
 }
 
 // runLoop is the main double-loop logic shared by AgentLoop and AgentLoopContinue.
@@ -134,10 +143,10 @@ func commitMessage(currentCtx *AgentContext, newMessages *[]AgentMessage, config
 // Core loop contracts:
 //   - Streamed tool-call lifecycle signals are authoritative; stop reasons are
 //     only hints and must not be used as the sole source of tool state.
-//   - Tool results are appended to context only after the assistant message
-//     that requested them, even when execution started during streaming.
-//   - Once a streamed tool call has completed, the turn is no longer retried
-//     automatically; replay could duplicate side effects.
+//   - Tool execution starts only after the complete assistant message has been
+//     committed. This lets CommitMessage establish the durable tool-call
+//     record before a tool can produce side effects.
+//   - Tool results are appended after the assistant message that requested them.
 //   - Steering stops not-yet-started tools. Started tools follow their
 //     InterruptBehavior and may continue or be cancelled.
 func runLoop(ctx context.Context, currentCtx *AgentContext, newMessages *[]AgentMessage, config LoopConfig, sink eventSink) {
@@ -154,7 +163,6 @@ func runLoop(ctx context.Context, currentCtx *AgentContext, newMessages *[]Agent
 			EndReason:  reason,
 		}
 	}
-
 	maxTurns := config.MaxTurns
 	if maxTurns <= 0 {
 		maxTurns = defaultMaxTurns
@@ -164,6 +172,13 @@ func runLoop(ctx context.Context, currentCtx *AgentContext, newMessages *[]Agent
 	turnCount := 0
 	lengthRecoveryCount := 0
 	toolErrors := make(map[string]int) // consecutive failure count per tool
+	commit := func(msg AgentMessage) bool {
+		if err := commitMessage(currentCtx, newMessages, config, msg); err != nil {
+			sink.emitError(fmt.Errorf("commit message: %w", err), buildSummary(turnCount, EndReasonError))
+			return false
+		}
+		return true
+	}
 
 	// Check for steering messages at start
 	var pendingMessages []AgentMessage
@@ -198,8 +213,10 @@ func runLoop(ctx context.Context, currentCtx *AgentContext, newMessages *[]Agent
 						}
 					}
 					abortMsg := AbortMsg(text, phase)
+					if !commit(abortMsg) {
+						return
+					}
 					sink.emit(Event{Type: EventMessageEnd, Message: abortMsg})
-					commitMessage(currentCtx, newMessages, config, abortMsg)
 				}
 				sink.emit(Event{Type: EventError, Err: ctx.Err()})
 				sink.emit(Event{Type: EventAgentEnd, NewMessages: *newMessages, Summary: buildSummary(turnCount, EndReasonAborted)})
@@ -222,40 +239,17 @@ func runLoop(ctx context.Context, currentCtx *AgentContext, newMessages *[]Agent
 			if len(pendingMessages) > 0 {
 				for _, msg := range pendingMessages {
 					sink.emit(Event{Type: EventMessageStart, Message: msg})
+					if !commit(msg) {
+						return
+					}
 					sink.emit(Event{Type: EventMessageEnd, Message: msg})
-					commitMessage(currentCtx, newMessages, config, msg)
 				}
 				pendingMessages = nil
 			}
 
-			var streamedTools *turnToolExecutor
-			hooks := llmCallHooks{
-				OnToolCallComplete: func(call ToolCall) {
-					if streamedTools == nil {
-						streamedTools = newTurnToolExecutor(ctx, currentCtx.Tools, config, toolErrors, sink)
-					}
-					streamedTools.Add(call)
-				},
-			}
-
-			// Reset hook for retries: abort any tool executions started by the
-			// failed attempt and clear the executor so the next attempt sees
-			// a fresh slate (the OnToolCallComplete closure above re-creates it).
-			// Only used when ToolsAreIdempotent is set; without it, retries
-			// after a streamed tool_call are skipped entirely.
-			resetTurnState := func() {
-				if streamedTools != nil {
-					streamedTools.AbortAndWait()
-					streamedTools = nil
-				}
-			}
-
 			// Call LLM with retry (streaming: events emitted inside callLLM)
-			assistantMsg, callInfo, err := callLLMWithRetry(ctx, currentCtx, config, sink, hooks, resetTurnState)
+			assistantMsg, callInfo, err := callLLMWithRetry(ctx, currentCtx, config, sink)
 			if err != nil {
-				if streamedTools != nil {
-					streamedTools.AbortAndWait()
-				}
 				if ctx.Err() != nil {
 					if config.ShouldEmitAbortMarker != nil && config.ShouldEmitAbortMarker() {
 						text := config.AbortMarkerText
@@ -263,8 +257,10 @@ func runLoop(ctx context.Context, currentCtx *AgentContext, newMessages *[]Agent
 							text = defaultAbortMarkerText
 						}
 						abortMsg := AbortMsg(text, "inference")
+						if !commit(abortMsg) {
+							return
+						}
 						sink.emit(Event{Type: EventMessageEnd, Message: abortMsg})
-						commitMessage(currentCtx, newMessages, config, abortMsg)
 					}
 					sink.emit(Event{Type: EventError, Err: ctx.Err()})
 					sink.emit(Event{Type: EventAgentEnd, NewMessages: *newMessages, Summary: buildSummary(turnCount, EndReasonAborted)})
@@ -276,15 +272,10 @@ func runLoop(ctx context.Context, currentCtx *AgentContext, newMessages *[]Agent
 
 			// Check stop reason — terminate early on error/aborted
 			if assistantMsg.StopReason == StopReasonError || assistantMsg.StopReason == StopReasonAborted {
-				// A custom ChatModel may report Error/Aborted on a message whose
-				// stream already completed tool calls (the bundled litellm
-				// adapter never does, but the kernel is model-agnostic). Drain the
-				// executor so its child ctx and goroutines don't leak past this
-				// early exit — every other exit that can hold streamedTools does.
-				if streamedTools != nil {
-					streamedTools.AbortAndWait()
+				if !commit(assistantMsg) {
+					return
 				}
-				commitMessage(currentCtx, newMessages, config, assistantMsg)
+				sink.emit(Event{Type: EventMessageEnd, Message: assistantMsg})
 				sink.emit(Event{Type: EventModelResponse, Message: assistantMsg})
 				turnCount++
 				reason := EndReasonError
@@ -303,7 +294,10 @@ func runLoop(ctx context.Context, currentCtx *AgentContext, newMessages *[]Agent
 			}
 
 			lastAssistantMsg = assistantMsg
-			commitMessage(currentCtx, newMessages, config, assistantMsg)
+			if !commit(assistantMsg) {
+				return
+			}
+			sink.emit(Event{Type: EventMessageEnd, Message: assistantMsg})
 
 			// Check for tool calls
 			toolCalls := assistantMsg.ToolCalls()
@@ -322,18 +316,16 @@ func runLoop(ctx context.Context, currentCtx *AgentContext, newMessages *[]Agent
 			var turnToolResults []ToolResult
 			if hasMoreToolCalls {
 				var steering []AgentMessage
-				if callInfo.HasCompletedToolCalls && streamedTools != nil {
-					turnToolResults, steering = streamedTools.Wait()
-				} else {
-					turnToolResults, steering = executeToolCalls(ctx, currentCtx.Tools, toolCalls, config, toolErrors, sink)
-				}
+				turnToolResults, steering = executeToolCalls(ctx, currentCtx.Tools, toolCalls, config, toolErrors, sink)
 				afterToolExec = true
 
 				for _, tr := range turnToolResults {
 					resultMsg := toolResultToMessage(tr)
 					sink.emit(Event{Type: EventMessageStart, Message: resultMsg})
+					if !commit(resultMsg) {
+						return
+					}
 					sink.emit(Event{Type: EventMessageEnd, Message: resultMsg})
-					commitMessage(currentCtx, newMessages, config, resultMsg)
 				}
 
 				steeringAfterTools = steering
@@ -464,10 +456,6 @@ func consultStopGuard(ctx context.Context, config LoopConfig, info StopInfo) (in
 	return "", false
 }
 
-type llmCallHooks struct {
-	OnToolCallComplete func(ToolCall)
-}
-
 type llmCallInfo struct {
 	HasCompletedToolCalls bool
 }
@@ -475,18 +463,15 @@ type llmCallInfo struct {
 // callLLMWithRetry wraps callLLM with retry logic for retryable errors.
 // Context overflow errors trigger automatic compaction and a single retry.
 //
-// resetTurnState, when non-nil, is invoked after a retryable failure and before
-// the next attempt. Callers use it to abort and discard any tool executions
-// already kicked off via the streaming hook in the failed attempt, so the
-// retried attempt can re-execute the tool calls cleanly. Only invoked when
-// the failure path actually decides to retry (i.e. the error is retryable
-// and the attempt cap has not been reached).
-func callLLMWithRetry(ctx context.Context, agentCtx *AgentContext, config LoopConfig, sink eventSink, hooks llmCallHooks, resetTurnState func()) (Message, llmCallInfo, error) {
+// Tool execution is deliberately outside this function and starts only after
+// a complete response has been committed, so retrying a failed stream cannot
+// replay tool side effects.
+func callLLMWithRetry(ctx context.Context, agentCtx *AgentContext, config LoopConfig, sink eventSink) (Message, llmCallInfo, error) {
 	maxRetries := config.MaxRetries
 	if maxRetries <= 0 {
-		msg, info, err := callLLM(ctx, agentCtx, config, sink, hooks)
+		msg, info, err := callLLM(ctx, agentCtx, config, sink)
 		if err != nil && IsContextOverflow(err) {
-			return recoverOverflow(ctx, agentCtx, config, sink, err, hooks)
+			return recoverOverflow(ctx, agentCtx, config, sink, err)
 		}
 		return msg, info, err
 	}
@@ -494,7 +479,7 @@ func callLLMWithRetry(ctx context.Context, agentCtx *AgentContext, config LoopCo
 	var lastErr error
 	var lastInfo llmCallInfo
 	for attempt := 0; attempt <= maxRetries; attempt++ {
-		msg, info, err := callLLM(ctx, agentCtx, config, sink, hooks)
+		msg, info, err := callLLM(ctx, agentCtx, config, sink)
 		if err == nil {
 			return msg, info, nil
 		}
@@ -503,15 +488,7 @@ func callLLMWithRetry(ctx context.Context, agentCtx *AgentContext, config LoopCo
 
 		// Context overflow: compact and retry once (not a normal retry)
 		if IsContextOverflow(err) {
-			return recoverOverflow(ctx, agentCtx, config, sink, err, hooks)
-		}
-
-		// Once streamed tool calls have already completed, retrying this turn
-		// risks duplicating side effects from tools that already started — unless
-		// the caller has declared its tools idempotent, in which case we abort
-		// the in-flight executions and retry the whole turn cleanly.
-		if info.HasCompletedToolCalls && !config.ToolsAreIdempotent {
-			return Message{}, info, err
+			return recoverOverflow(ctx, agentCtx, config, sink, err)
 		}
 
 		// User cancellation is never retryable: the next attempt would just
@@ -525,19 +502,11 @@ func callLLMWithRetry(ctx context.Context, agentCtx *AgentContext, config LoopCo
 
 		// PartialStreamError (stream closed without done) is treated as retryable:
 		// it most often signals a transient network/provider stream-format issue
-		// that a fresh request can recover from. The HasCompletedToolCalls guard
-		// above already prevents retrying after a tool side-effect has fired.
+		// that a fresh request can recover from.
 		var pse *PartialStreamError
 		retryable := isRetryable(err) || errors.As(err, &pse)
 		if !retryable || attempt == maxRetries {
 			return Message{}, info, err
-		}
-
-		// Discard any tool executions started during the failed attempt before
-		// the next retry — otherwise the streaming hook would Add a second copy
-		// of the same tool_call onto the same executor on the next callLLM.
-		if resetTurnState != nil {
-			resetTurnState()
 		}
 
 		delay := retryDelay(err, attempt)
@@ -565,7 +534,7 @@ func callLLMWithRetry(ctx context.Context, agentCtx *AgentContext, config LoopCo
 // recoverOverflow attempts to compact the context via the ContextManager and
 // retry the LLM call. If no ContextManager is configured, the original error
 // is returned.
-func recoverOverflow(ctx context.Context, agentCtx *AgentContext, config LoopConfig, sink eventSink, originalErr error, hooks llmCallHooks) (Message, llmCallInfo, error) {
+func recoverOverflow(ctx context.Context, agentCtx *AgentContext, config LoopConfig, sink eventSink, originalErr error) (Message, llmCallInfo, error) {
 	if config.ContextManager == nil {
 		return Message{}, llmCallInfo{}, &ContextOverflowError{Cause: fmt.Errorf("no compaction configured: %w", originalErr)}
 	}
@@ -593,7 +562,7 @@ func recoverOverflow(ctx context.Context, agentCtx *AgentContext, config LoopCon
 			return Message{}, llmCallInfo{}, &ContextOverflowError{Cause: fmt.Errorf("commit failed: %w", err)}
 		}
 	}
-	return callLLM(ctx, agentCtx, config, sink, hooks)
+	return callLLM(ctx, agentCtx, config, sink)
 }
 
 // retryDelay calculates the wait duration using exponential backoff.
@@ -616,7 +585,7 @@ func retryDelay(err error, attempt int) time.Duration {
 }
 
 // callLLM applies the two-stage pipeline and calls the model.
-func callLLM(ctx context.Context, agentCtx *AgentContext, config LoopConfig, sink eventSink, hooks llmCallHooks) (Message, llmCallInfo, error) {
+func callLLM(ctx context.Context, agentCtx *AgentContext, config LoopConfig, sink eventSink) (Message, llmCallInfo, error) {
 	messages := agentCtx.Messages
 
 	// Stage 1: ContextManager / TransformContext
@@ -711,7 +680,7 @@ func callLLM(ctx context.Context, agentCtx *AgentContext, config LoopConfig, sin
 	}
 
 	// Use streaming for real-time token deltas
-	return callLLMStream(ctx, config.Model, llmMessages, toolSpecs, callOpts, sink, hooks)
+	return callLLMStream(ctx, config.Model, llmMessages, toolSpecs, callOpts, sink)
 }
 
 // markLastMessageForCache returns a copy of messages with cache_control attached
@@ -747,7 +716,7 @@ func markLastMessageForCache(messages []Message, cacheControl string) []Message 
 // non-streaming Generate, because callers (TUIs, event subscribers) typically
 // depend on stream events for live rendering, tool-call deltas, and cancellation
 // semantics. Switching execution model without notice changes the contract.
-func callLLMStream(ctx context.Context, model ChatModel, messages []Message, tools []ToolSpec, opts []CallOption, sink eventSink, hooks llmCallHooks) (Message, llmCallInfo, error) {
+func callLLMStream(ctx context.Context, model ChatModel, messages []Message, tools []ToolSpec, opts []CallOption, sink eventSink) (Message, llmCallInfo, error) {
 	streamCh, err := model.GenerateStream(ctx, messages, tools, opts...)
 	if err != nil {
 		return Message{}, llmCallInfo{}, err
@@ -787,9 +756,6 @@ func callLLMStream(ctx context.Context, model ChatModel, messages []Message, too
 			partial = ev.Message
 			if ev.CompletedToolCall != nil {
 				info.HasCompletedToolCalls = true
-				if hooks.OnToolCallComplete != nil {
-					hooks.OnToolCallComplete(*ev.CompletedToolCall)
-				}
 			}
 
 		case StreamEventDone:
@@ -798,7 +764,6 @@ func callLLMStream(ctx context.Context, model ChatModel, messages []Message, too
 			if !started {
 				sink.emit(Event{Type: EventMessageStart, Message: finalMsg})
 			}
-			sink.emit(Event{Type: EventMessageEnd, Message: finalMsg})
 			return finalMsg, info, nil
 
 		case StreamEventError:
@@ -814,8 +779,8 @@ func callLLMStream(ctx context.Context, model ChatModel, messages []Message, too
 	return Message{}, info, &PartialStreamError{Partial: partial}
 }
 
-// executeToolCalls runs tool calls for one assistant turn using the shared
-// turn executor. The same executor also powers streaming tool execution.
+// executeToolCalls runs tool calls for one committed assistant turn using the
+// shared concurrency and steering scheduler.
 func executeToolCalls(ctx context.Context, tools []Tool, calls []ToolCall, config LoopConfig, toolErrors map[string]int, sink eventSink) ([]ToolResult, []AgentMessage) {
 	exec := newTurnToolExecutor(ctx, tools, config, toolErrors, sink)
 	for _, call := range calls {
@@ -834,8 +799,6 @@ func executeSingleToolCall(ctx context.Context, tools []Tool, call ToolCall, con
 
 	// Fast exit: context already cancelled — don't start any tool work.
 	if ctx.Err() != nil {
-		content, _ := json.Marshal("Tool execution cancelled.")
-		result := ToolResult{ToolCallID: call.ID, Content: content, IsError: true}
 		sink.emit(Event{
 			Type:      EventToolExecStart,
 			ToolID:    call.ID,
@@ -843,15 +806,7 @@ func executeSingleToolCall(ctx context.Context, tools []Tool, call ToolCall, con
 			ToolLabel: label,
 			Args:      call.Args,
 		})
-		sink.emit(Event{
-			Type:      EventToolExecEnd,
-			ToolID:    call.ID,
-			Tool:      call.Name,
-			ToolLabel: label,
-			Result:    result.Content,
-			IsError:   true,
-		})
-		return result
+		return failToolCall(sink, call, label, "Tool execution cancelled.", false)
 	}
 
 	// Circuit breaker: skip if tool has exceeded consecutive failure threshold
@@ -863,16 +818,8 @@ func executeSingleToolCall(ctx context.Context, tools []Tool, call ToolCall, con
 			ToolLabel: label,
 			Args:      call.Args,
 		})
-		errContent, _ := json.Marshal(fmt.Sprintf("tool %q disabled after %d consecutive errors", call.Name, config.MaxToolErrors))
-		result := ToolResult{ToolCallID: call.ID, Content: errContent, IsError: true}
-		sink.emit(Event{
-			Type:    EventToolExecEnd,
-			ToolID:  call.ID,
-			Tool:    call.Name,
-			Result:  result.Content,
-			IsError: true,
-		})
-		return result // ToolName empty → don't count
+		return failToolCall(sink, call, label,
+			fmt.Sprintf("tool %q disabled after %d consecutive errors", call.Name, config.MaxToolErrors), false)
 	}
 
 	sink.emit(Event{
@@ -914,22 +861,7 @@ func executeSingleToolCall(ctx context.Context, tools []Tool, call ToolCall, con
 				if msg == "" {
 					msg = "tool input validation failed"
 				}
-				content, _ := json.Marshal(msg)
-				result = ToolResult{
-					ToolCallID: call.ID,
-					ToolName:   call.Name,
-					Content:    content,
-					IsError:    true,
-				}
-				sink.emit(Event{
-					Type:      EventToolExecEnd,
-					ToolID:    call.ID,
-					Tool:      call.Name,
-					ToolLabel: label,
-					Result:    content,
-					IsError:   true,
-				})
-				return result
+				return failToolCall(sink, call, label, msg, true)
 			}
 		}
 
@@ -938,18 +870,20 @@ func executeSingleToolCall(ctx context.Context, tools []Tool, call ToolCall, con
 		// Preview: if tool supports it, compute and emit preview before execution.
 		// Preview runs only after args are validated so approval UIs can use it.
 		if p, ok := tool.(Previewer); ok {
-			if data, err := p.Preview(ctx, call.Args); err == nil {
-				preview = data
-				sink.emit(Event{
-					Type:       EventToolExecUpdate,
-					ToolID:     call.ID,
-					Tool:       call.Name,
-					ToolLabel:  label,
-					Args:       call.Args,
-					Result:     data,
-					UpdateKind: ToolExecUpdatePreview,
-				})
+			data, err := p.Preview(ctx, call.Args)
+			if err != nil {
+				return failToolCall(sink, call, label, fmt.Sprintf("preview tool %q: %v", call.Name, err), true)
 			}
+			preview = data
+			sink.emit(Event{
+				Type:       EventToolExecUpdate,
+				ToolID:     call.ID,
+				Tool:       call.Name,
+				ToolLabel:  label,
+				Args:       call.Args,
+				Result:     data,
+				UpdateKind: ToolExecUpdatePreview,
+			})
 		}
 
 		if config.ToolGate != nil {
@@ -968,21 +902,7 @@ func executeSingleToolCall(ctx context.Context, tools []Tool, call ToolCall, con
 				if reason == "" {
 					reason = "tool execution denied"
 				}
-				errContent, _ := json.Marshal(reason)
-				result = ToolResult{
-					ToolCallID: call.ID,
-					Content:    errContent,
-					IsError:    true,
-				}
-				sink.emit(Event{
-					Type:      EventToolExecEnd,
-					ToolID:    call.ID,
-					Tool:      call.Name,
-					ToolLabel: label,
-					Result:    result.Content,
-					IsError:   true,
-				})
-				return result
+				return failToolCall(sink, call, label, reason, false)
 			}
 		}
 
@@ -1077,6 +997,27 @@ func executeSingleToolCall(ctx context.Context, tools []Tool, call ToolCall, con
 	return result
 }
 
+// failToolCall emits the terminal tool_exec_end event and returns the error
+// result for a call that failed before the tool ran. countErr sets ToolName
+// on the result so the caller counts the failure toward toolErrors; denials,
+// skips, and cancellations pass false (see executeSingleToolCall).
+func failToolCall(sink eventSink, call ToolCall, label, msg string, countErr bool) ToolResult {
+	content, _ := json.Marshal(msg)
+	result := ToolResult{ToolCallID: call.ID, Content: content, IsError: true}
+	if countErr {
+		result.ToolName = call.Name
+	}
+	sink.emit(Event{
+		Type:      EventToolExecEnd,
+		ToolID:    call.ID,
+		Tool:      call.Name,
+		ToolLabel: label,
+		Result:    content,
+		IsError:   true,
+	})
+	return result
+}
+
 // skipToolCall creates a skipped result for an interrupted tool call.
 func skipToolCall(call ToolCall, tools []Tool, sink eventSink) ToolResult {
 	return skipToolCallWithMessage(call, tools, sink, "Skipped due to queued user message.")
@@ -1093,23 +1034,7 @@ func skipToolCallWithMessage(call ToolCall, tools []Tool, sink eventSink, messag
 		Args:      call.Args,
 	})
 
-	content, _ := json.Marshal(message)
-	result := ToolResult{
-		ToolCallID: call.ID,
-		Content:    content,
-		IsError:    true,
-	}
-
-	sink.emit(Event{
-		Type:      EventToolExecEnd,
-		ToolID:    call.ID,
-		Tool:      call.Name,
-		ToolLabel: label,
-		Result:    result.Content,
-		IsError:   true,
-	})
-
-	return result
+	return failToolCall(sink, call, label, message, false)
 }
 
 // toolResultToMessage converts a ToolResult into a Message for the context.

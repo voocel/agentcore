@@ -3,10 +3,16 @@ package tools
 import (
 	"context"
 	"encoding/json"
+	"errors"
+	"io"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
+
+	"github.com/voocel/agentcore"
+	"github.com/voocel/agentcore/task"
 )
 
 type bashResult struct {
@@ -155,3 +161,105 @@ func TestBashNonZeroExitReturnsStructuredResult(t *testing.T) {
 		t.Fatalf("expected output to contain command output, got %#v", result)
 	}
 }
+
+func TestBashBackgroundOutputErrorsFailTask(t *testing.T) {
+	if _, _, err := resolveShell(); err != nil {
+		t.Skip(err)
+	}
+
+	for _, tc := range []struct {
+		name       string
+		command    string
+		writer     io.WriteCloser
+		wantCode   int
+		wantErrors []string
+	}{
+		{
+			name:       "write error",
+			command:    "printf output",
+			writer:     &errorWriteCloser{writeErr: errors.New("disk full")},
+			wantErrors: []string{"copy command output: disk full"},
+		},
+		{
+			name:       "close error",
+			command:    "printf output",
+			writer:     &errorWriteCloser{closeErr: errors.New("flush log")},
+			wantErrors: []string{"close command output: flush log"},
+		},
+		{
+			name:       "command and write errors",
+			command:    "printf output; exit 7",
+			writer:     &errorWriteCloser{writeErr: errors.New("disk full")},
+			wantCode:   7,
+			wantErrors: []string{"wait command:", "copy command output: disk full"},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			rt := task.NewRuntime()
+			tool := NewBash(".")
+			tool.SetTaskRuntime(rt)
+			tool.SetBgOutputFactory(func(string) (io.WriteCloser, string, error) {
+				return tc.writer, "background.log", nil
+			})
+			notified := make(chan agentcore.AgentMessage, 1)
+			tool.SetNotifyFn(func(msg agentcore.AgentMessage) { notified <- msg })
+
+			args, err := json.Marshal(map[string]any{
+				"command":           tc.command,
+				"run_in_background": true,
+			})
+			if err != nil {
+				t.Fatalf("marshal args: %v", err)
+			}
+			if _, err := tool.Execute(context.Background(), args); err != nil {
+				t.Fatalf("execute background bash: %v", err)
+			}
+
+			waited := make(chan struct{})
+			go func() {
+				rt.Wait()
+				close(waited)
+			}()
+			select {
+			case <-waited:
+			case <-time.After(15 * time.Second):
+				t.Fatal("background bash did not finish")
+			}
+
+			entries := rt.List()
+			if len(entries) != 1 {
+				t.Fatalf("tasks: got %d, want 1", len(entries))
+			}
+			if entries[0].Status != task.Failed {
+				t.Fatalf("status: got %q, want %q", entries[0].Status, task.Failed)
+			}
+			if entries[0].ExitCode != tc.wantCode {
+				t.Fatalf("exit code: got %d, want %d", entries[0].ExitCode, tc.wantCode)
+			}
+			for _, want := range tc.wantErrors {
+				if !strings.Contains(entries[0].Error, want) {
+					t.Fatalf("task error %q does not contain %q", entries[0].Error, want)
+				}
+			}
+			select {
+			case <-notified:
+			default:
+				t.Fatal("Wait returned before completion notification")
+			}
+		})
+	}
+}
+
+type errorWriteCloser struct {
+	writeErr error
+	closeErr error
+}
+
+func (w *errorWriteCloser) Write(p []byte) (int, error) {
+	if w.writeErr != nil {
+		return 0, w.writeErr
+	}
+	return len(p), nil
+}
+
+func (w *errorWriteCloser) Close() error { return w.closeErr }

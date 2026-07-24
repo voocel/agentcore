@@ -93,6 +93,7 @@ type Entry struct {
 	ToolCount   int    // number of tool calls executed
 	Depth       int    // nesting depth: 1 for tasks spawned by the main agent; n+1 inside a depth-n task. See MaxAgentDepth.
 	cancel      func() // unexported: only Stop()/StopAll() should use this
+	active      bool   // execution goroutine has not called Runtime.Done yet
 
 	// Shell-specific
 	PID     int
@@ -135,14 +136,18 @@ func (e *Entry) SetCancel(fn func()) {
 
 // Runtime is a unified registry for background tasks.
 type Runtime struct {
-	mu    sync.Mutex
-	seq   int
-	tasks map[string]*Entry
+	mu     sync.Mutex
+	idle   *sync.Cond
+	seq    int
+	active int
+	tasks  map[string]*Entry
 }
 
 // NewRuntime creates an empty runtime.
 func NewRuntime() *Runtime {
-	return &Runtime{tasks: make(map[string]*Entry)}
+	r := &Runtime{tasks: make(map[string]*Entry)}
+	r.idle = sync.NewCond(&r.mu)
+	return r
 }
 
 // NextID generates a sequential task ID with the given prefix (e.g. "shell", "bg").
@@ -153,11 +158,16 @@ func (r *Runtime) NextID(prefix string) string {
 	return prefix + "-" + strconv.Itoa(r.seq)
 }
 
-// Register adds a task entry. The caller is responsible for populating all fields.
+// Register adds a task entry. A running task remains active until its owner
+// calls Done after all completion work, including notifications, has finished.
 func (r *Runtime) Register(entry *Entry) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	r.tasks[entry.ID] = entry
+	if entry.Status == Running {
+		entry.active = true
+		r.active++
+	}
 }
 
 // Get returns a snapshot of a single task, or nil if not found.
@@ -191,13 +201,15 @@ func (r *Runtime) List() []Entry {
 // the cancellation.
 func (r *Runtime) Stop(id string) bool {
 	r.mu.Lock()
-	defer r.mu.Unlock()
 	e, ok := r.tasks[id]
 	if !ok || e.Status != Running {
+		r.mu.Unlock()
 		return false
 	}
-	if e.cancel != nil {
-		e.cancel()
+	cancel := e.cancel
+	r.mu.Unlock()
+	if cancel != nil {
+		cancel()
 	}
 	return true
 }
@@ -205,17 +217,60 @@ func (r *Runtime) Stop(id string) bool {
 // StopAll cancels all running tasks. Returns the number cancelled.
 func (r *Runtime) StopAll() int {
 	r.mu.Lock()
-	defer r.mu.Unlock()
+	cancels := make([]func(), 0, len(r.tasks))
 	count := 0
 	for _, e := range r.tasks {
 		if e.Status == Running {
-			if e.cancel != nil {
-				e.cancel()
-			}
 			count++
+			if e.cancel != nil {
+				cancels = append(cancels, e.cancel)
+			}
 		}
 	}
+	r.mu.Unlock()
+	for _, cancel := range cancels {
+		cancel()
+	}
 	return count
+}
+
+// Done marks a task's execution goroutine as fully finished. It must be
+// called after terminal state and completion notifications have been written.
+// Repeated calls and unknown IDs return false.
+func (r *Runtime) Done(id string) bool {
+	r.mu.Lock()
+	e, ok := r.tasks[id]
+	if !ok || !e.active {
+		r.mu.Unlock()
+		return false
+	}
+	e.active = false
+	r.active--
+	if r.active == 0 {
+		r.idle.Broadcast()
+	}
+	r.mu.Unlock()
+	return true
+}
+
+// Active returns the number of task goroutines that have not called Done.
+// Terminal tasks remain active while their completion notification is being
+// delivered, so callers can distinguish visible status from true quiescence.
+func (r *Runtime) Active() int {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.active
+}
+
+// Wait blocks until the runtime observes no active tasks. Work registered
+// while it is waiting is included, so shutdown can wait for nested work
+// without polling or imposing a timeout.
+func (r *Runtime) Wait() {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	for r.active > 0 {
+		r.idle.Wait()
+	}
 }
 
 // Update applies a mutation function to a task entry under the lock.
@@ -281,6 +336,7 @@ func (r *Runtime) DrainPending(id string) []string {
 func copyEntry(e *Entry) *Entry {
 	cp := *e
 	cp.cancel = nil          // snapshots don't carry cancel
+	cp.active = false        // snapshots don't carry lifecycle bookkeeping
 	cp.pendingMessages = nil // snapshots don't carry the live queue
 	return &cp
 }

@@ -45,6 +45,7 @@ type Agent struct {
 	lengthRecoveryPrompt string
 	abortMarkerText      string
 	abortMarkerToolText  string
+	messageCommitter     func(AgentMessage) error
 	onMessage            func(AgentMessage)
 	stopGuard            StopGuard
 	cacheLastMessage     string
@@ -192,7 +193,9 @@ func (a *Agent) Steer(msg AgentMessage) {
 	a.steeringQ = append(a.steeringQ, msg)
 }
 
-// FollowUp queues a message to be processed after the agent finishes.
+// FollowUp queues a message for the next natural continuation point. An
+// active run consumes follow-ups when it reaches that point; an idle Agent
+// retains them until the harness calls Continue.
 func (a *Agent) FollowUp(msg AgentMessage) {
 	a.mu.Lock()
 	defer a.mu.Unlock()
@@ -272,6 +275,14 @@ func (a *Agent) Messages() []AgentMessage {
 	a.mu.Lock()
 	defer a.mu.Unlock()
 	return copyMessages(a.messages)
+}
+
+// SetMessageCommitter replaces the durable message callback used by subsequent
+// runs. Returning an error stops the run before the message enters context.
+func (a *Agent) SetMessageCommitter(fn func(AgentMessage) error) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	a.messageCommitter = fn
 }
 
 // SetMessages replaces the message history (e.g. to restore a previous conversation).
@@ -603,6 +614,13 @@ func (a *Agent) HasQueuedMessages() bool {
 	return len(a.steeringQ) > 0 || len(a.followUpQ) > 0
 }
 
+// HasFollowUps reports whether follow-up messages are waiting to be consumed.
+func (a *Agent) HasFollowUps() bool {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	return len(a.followUpQ) > 0
+}
+
 // Reset clears all state and queues. If the agent is running, it cancels and waits first.
 func (a *Agent) Reset() {
 	a.mu.Lock()
@@ -652,7 +670,8 @@ func (a *Agent) buildConfig() LoopConfig {
 			a.syncContextManagerLocked()
 			return nil
 		},
-		ToolGate: a.toolGate,
+		CommitMessage: a.messageCommitter,
+		ToolGate:      a.toolGate,
 		GetSteeringMessages: func() []AgentMessage {
 			a.mu.Lock()
 			defer a.mu.Unlock()

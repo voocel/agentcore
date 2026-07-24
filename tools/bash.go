@@ -99,6 +99,24 @@ type bashArgs struct {
 	RunInBackground bool   `json:"run_in_background"`
 }
 
+// backgroundOutputWriter keeps os/exec on its managed copy path even when the
+// underlying destination is an *os.File. It records write errors separately
+// because Cmd.Wait prefers a non-zero process exit over copier errors.
+type backgroundOutputWriter struct {
+	io.Writer
+	err error
+}
+
+func (w *backgroundOutputWriter) Write(p []byte) (int, error) {
+	n, err := w.Writer.Write(p)
+	if err != nil && w.err == nil {
+		w.err = err
+	}
+	return n, err
+}
+
+func (w *backgroundOutputWriter) Err() error { return w.err }
+
 type bashForegroundResult struct {
 	Output     string `json:"output"`
 	ExitCode   int    `json:"exit_code"`
@@ -166,6 +184,28 @@ func (t *BashTool) executeBackground(ctx context.Context, a bashArgs) (json.RawM
 	}
 
 	bgCtx, cancel := context.WithTimeout(context.Background(), timeout)
+	shellID := rt.NextID("shell")
+
+	var outFile io.WriteCloser
+	var outPath string
+	if t.bgOutputFactory != nil {
+		outFile, outPath, err = t.bgOutputFactory(shellID)
+		if err != nil {
+			cancel()
+			return nil, fmt.Errorf("create output: %w", err)
+		}
+	}
+	closeOutput := func() error {
+		if outFile == nil {
+			return nil
+		}
+		err := outFile.Close()
+		outFile = nil
+		if err != nil {
+			return fmt.Errorf("close command output: %w", err)
+		}
+		return nil
+	}
 
 	cmdArgs := append(append([]string{}, shellArgs...), a.Command)
 	cmd := exec.CommandContext(bgCtx, shellPath, cmdArgs...)
@@ -173,38 +213,22 @@ func (t *BashTool) executeBackground(ctx context.Context, a bashArgs) (json.RawM
 		cmd.Dir = workDir
 	}
 	configureProcGroup(cmd)
-
-	pr, pw, pipeErr := os.Pipe()
-	if pipeErr != nil {
-		cancel()
-		return nil, fmt.Errorf("create pipe: %w", pipeErr)
+	output := io.Writer(io.Discard)
+	if outFile != nil {
+		output = outFile
 	}
-	cmd.Stdout = pw
-	cmd.Stderr = pw
+	managedOutput := &backgroundOutputWriter{Writer: output}
+	cmd.Stdout = managedOutput
+	cmd.Stderr = managedOutput
 
 	if err := cmd.Start(); err != nil {
 		cancel()
-		pr.Close()
-		pw.Close()
-		return nil, fmt.Errorf("start command: %w", err)
+		return nil, errors.Join(fmt.Errorf("start command: %w", err), closeOutput())
 	}
-	pw.Close()
-	shellID := rt.NextID("shell")
+
 	desc := a.Description
 	if desc == "" {
 		desc = bashTruncate(a.Command, 60)
-	}
-
-	var outFile io.WriteCloser
-	var outPath string
-	if t.bgOutputFactory != nil {
-		var ferr error
-		outFile, outPath, ferr = t.bgOutputFactory(shellID)
-		if ferr != nil {
-			cancel()
-			pr.Close()
-			return nil, fmt.Errorf("create output: %w", ferr)
-		}
 	}
 
 	entry := &task.Entry{
@@ -222,42 +246,42 @@ func (t *BashTool) executeBackground(ctx context.Context, a bashArgs) (json.RawM
 
 	// Background goroutine: stream output to file, wait for exit, notify.
 	go func() {
-		defer cancel()
-
-		var w io.Writer = io.Discard
-		if outFile != nil {
-			defer outFile.Close()
-			w = outFile
-		}
-
-		done := make(chan struct{})
-		go func() {
-			defer close(done)
-			io.Copy(w, pr)
+		defer func() {
+			cancel()
+			rt.Done(shellID)
 		}()
 
 		waitErr := cmd.Wait()
+		outputCloseErr := closeOutput()
 
-		select {
-		case <-done:
-		case <-time.After(500 * time.Millisecond):
-		}
-		pr.Close()
-		<-done
+		// When the process exits zero but output copying failed, Wait returns
+		// the copy error itself; report it once as a copy failure below.
+		outputErr := managedOutput.Err()
+		copyOnly := waitErr != nil && outputErr != nil && errors.Is(waitErr, outputErr)
 
 		exitCode := 0
-		status := task.Completed
-		if waitErr != nil {
-			status = task.Failed
+		var taskErr error
+		if waitErr != nil && !copyOnly {
+			exitCode = -1
 			if exitErr, ok := waitErr.(*exec.ExitError); ok {
 				exitCode = exitErr.ExitCode()
-			} else {
-				exitCode = -1
 			}
+			taskErr = fmt.Errorf("wait command: %w", waitErr)
+		}
+		if outputErr != nil {
+			taskErr = errors.Join(taskErr, fmt.Errorf("copy command output: %w", outputErr))
+		}
+		if outputCloseErr != nil {
+			taskErr = errors.Join(taskErr, outputCloseErr)
 		}
 
 		rt.Update(shellID, func(e *task.Entry) {
-			e.Status = status
+			if taskErr != nil {
+				e.Status = task.Failed
+				e.Error = taskErr.Error()
+			} else {
+				e.Status = task.Completed
+			}
 			e.ExitCode = exitCode
 			e.EndedAt = time.Now()
 		})

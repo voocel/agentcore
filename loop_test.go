@@ -79,7 +79,7 @@ func TestCallLLM_CommitsProjectedContextWhenRequested(t *testing.T) {
 	}
 
 	events := make(chan Event, 16)
-	if _, _, err := callLLM(context.Background(), agentCtx, cfg, eventSink{ctx: context.Background(), ch: events}, llmCallHooks{}); err != nil {
+	if _, _, err := callLLM(context.Background(), agentCtx, cfg, eventSink{ctx: context.Background(), ch: events}); err != nil {
 		t.Fatalf("callLLM failed: %v", err)
 	}
 
@@ -472,9 +472,12 @@ func TestAgentLoop_PreviewAndProgress(t *testing.T) {
 	for _, tc := range []struct {
 		name              string
 		args              json.RawMessage
+		previewErr        error
 		wantPreviewCalls  int64
+		wantExecuteCalls  int64
 		wantUpdateKinds   []ToolExecUpdateKind
 		wantToolExecError bool
+		wantError         string
 	}{
 		{
 			name:              "invalid args skip preview",
@@ -483,16 +486,30 @@ func TestAgentLoop_PreviewAndProgress(t *testing.T) {
 			wantToolExecError: true,
 		},
 		{
+			name:              "preview failure skips execution",
+			args:              json.RawMessage(`{"x":"v"}`),
+			previewErr:        errors.New("render diff"),
+			wantPreviewCalls:  1,
+			wantToolExecError: true,
+			wantError:         `preview tool "preview_tool": render diff`,
+		},
+		{
 			name:              "valid args emit preview and progress",
 			args:              json.RawMessage(`{"x":"v"}`),
 			wantPreviewCalls:  1,
+			wantExecuteCalls:  1,
 			wantUpdateKinds:   []ToolExecUpdateKind{ToolExecUpdatePreview, ToolExecUpdateProgress},
 			wantToolExecError: false,
 		},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			var previewCalls int64
-			pt := &previewProgressTool{previewCalls: &previewCalls}
+			var executeCalls int64
+			pt := &previewProgressTool{
+				previewCalls: &previewCalls,
+				executeCalls: &executeCalls,
+				previewErr:   tc.previewErr,
+			}
 
 			events := runTestLoop(t,
 				[]AgentMessage{UserMsg("test")},
@@ -506,6 +523,9 @@ func TestAgentLoop_PreviewAndProgress(t *testing.T) {
 
 			if got := atomic.LoadInt64(&previewCalls); got != tc.wantPreviewCalls {
 				t.Fatalf("preview calls: got %d, want %d", got, tc.wantPreviewCalls)
+			}
+			if got := atomic.LoadInt64(&executeCalls); got != tc.wantExecuteCalls {
+				t.Fatalf("execute calls: got %d, want %d", got, tc.wantExecuteCalls)
 			}
 
 			var gotKinds []ToolExecUpdateKind
@@ -545,13 +565,43 @@ func TestAgentLoop_PreviewAndProgress(t *testing.T) {
 			if end.IsError != tc.wantToolExecError {
 				t.Fatalf("tool_exec_end isError=%v, want %v", end.IsError, tc.wantToolExecError)
 			}
+			if tc.wantError != "" {
+				var errorText string
+				if err := json.Unmarshal(end.Result, &errorText); err != nil {
+					t.Fatalf("decode tool_exec_end result: %v", err)
+				}
+				if !strings.Contains(errorText, tc.wantError) {
+					t.Fatalf("tool_exec_end result %q does not contain %q", errorText, tc.wantError)
+				}
+			}
 		})
 	}
 }
 
-func TestAgentLoop_StreamingToolExecutionStartsBeforeAssistantEnds(t *testing.T) {
-	var calls []string
+func TestAgentLoop_StreamingToolExecutionStartsAfterAssistantCommit(t *testing.T) {
+	var (
+		calls              []string
+		assistantCommitted atomic.Bool
+		executedTooEarly   atomic.Bool
+	)
 	tc := ToolCall{ID: "tc-stream", Name: "echo", Args: json.RawMessage(`{"value":"ping"}`)}
+	tool := NewFuncTool("echo", "echo value", map[string]any{
+		"type": "object",
+		"properties": map[string]any{
+			"value": map[string]any{"type": "string"},
+		},
+		"required": []string{"value"},
+	}, func(_ context.Context, args json.RawMessage) (json.RawMessage, error) {
+		if !assistantCommitted.Load() {
+			executedTooEarly.Store(true)
+		}
+		var p struct {
+			Value string `json:"value"`
+		}
+		_ = json.Unmarshal(args, &p)
+		calls = append(calls, p.Value)
+		return json.Marshal(p.Value)
+	})
 
 	model := newScriptedStreamModel(
 		streamAssistantToolCalls("working", StopReasonToolUse, 40*time.Millisecond, tc),
@@ -560,12 +610,22 @@ func TestAgentLoop_StreamingToolExecutionStartsBeforeAssistantEnds(t *testing.T)
 
 	events := runTestLoop(t,
 		[]AgentMessage{UserMsg("stream tools")},
-		AgentContext{Tools: []Tool{echoTool(&calls)}},
-		LoopConfig{Model: model},
+		AgentContext{Tools: []Tool{tool}},
+		LoopConfig{
+			Model: model,
+			OnMessage: func(msg AgentMessage) {
+				if concrete, ok := msg.(Message); ok && concrete.Role == RoleAssistant && len(concrete.ToolCalls()) > 0 {
+					assistantCommitted.Store(true)
+				}
+			},
+		},
 	)
 
 	if len(calls) != 1 || calls[0] != "ping" {
 		t.Fatalf("expected streaming tool execution, got %v", calls)
+	}
+	if executedTooEarly.Load() {
+		t.Fatal("tool executed before assistant tool-call message was committed")
 	}
 
 	toolExecStart := -1
@@ -577,7 +637,6 @@ func TestAgentLoop_StreamingToolExecutionStartsBeforeAssistantEnds(t *testing.T)
 		if ev.Type == EventMessageEnd {
 			if msg, ok := ev.Message.(Message); ok && msg.Role == RoleAssistant && len(msg.ToolCalls()) > 0 {
 				assistantToolMessageEnd = i
-				break
 			}
 		}
 	}
@@ -585,8 +644,55 @@ func TestAgentLoop_StreamingToolExecutionStartsBeforeAssistantEnds(t *testing.T)
 	if toolExecStart < 0 || assistantToolMessageEnd < 0 {
 		t.Fatalf("unexpected event sequence: tool_exec_start=%d assistant_tool_message_end=%d", toolExecStart, assistantToolMessageEnd)
 	}
-	if toolExecStart >= assistantToolMessageEnd {
-		t.Fatalf("expected tool execution to start before assistant message ended, got start=%d end=%d", toolExecStart, assistantToolMessageEnd)
+	if assistantToolMessageEnd >= toolExecStart {
+		t.Fatalf("expected assistant message end before tool execution, got end=%d start=%d", assistantToolMessageEnd, toolExecStart)
+	}
+}
+
+func TestAgentLoop_MessageCommitFailurePreventsToolExecution(t *testing.T) {
+	var executeCalls atomic.Int64
+	call := ToolCall{ID: "tc-commit-fail", Name: "write", Args: json.RawMessage(`{}`)}
+	tool := NewFuncTool("write", "write data", map[string]any{
+		"type":       "object",
+		"properties": map[string]any{},
+	}, func(context.Context, json.RawMessage) (json.RawMessage, error) {
+		executeCalls.Add(1)
+		return json.RawMessage(`"unexpected"`), nil
+	})
+	model := newScriptedStreamModel(
+		streamAssistantToolCalls("write", StopReasonToolUse, 0, call),
+	)
+
+	events := runTestLoop(t,
+		[]AgentMessage{UserMsg("run")},
+		AgentContext{Tools: []Tool{tool}},
+		LoopConfig{
+			Model: model,
+			CommitMessage: func(message AgentMessage) error {
+				concrete, ok := message.(Message)
+				if ok && concrete.Role == RoleAssistant && len(concrete.ToolCalls()) > 0 {
+					return errors.New("session disk full")
+				}
+				return nil
+			},
+		},
+	)
+
+	if executeCalls.Load() != 0 {
+		t.Fatalf("tool execute calls = %d, want 0", executeCalls.Load())
+	}
+	for _, event := range events {
+		if event.Type == EventToolExecStart || event.Type == EventToolExecEnd {
+			t.Fatalf("unexpected tool event after commit failure: %+v", event)
+		}
+	}
+	errEvent, ok := findEvent(events, EventError)
+	if !ok || errEvent.Err == nil || !strings.Contains(errEvent.Err.Error(), "session disk full") {
+		t.Fatalf("expected commit failure event, got %+v", errEvent)
+	}
+	endEvent, ok := findEvent(events, EventAgentEnd)
+	if !ok || endEvent.Summary == nil || endEvent.Summary.EndReason != EndReasonError {
+		t.Fatalf("expected error agent_end, got %+v", endEvent)
 	}
 }
 
@@ -943,20 +1049,16 @@ func TestAgentLoop_StreamingToolExecutionHonorsSteeringForQueuedTools(t *testing
 	}
 }
 
-func TestAgentLoop_StreamingToolExecutionDrainsOnStreamError(t *testing.T) {
-	started := make(chan struct{}, 1)
+func TestAgentLoop_StreamingToolCallDoesNotExecuteOnStreamError(t *testing.T) {
+	var executeCalls atomic.Int64
 	tc := ToolCall{ID: "tc-err", Name: "wait_for_cancel", Args: json.RawMessage(`{}`)}
 
 	waitForCancel := NewFuncTool("wait_for_cancel", "waits for cancellation", map[string]any{
 		"type":       "object",
 		"properties": map[string]any{},
-	}, func(ctx context.Context, args json.RawMessage) (json.RawMessage, error) {
-		select {
-		case started <- struct{}{}:
-		default:
-		}
-		<-ctx.Done()
-		return nil, ctx.Err()
+	}, func(context.Context, json.RawMessage) (json.RawMessage, error) {
+		executeCalls.Add(1)
+		return json.RawMessage(`"unexpected"`), nil
 	})
 
 	model := &scriptedStreamModel{
@@ -967,10 +1069,6 @@ func TestAgentLoop_StreamingToolExecutionDrainsOnStreamError(t *testing.T) {
 				ch <- StreamEvent{Type: StreamEventToolCallStart, Message: partial}
 				partial.Content = append(partial.Content, ToolCallBlock(tc))
 				ch <- StreamEvent{Type: StreamEventToolCallEnd, Message: partial, CompletedToolCall: &tc}
-				select {
-				case <-started:
-				case <-time.After(time.Second):
-				}
 				ch <- StreamEvent{Type: StreamEventError, Err: fmt.Errorf("stream failed")}
 			},
 		},
@@ -982,19 +1080,17 @@ func TestAgentLoop_StreamingToolExecutionDrainsOnStreamError(t *testing.T) {
 		LoopConfig{Model: model},
 	)
 
-	toolStart := -1
-	toolEnd := -1
 	errIdx := -1
 	agentEnd := -1
 	for i, ev := range events {
 		switch ev.Type {
 		case EventToolExecStart:
-			if ev.ToolID == "tc-err" && toolStart < 0 {
-				toolStart = i
+			if ev.ToolID == "tc-err" {
+				t.Fatal("tool must not start when the assistant stream fails before completion")
 			}
 		case EventToolExecEnd:
-			if ev.ToolID == "tc-err" && strings.Contains(string(ev.Result), "context canceled") {
-				toolEnd = i
+			if ev.ToolID == "tc-err" {
+				t.Fatal("tool must not emit a result when it never started")
 			}
 		case EventError:
 			if ev.Err != nil && strings.Contains(ev.Err.Error(), "stream failed") {
@@ -1005,14 +1101,11 @@ func TestAgentLoop_StreamingToolExecutionDrainsOnStreamError(t *testing.T) {
 		}
 	}
 
-	if toolStart < 0 || toolEnd < 0 || errIdx < 0 || agentEnd < 0 {
-		t.Fatalf("unexpected event sequence: tool_start=%d tool_end=%d err=%d agent_end=%d", toolStart, toolEnd, errIdx, agentEnd)
+	if executeCalls.Load() != 0 {
+		t.Fatalf("tool execute calls = %d, want 0", executeCalls.Load())
 	}
-	if toolStart >= toolEnd {
-		t.Fatalf("expected cancelled tool to emit end after start, got start=%d end=%d", toolStart, toolEnd)
-	}
-	if toolEnd >= errIdx {
-		t.Fatalf("expected tool cleanup before stream error surfaced, got tool_end=%d err=%d", toolEnd, errIdx)
+	if errIdx < 0 || agentEnd < 0 {
+		t.Fatalf("unexpected event sequence: err=%d agent_end=%d", errIdx, agentEnd)
 	}
 	if errIdx >= agentEnd {
 		t.Fatalf("expected agent_end after error, got err=%d agent_end=%d", errIdx, agentEnd)
@@ -1331,6 +1424,8 @@ func echoTool(calls *[]string) Tool {
 
 type previewProgressTool struct {
 	previewCalls *int64
+	executeCalls *int64
+	previewErr   error
 }
 
 func (t *previewProgressTool) Name() string        { return "preview_tool" }
@@ -1347,10 +1442,14 @@ func (t *previewProgressTool) Schema() map[string]any {
 
 func (t *previewProgressTool) Preview(ctx context.Context, args json.RawMessage) (json.RawMessage, error) {
 	atomic.AddInt64(t.previewCalls, 1)
+	if t.previewErr != nil {
+		return nil, t.previewErr
+	}
 	return json.RawMessage(`"preview"`), nil
 }
 
 func (t *previewProgressTool) Execute(ctx context.Context, args json.RawMessage) (json.RawMessage, error) {
+	atomic.AddInt64(t.executeCalls, 1)
 	ReportToolProgress(ctx, ProgressPayload{Kind: ProgressSummary, Summary: "progress"})
 	return json.RawMessage(`"ok"`), nil
 }
@@ -1627,7 +1726,7 @@ func TestCallLLMStream_StreamInitErrorBubbles(t *testing.T) {
 	m := &streamErrModel{err: fmt.Errorf("provider unavailable")}
 	events := make(chan Event, 4)
 
-	_, _, err := callLLMStream(context.Background(), m, nil, nil, nil, eventSink{ctx: context.Background(), ch: events}, llmCallHooks{})
+	_, _, err := callLLMStream(context.Background(), m, nil, nil, nil, eventSink{ctx: context.Background(), ch: events})
 	close(events)
 
 	if err == nil {
@@ -1665,7 +1764,7 @@ func TestCallLLMStream_PartialStreamErrorOnTruncation(t *testing.T) {
 	m := &partialStreamModel{text: "half a sente"}
 	events := make(chan Event, 16)
 
-	_, _, err := callLLMStream(context.Background(), m, nil, nil, nil, eventSink{ctx: context.Background(), ch: events}, llmCallHooks{})
+	_, _, err := callLLMStream(context.Background(), m, nil, nil, nil, eventSink{ctx: context.Background(), ch: events})
 	close(events)
 
 	var partialErr *PartialStreamError
@@ -1703,11 +1802,17 @@ func (m *flakyStreamModel) GenerateStream(_ context.Context, _ []Message, _ []To
 	m.calls++
 	ch := make(chan StreamEvent, 4)
 	if m.calls == 1 {
-		// Truncate: emit a delta then close without StreamEventDone.
+		// Truncate after a complete tool call then close without
+		// StreamEventDone. The tool has only been parsed, not executed, so a
+		// fresh model attempt remains safe.
 		partial := Message{Role: RoleAssistant, Content: []ContentBlock{TextBlock("")}}
 		ch <- StreamEvent{Type: StreamEventTextStart, ContentIndex: 0, Message: partial}
 		partial.Content[0].Text = "partial..."
 		ch <- StreamEvent{Type: StreamEventTextDelta, ContentIndex: 0, Delta: "partial...", Message: partial}
+		call := ToolCall{ID: "retry-call", Name: "read", Args: json.RawMessage(`{}`)}
+		partial.Content = append(partial.Content, ToolCallBlock(call))
+		ch <- StreamEvent{Type: StreamEventToolCallStart, Message: partial}
+		ch <- StreamEvent{Type: StreamEventToolCallEnd, Message: partial, CompletedToolCall: &call}
 		close(ch)
 		return ch, nil
 	}
@@ -1731,7 +1836,7 @@ func TestCallLLMWithRetry_RetriesPartialStream(t *testing.T) {
 	cfg := LoopConfig{Model: m, MaxRetries: 2}
 	agentCtx := &AgentContext{Messages: []AgentMessage{UserMsg("hi")}}
 
-	msg, _, err := callLLMWithRetry(context.Background(), agentCtx, cfg, eventSink{ctx: context.Background(), ch: events}, llmCallHooks{}, nil)
+	msg, _, err := callLLMWithRetry(context.Background(), agentCtx, cfg, eventSink{ctx: context.Background(), ch: events})
 	if err != nil {
 		t.Fatalf("expected retry to succeed, got %v", err)
 	}
