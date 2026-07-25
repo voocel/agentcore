@@ -105,13 +105,6 @@ func WithMaxRetries(n int) AgentOption {
 	return func(a *Agent) { a.maxRetries = n }
 }
 
-// WithToolsAreIdempotent is retained for source compatibility.
-// Deprecated: tools start only after a complete assistant response has been
-// committed, so model-stream retries cannot replay tool side effects.
-func WithToolsAreIdempotent(idempotent bool) AgentOption {
-	return func(a *Agent) { a.toolsAreIdempotent = idempotent }
-}
-
 // ---------------------------------------------------------------------------
 // Context Pipeline — manage context window and message transformation
 // ---------------------------------------------------------------------------

@@ -41,7 +41,6 @@ type Agent struct {
 	toolGate             ToolGate
 	middlewares          []ToolMiddleware
 	maxToolConcurrency   int
-	toolsAreIdempotent   bool
 	lengthRecoveryPrompt string
 	abortMarkerText      string
 	abortMarkerToolText  string
@@ -694,7 +693,6 @@ func (a *Agent) buildConfig() LoopConfig {
 		LengthRecoveryPrompt:  a.lengthRecoveryPrompt,
 		AbortMarkerText:       a.abortMarkerText,
 		AbortMarkerToolText:   a.abortMarkerToolText,
-		ToolsAreIdempotent:    a.toolsAreIdempotent,
 		CacheLastMessage:      a.cacheLastMessage,
 		PromptCacheKey:        a.promptCacheKey,
 	}

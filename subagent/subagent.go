@@ -53,10 +53,6 @@ type Config struct {
 	// this sub-agent's loop. 0 (default) disables retry entirely.
 	MaxRetries int
 
-	// ToolsAreIdempotent is retained for source compatibility.
-	// Deprecated: agentcore no longer executes tools before stream completion.
-	ToolsAreIdempotent bool
-
 	// StopAfterTools lists tool names that trigger early loop exit after
 	// successful execution.
 	StopAfterTools []string
@@ -907,15 +903,14 @@ func (r *Runner) run(ctx context.Context, agentName, taskStr string, modelOverri
 	}
 
 	loopCfg := agentcore.LoopConfig{
-		Model:              runModel,
-		MaxTurns:           cfg.MaxTurns,
-		MaxRetries:         cfg.MaxRetries,
-		ToolsAreIdempotent: cfg.ToolsAreIdempotent,
-		ContextManager:     contextManager,
-		ConvertToLLM:       convertToLLM,
-		ThinkingLevel:      r.resolveThinking(agentName, cfg.ThinkingLevel),
-		CacheLastMessage:   cfg.CacheLastMessage,
-		PromptCacheKey:     promptCacheKey,
+		Model:            runModel,
+		MaxTurns:         cfg.MaxTurns,
+		MaxRetries:       cfg.MaxRetries,
+		ContextManager:   contextManager,
+		ConvertToLLM:     convertToLLM,
+		ThinkingLevel:    r.resolveThinking(agentName, cfg.ThinkingLevel),
+		CacheLastMessage: cfg.CacheLastMessage,
+		PromptCacheKey:   promptCacheKey,
 	}
 
 	loopCfg.GetSteeringMessages = opts.getSteeringMessages

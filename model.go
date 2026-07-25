@@ -134,11 +134,6 @@ type LoopConfig struct {
 	// cancellation lands during tool execution. Empty uses a built-in default.
 	AbortMarkerToolText string
 
-	// ToolsAreIdempotent is retained for source compatibility.
-	// Deprecated: tool execution now starts only after a complete assistant
-	// response has been committed, so model-stream retries cannot replay tools.
-	ToolsAreIdempotent bool
-
 	// CacheLastMessage, when non-empty, instructs the loop to tag the last
 	// non-system message in every LLM request with this cache_control value
 	// (e.g. "ephemeral"). Providers that support prompt caching place a write
