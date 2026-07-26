@@ -391,7 +391,7 @@ func (t *ReadTool) readTextFile(ctx context.Context, a resolvedRead) (string, er
 }
 
 func (t *ReadTool) notFoundWithSuggestions(ctx context.Context, target string) string {
-	dir := filepath.Dir(target)
+	dir := dirOf(target)
 	base := filepath.Base(target)
 	entries, err := t.fs.ReadDir(ctx, dir)
 	if err != nil {
@@ -408,7 +408,7 @@ func (t *ReadTool) notFoundWithSuggestions(ctx context.Context, target string) s
 		if strings.Contains(lowerName, lowerBase) ||
 			strings.Contains(lowerBase, lowerName) ||
 			(lowerStem != "" && (strings.Contains(lowerNameStem, lowerStem) || strings.Contains(lowerStem, lowerNameStem))) {
-			suggestions = append(suggestions, filepath.Join(dir, name))
+			suggestions = append(suggestions, joinOf(dir, name))
 			if len(suggestions) >= 3 {
 				break
 			}

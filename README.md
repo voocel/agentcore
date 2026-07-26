@@ -322,6 +322,8 @@ When usage exceeds `ContextWindow - ReserveTokens` (default 16384), compaction:
 | `edit` | Exact text replacement with fuzzy match, BOM/line-ending normalization, unified diff output |
 | `bash` | Execute shell commands with tail truncation (2000 lines / 50KB) |
 
+The `bash` tool requires a POSIX shell (`bash` or `sh`) on PATH — on Windows that means Git Bash. There is no cmd.exe/PowerShell fallback: LLM-generated commands assume POSIX syntax.
+
 ## API Reference
 
 ### Agent

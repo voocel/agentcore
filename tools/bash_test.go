@@ -6,6 +6,7 @@ import (
 	"errors"
 	"io"
 	"os"
+	"path"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -138,8 +139,12 @@ func TestBashUsesPerCommandWorkDir(t *testing.T) {
 	if err != nil {
 		t.Fatalf("execute bash: %v", err)
 	}
-	if !strings.Contains(strings.TrimSpace(out.Output), nested) {
-		t.Fatalf("expected output to contain %q, got %q", nested, out.Output)
+	// Compare the tail path segment only: on Windows the shell is Git Bash,
+	// whose pwd prints the MSYS-mapped POSIX form of the same directory
+	// (%TEMP% → /tmp), so a literal comparison against the OS path fails even
+	// though the workdir was set correctly.
+	if got := path.Base(filepath.ToSlash(strings.TrimSpace(out.Output))); got != "nested" {
+		t.Fatalf("expected pwd to end in \"nested\", got %q (full output %q)", got, out.Output)
 	}
 }
 

@@ -5,7 +5,6 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
-	"path/filepath"
 	"strings"
 
 	"github.com/voocel/agentcore"
@@ -175,7 +174,7 @@ func (t *WriteTool) Execute(ctx context.Context, args json.RawMessage) (json.Raw
 		return nil, err
 	}
 
-	if err := t.fs.MkdirAll(ctx, filepath.Dir(state.path), 0o755); err != nil {
+	if err := t.fs.MkdirAll(ctx, dirOf(state.path), 0o755); err != nil {
 		return nil, fmt.Errorf("mkdir: %w", err)
 	}
 

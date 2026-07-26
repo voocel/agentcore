@@ -14,8 +14,11 @@ import (
 // instead of calling os.* directly.
 //
 // All paths are absolute: tools call ResolvePath before handing a path to a
-// WorkspaceFS method. Implementations that perform I/O over a transport should
-// honour ctx cancellation; the OS backend ignores ctx.
+// WorkspaceFS method. Non-OS backends should key files by slash-separated
+// absolute paths ("/work/file.txt"); tools preserve slash separators for
+// slash-rooted paths on every platform, so such keys survive Windows hosts
+// intact. Implementations that perform I/O over a transport should honour ctx
+// cancellation; the OS backend ignores ctx.
 type WorkspaceFS interface {
 	// Stat returns metadata for the file or directory at path.
 	Stat(ctx context.Context, path string) (FileInfo, error)

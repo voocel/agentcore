@@ -78,15 +78,47 @@ func ExpandPath(p string) string {
 // ResolvePath resolves a user-provided path against a working directory.
 // If userPath is empty, returns workDir. If absolute, returns as-is.
 // Otherwise joins with workDir.
+//
+// Path semantics follow the workspace root. WorkspaceFS backends key files
+// with slash-separated absolute paths (editor buffers, remote hosts), so a
+// leading "/" counts as absolute even on Windows — where filepath.IsAbs would
+// demand a drive letter and the fallthrough join would corrupt the virtual
+// path ("/work" + "/work/f.txt" → `\work\work\f.txt`). Likewise a
+// slash-rooted workDir joins with slash separators, never the OS's. OS-rooted
+// paths (drive letters, UNC) keep filepath semantics unchanged, and on Unix
+// the two branches coincide.
 func ResolvePath(workDir, userPath string) string {
 	if userPath == "" {
 		return workDir
 	}
 	expanded := ExpandPath(userPath)
-	if filepath.IsAbs(expanded) {
+	if filepath.IsAbs(expanded) || strings.HasPrefix(expanded, "/") {
 		return expanded
 	}
+	if strings.HasPrefix(workDir, "/") {
+		return path.Join(workDir, filepath.ToSlash(expanded))
+	}
 	return filepath.Join(workDir, expanded)
+}
+
+// dirOf and joinOf are filepath.Dir / filepath.Join with the same
+// virtual-path awareness as ResolvePath: slash-rooted paths stay
+// slash-separated instead of being rewritten with the OS separator, so a
+// resolved WorkspaceFS path survives parent-dir and sibling derivation on
+// Windows.
+
+func dirOf(p string) string {
+	if strings.HasPrefix(p, "/") {
+		return path.Dir(p)
+	}
+	return filepath.Dir(p)
+}
+
+func joinOf(dir, name string) string {
+	if strings.HasPrefix(dir, "/") {
+		return path.Join(dir, name)
+	}
+	return filepath.Join(dir, name)
 }
 
 // IsSkipDir reports whether a directory name should be excluded from traversal.

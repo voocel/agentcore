@@ -318,6 +318,8 @@ agent := agentcore.NewAgent(
 | `edit` | 精确文本替换，支持模糊匹配、BOM/行ending 归一化、unified diff 输出 |
 | `bash` | 执行 shell 命令，tail 截断（2000 行 / 50KB） |
 
+`bash` 工具要求 PATH 上有 POSIX shell（`bash` 或 `sh`）——Windows 上即 Git Bash。不提供 cmd.exe/PowerShell 回退：LLM 生成的命令假定 POSIX 语法。
+
 ## API 参考
 
 ### Agent
