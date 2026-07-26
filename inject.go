@@ -16,23 +16,17 @@ type InjectResult struct {
 	Disposition InjectDisposition
 }
 
-// Inject delivers a message as soon as the current agent state allows, resuming
-// an idle run on the background context. Prefer InjectContext when the resumed
-// run should carry caller context (e.g. a working-directory override).
-func (a *Agent) Inject(msg AgentMessage) (InjectResult, error) {
-	return a.InjectContext(context.Background(), msg)
-}
-
-// InjectContext is Inject with an explicit context that an idle resume runs
-// under, so values threaded onto ctx (cwd override, deadlines) reach the
-// resumed run's tools just as they would on PromptMessages/Continue.
+// Inject delivers a message as soon as the current agent state allows. An
+// idle resume runs under ctx, so values threaded onto it (cwd override,
+// deadlines) reach the resumed run's tools just as they would on
+// PromptMessages/Continue.
 //
 // Outcomes:
 //   - runs held (HoldRuns) → ErrRunsHeld, nothing queued
 //   - running → steer into current run (ctx unused; the live run keeps its own)
 //   - idle + assistant tail → enqueue and resume, atomically
 //   - idle + no assistant tail → enqueue for next run
-func (a *Agent) InjectContext(ctx context.Context, msg AgentMessage) (InjectResult, error) {
+func (a *Agent) Inject(ctx context.Context, msg AgentMessage) (InjectResult, error) {
 	if msg == nil {
 		return InjectResult{}, ErrInjectNilMessage
 	}

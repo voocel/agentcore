@@ -23,7 +23,7 @@ func TestAgentInject_WhenRunning_ReturnsSteeredCurrentRun(t *testing.T) {
 		t.Fatalf("prompt failed: %v", err)
 	}
 
-	result, err := agent.Inject(UserMsg("runtime steer"))
+	result, err := agent.Inject(context.Background(), UserMsg("runtime steer"))
 	if err != nil {
 		t.Fatalf("inject failed: %v", err)
 	}
@@ -56,7 +56,7 @@ func TestAgentInject_WhenIdleAndAssistantTail_ReturnsResumedIdleRun(t *testing.T
 	}
 	agent.WaitForIdle()
 
-	result, err := agent.Inject(UserMsg("runtime reminder"))
+	result, err := agent.Inject(context.Background(), UserMsg("runtime reminder"))
 	if err != nil {
 		t.Fatalf("inject failed: %v", err)
 	}
@@ -84,7 +84,7 @@ func TestAgentInject_WhenIdleWithoutAssistantTail_ReturnsQueued(t *testing.T) {
 		t.Fatalf("set messages failed: %v", err)
 	}
 
-	result, err := agent.Inject(UserMsg("queued"))
+	result, err := agent.Inject(context.Background(), UserMsg("queued"))
 	if err != nil {
 		t.Fatalf("inject failed: %v", err)
 	}
@@ -98,7 +98,7 @@ func TestAgentInject_WhenIdleWithoutAssistantTail_ReturnsQueued(t *testing.T) {
 
 func TestAgentInject_WhenNilMessage_ReturnsError(t *testing.T) {
 	agent := NewAgent()
-	if _, err := agent.Inject(nil); err == nil {
+	if _, err := agent.Inject(context.Background(), nil); err == nil {
 		t.Fatal("expected nil inject message to fail")
 	}
 }
@@ -130,7 +130,7 @@ func TestAgentInject_IsAtomicUnderConcurrentCalls(t *testing.T) {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			outcomes[i].result, outcomes[i].err = agent.Inject(msgsToInject[i])
+			outcomes[i].result, outcomes[i].err = agent.Inject(context.Background(), msgsToInject[i])
 		}()
 	}
 	wg.Wait()
@@ -285,7 +285,7 @@ func TestResumeFromAgentEndListenerSurvivesCleanup(t *testing.T) {
 	var resumed atomic.Bool
 	agent.Subscribe(func(ev Event) {
 		if ev.Type == EventAgentEnd && !resumed.Swap(true) {
-			_, _ = agent.Inject(UserMsg("resume"))
+			_, _ = agent.Inject(context.Background(), UserMsg("resume"))
 		}
 	})
 
@@ -392,7 +392,7 @@ func TestHoldRunsBlocksPromptContinueInject(t *testing.T) {
 	if !agent.HasQueuedMessages() {
 		t.Fatal("held Continue must not consume queued messages")
 	}
-	if _, err := agent.Inject(UserMsg("blocked inject")); !errors.Is(err, ErrRunsHeld) {
+	if _, err := agent.Inject(context.Background(), UserMsg("blocked inject")); !errors.Is(err, ErrRunsHeld) {
 		t.Fatalf("Inject during hold: err = %v, want ErrRunsHeld", err)
 	}
 
@@ -446,7 +446,7 @@ func TestHoldRunsRejectsListenerAutoContinueWithoutDeadlock(t *testing.T) {
 	injectDone := make(chan struct{})
 	agent.Subscribe(func(ev Event) {
 		if ev.Type == EventAgentEnd {
-			_, injectErr = agent.Inject(UserMsg("auto resume"))
+			_, injectErr = agent.Inject(context.Background(), UserMsg("auto resume"))
 			close(injectDone)
 		}
 	})
@@ -487,7 +487,7 @@ func TestInjectDuringHoldFailsFastWithoutQueueing(t *testing.T) {
 	release := holdWithTimeout(t, agent)
 	defer release()
 
-	if _, err := agent.Inject(UserMsg("dropped")); !errors.Is(err, ErrRunsHeld) {
+	if _, err := agent.Inject(context.Background(), UserMsg("dropped")); !errors.Is(err, ErrRunsHeld) {
 		t.Fatalf("inject during hold: err = %v, want ErrRunsHeld", err)
 	}
 	if agent.HasQueuedMessages() {
@@ -597,7 +597,7 @@ func TestResetDrainsActiveRunAndLeavesAgentUsable(t *testing.T) {
 	}
 }
 
-func TestClearMessagesWhileRunningReturnsErrAlreadyRunning(t *testing.T) {
+func TestSetMessagesWhileRunningReturnsErrAlreadyRunning(t *testing.T) {
 	started := make(chan struct{})
 	release := make(chan struct{})
 	agent := NewAgent(WithModel(funcModel(func(_ context.Context, _ *LLMRequest) (*LLMResponse, error) {
@@ -610,13 +610,13 @@ func TestClearMessagesWhileRunningReturnsErrAlreadyRunning(t *testing.T) {
 		t.Fatalf("prompt failed: %v", err)
 	}
 	<-started
-	if err := agent.ClearMessages(); !errors.Is(err, ErrAlreadyRunning) {
+	if err := agent.SetMessages(nil); !errors.Is(err, ErrAlreadyRunning) {
 		t.Fatalf("clear during run: err = %v, want ErrAlreadyRunning", err)
 	}
 
 	close(release)
 	agent.WaitForIdle()
-	if err := agent.ClearMessages(); err != nil {
+	if err := agent.SetMessages(nil); err != nil {
 		t.Fatalf("clear while idle failed: %v", err)
 	}
 	if got := len(agent.Messages()); got != 0 {
@@ -625,8 +625,8 @@ func TestClearMessagesWhileRunningReturnsErrAlreadyRunning(t *testing.T) {
 }
 
 // TestInjectDuringHoldChurnNeverStrandsMessage races Inject against a
-// hold/release churn goroutine. The invariant under test is InjectContext's
-// atomic idle-resume: whenever an inject fails with ErrRunsHeld the message
+// hold/release churn goroutine. The invariant under test is Inject's atomic
+// idle-resume: whenever an inject fails with ErrRunsHeld the message
 // must NOT be left queued (the caller reroutes it — a queued copy would
 // double-deliver on the next resume), and a reported resume really started.
 func TestInjectDuringHoldChurnNeverStrandsMessage(t *testing.T) {
@@ -669,7 +669,7 @@ func TestInjectDuringHoldChurnNeverStrandsMessage(t *testing.T) {
 			t.Fatalf("reset messages failed: %v", err)
 		}
 
-		res, err := agent.Inject(UserMsg("inject"))
+		res, err := agent.Inject(context.Background(), UserMsg("inject"))
 		switch {
 		case errors.Is(err, ErrRunsHeld):
 			if agent.HasQueuedMessages() {

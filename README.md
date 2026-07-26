@@ -202,10 +202,10 @@ Four execution modes via tool call:
 
 ### Steering & Injection
 
-`Inject(msg)` delivers a message according to the agent's current state — preferred when the caller's intent is "deliver this as soon as possible" without manually branching on running vs idle:
+`Inject(ctx, msg)` delivers a message according to the agent's current state — preferred when the caller's intent is "deliver this as soon as possible" without manually branching on running vs idle:
 
 ```go
-result, _ := agent.Inject(agentcore.UserMsg("Re-check unfinished tasks before stopping."))
+result, _ := agent.Inject(ctx, agentcore.UserMsg("Re-check unfinished tasks before stopping."))
 fmt.Println(result.Disposition)
 ```
 
@@ -332,14 +332,13 @@ When usage exceeds `ContextWindow - ReserveTokens` (default 16384), compaction:
 | `Prompt(input)` | Start new conversation turn |
 | `PromptMessages(msgs...)` | Start turn with arbitrary AgentMessages |
 | `Continue()` | Resume from current context |
-| `Inject(msg)` | Deliver message via steer / idle resume / queue, depending on current state |
+| `Inject(ctx, msg)` | Deliver message via steer / idle resume / queue, depending on current state |
 | `Steer(msg)` | Inject steering message mid-run |
 | `FollowUp(msg)` | Queue message for after completion |
 | `Abort()` | Cancel current execution |
 | `AbortSilent()` | Cancel without emitting abort marker |
 | `HoldRuns()` | Silently drain the current run and reject new starts (`ErrRunsHeld`) until released — for atomic state surgery |
 | `Reset()` | Drain via HoldRuns, then clear all state and queues |
-| `ClearMessages() error` | Clear history; fails with `ErrAlreadyRunning` mid-run |
 | `WaitForIdle()` | Block until agent finishes |
 | `Subscribe(fn)` | Register event listener |
 | `State()` | Snapshot of current state |

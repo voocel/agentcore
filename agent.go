@@ -377,8 +377,11 @@ func (a *Agent) SetMessageCommitter(fn func(AgentMessage) error) {
 	a.messageCommitter = fn
 }
 
-// SetMessages replaces the message history (e.g. to restore a previous conversation).
-// The agent must not be running.
+// SetMessages replaces the message history — restore a previous conversation,
+// or clear it with nil. Refused while a run is in flight (ErrAlreadyRunning):
+// the loop's context commit would resurrect the replaced history as silent
+// corruption. Hold the lifecycle first (HoldRuns) when mutating around live
+// runs.
 func (a *Agent) SetMessages(msgs []AgentMessage) error {
 	a.mu.Lock()
 	defer a.mu.Unlock()
@@ -400,21 +403,6 @@ func (a *Agent) ExportMessages() []Message {
 // ImportMessages replaces message history from deserialized Messages.
 func (a *Agent) ImportMessages(msgs []Message) error {
 	return a.SetMessages(ToAgentMessages(msgs))
-}
-
-// ClearMessages drops the conversation history. Refused while a run is in
-// flight (ErrAlreadyRunning): the loop's context commit would resurrect the
-// cleared history as silent corruption. Hold the lifecycle first (HoldRuns)
-// when clearing around live runs.
-func (a *Agent) ClearMessages() error {
-	a.mu.Lock()
-	defer a.mu.Unlock()
-	if a.isRunning {
-		return fmt.Errorf("cannot clear messages: %w", ErrAlreadyRunning)
-	}
-	a.messages = nil
-	a.syncContextManagerLocked()
-	return nil
 }
 
 // startPromptRunLocked starts a prompt-based run. Caller must hold a.mu.

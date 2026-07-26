@@ -200,10 +200,10 @@ LLM 通过工具调用触发四种执行模式：
 
 ### Steering 与注入
 
-`Inject(msg)` 根据 Agent 当前状态自动派发消息——当调用方意图是「尽快送达」、不想自己判断 running / idle 时使用：
+`Inject(ctx, msg)` 根据 Agent 当前状态自动派发消息——当调用方意图是「尽快送达」、不想自己判断 running / idle 时使用：
 
 ```go
-result, _ := agent.Inject(agentcore.UserMsg("结束前先重新检查未完成任务。"))
+result, _ := agent.Inject(ctx, agentcore.UserMsg("结束前先重新检查未完成任务。"))
 fmt.Println(result.Disposition)
 ```
 
@@ -328,14 +328,13 @@ agent := agentcore.NewAgent(
 | `Prompt(input)` | 发起新对话轮次 |
 | `PromptMessages(msgs...)` | 用任意 AgentMessage 发起对话 |
 | `Continue()` | 从当前上下文继续 |
-| `Inject(msg)` | 根据当前状态自动选择 steer / idle 续跑 / 排队 |
+| `Inject(ctx, msg)` | 根据当前状态自动选择 steer / idle 续跑 / 排队 |
 | `Steer(msg)` | 中断注入 steering 消息 |
 | `FollowUp(msg)` | 排队 follow-up 消息 |
 | `Abort()` | 取消当前执行 |
 | `AbortSilent()` | 静默取消（不发 abort 标记） |
 | `HoldRuns()` | 静默排空当前 run 并拒绝新启动（`ErrRunsHeld`），直到 release——用于原子性的状态手术 |
 | `Reset()` | 经 HoldRuns 排空后清空全部状态与队列 |
-| `ClearMessages() error` | 清空历史；运行中返回 `ErrAlreadyRunning` |
 | `WaitForIdle()` | 阻塞等待完成 |
 | `Subscribe(fn)` | 注册事件监听 |
 | `State()` | 获取当前状态快照 |
