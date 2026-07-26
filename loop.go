@@ -904,6 +904,13 @@ func executeSingleToolCall(ctx context.Context, tools []Tool, call ToolCall, con
 				}
 				return failToolCall(sink, call, label, reason, false)
 			}
+			// Adopt the gate's rewrite before execution so the tool, progress
+			// events, and middleware all see the approved arguments. The
+			// assistant message keeps the model's original args — like the
+			// exec-start event above, it records what was requested.
+			if decision != nil && len(decision.UpdatedArgs) > 0 {
+				call.Args = decision.UpdatedArgs
+			}
 		}
 
 		// Inject progress callback so tools can report partial results

@@ -359,6 +359,28 @@ func TestAgentLoop_ToolGate(t *testing.T) {
 		}
 	})
 
+	t.Run("allowed gate with UpdatedArgs executes the rewrite", func(t *testing.T) {
+		var calls []string
+
+		runTestLoop(t,
+			[]AgentMessage{UserMsg("test")},
+			AgentContext{Tools: []Tool{echoTool(&calls)}},
+			LoopConfig{
+				Model: mockModel(
+					toolCallMsg(ToolCall{ID: "tc1", Name: "echo", Args: json.RawMessage(`{"value":"original"}`)}),
+					assistantMsg("done", StopReasonStop),
+				),
+				ToolGate: func(ctx context.Context, req GateRequest) (*GateDecision, error) {
+					return &GateDecision{Allowed: true, UpdatedArgs: json.RawMessage(`{"value":"rewritten"}`)}, nil
+				},
+			},
+		)
+
+		if len(calls) != 1 || calls[0] != "rewritten" {
+			t.Fatalf("tool should execute with gate-updated args, got %v", calls)
+		}
+	})
+
 	t.Run("gate error is treated as deny", func(t *testing.T) {
 		var calls []string
 

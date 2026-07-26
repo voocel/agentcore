@@ -198,13 +198,17 @@ type GateRequest struct {
 
 // GateDecision is the gate's verdict for one tool call.
 //
-// Allowed=true => execute the tool with Call.Args.
+// Allowed=true => execute the tool with Call.Args, or with UpdatedArgs when
+// set — the gate's way to return a policy-side rewrite (hook updated_input,
+// interactive data backfill) so the tool executes exactly what was approved.
 // Allowed=false => return Reason as the tool result error; do not execute.
+// UpdatedArgs is ignored on a denial.
 //
 // A nil decision is treated as Allowed=true (the gate has no opinion).
 type GateDecision struct {
-	Allowed bool
-	Reason  string
+	Allowed     bool
+	Reason      string
+	UpdatedArgs json.RawMessage
 }
 
 // ToolGate is the pluggable hook called once per tool call, after argument
