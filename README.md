@@ -337,6 +337,9 @@ When usage exceeds `ContextWindow - ReserveTokens` (default 16384), compaction:
 | `FollowUp(msg)` | Queue message for after completion |
 | `Abort()` | Cancel current execution |
 | `AbortSilent()` | Cancel without emitting abort marker |
+| `HoldRuns()` | Silently drain the current run and reject new starts (`ErrRunsHeld`) until released — for atomic state surgery |
+| `Reset()` | Drain via HoldRuns, then clear all state and queues |
+| `ClearMessages() error` | Clear history; fails with `ErrAlreadyRunning` mid-run |
 | `WaitForIdle()` | Block until agent finishes |
 | `Subscribe(fn)` | Register event listener |
 | `State()` | Snapshot of current state |

@@ -37,6 +37,7 @@ var (
 	ErrStreamPartial    = errors.New("stream closed without done event")
 	ErrToolValidation   = errors.New("tool argument validation failed")
 	ErrInjectNilMessage = errors.New("inject message is nil")
+	ErrRunsHeld         = errors.New("agent runs are held")
 )
 
 // Provider runtime sentinels. These categorize errors returned by the model

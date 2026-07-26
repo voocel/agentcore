@@ -2,6 +2,7 @@ package agentcore
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"sync"
 	"sync/atomic"
@@ -312,6 +313,489 @@ func TestResumeFromAgentEndListenerSurvivesCleanup(t *testing.T) {
 	msgs := agent.Messages()
 	if got := msgs[len(msgs)-1].TextContent(); got != "run 2" {
 		t.Fatalf("resumed run did not complete: last message = %q, want %q", got, "run 2")
+	}
+}
+
+// holdWithTimeout runs HoldRuns on a goroutine so a deadlock fails the test
+// instead of hanging the package.
+func holdWithTimeout(t *testing.T, agent *Agent) (release func()) {
+	t.Helper()
+	done := make(chan struct{})
+	go func() {
+		release = agent.HoldRuns()
+		close(done)
+	}()
+	select {
+	case <-done:
+		return release
+	case <-time.After(2 * time.Second):
+		t.Fatal("HoldRuns did not return")
+		return nil
+	}
+}
+
+func TestHoldRunsDrainsActiveRun(t *testing.T) {
+	started := make(chan struct{})
+	sawCancel := make(chan struct{})
+	agent := NewAgent(WithModel(funcModel(func(ctx context.Context, _ *LLMRequest) (*LLMResponse, error) {
+		close(started)
+		<-ctx.Done()
+		close(sawCancel)
+		return nil, ctx.Err()
+	})))
+
+	if err := agent.Prompt(context.Background(), "start"); err != nil {
+		t.Fatalf("prompt failed: %v", err)
+	}
+	<-started
+
+	release := holdWithTimeout(t, agent)
+	defer release()
+
+	select {
+	case <-sawCancel:
+	default:
+		t.Fatal("model never observed the hold's cancellation")
+	}
+	if agent.State().IsRunning {
+		t.Fatal("agent still running after HoldRuns returned")
+	}
+	// The cancel is silent: no abort marker message may be appended.
+	msgs := agent.Messages()
+	if len(msgs) != 1 || msgs[0].TextContent() != "start" {
+		var texts []string
+		for _, m := range msgs {
+			texts = append(texts, m.TextContent())
+		}
+		t.Fatalf("history polluted by hold drain: %v", texts)
+	}
+}
+
+func TestHoldRunsBlocksPromptContinueInject(t *testing.T) {
+	agent := NewAgent(WithModel(mockModel(assistantMsg("later", StopReasonStop))))
+	if err := agent.SetMessages([]AgentMessage{
+		UserMsg("earlier"),
+		assistantMsg("earlier reply", StopReasonStop),
+	}); err != nil {
+		t.Fatalf("set messages failed: %v", err)
+	}
+
+	release := holdWithTimeout(t, agent)
+
+	if err := agent.Prompt(context.Background(), "blocked"); !errors.Is(err, ErrRunsHeld) {
+		t.Fatalf("Prompt during hold: err = %v, want ErrRunsHeld", err)
+	}
+	agent.Steer(UserMsg("queued steer"))
+	if err := agent.Continue(context.Background()); !errors.Is(err, ErrRunsHeld) {
+		t.Fatalf("Continue during hold: err = %v, want ErrRunsHeld", err)
+	}
+	if !agent.HasQueuedMessages() {
+		t.Fatal("held Continue must not consume queued messages")
+	}
+	if _, err := agent.Inject(UserMsg("blocked inject")); !errors.Is(err, ErrRunsHeld) {
+		t.Fatalf("Inject during hold: err = %v, want ErrRunsHeld", err)
+	}
+
+	release()
+	if err := agent.Prompt(context.Background(), "resumes"); err != nil {
+		t.Fatalf("prompt after release failed: %v", err)
+	}
+	agent.WaitForIdle()
+
+	// The steer queued during the hold survives it (queues are untouched) and
+	// is delivered to the released run via its initial steering poll.
+	var steerDelivered bool
+	for _, m := range agent.Messages() {
+		if m.TextContent() == "queued steer" {
+			steerDelivered = true
+		}
+	}
+	if !steerDelivered {
+		t.Fatal("steer queued during hold was not delivered to the post-release run")
+	}
+}
+
+func TestHoldRunsCounterAndIdempotentRelease(t *testing.T) {
+	agent := NewAgent(WithModel(mockModel(assistantMsg("ok", StopReasonStop))))
+
+	release1 := holdWithTimeout(t, agent)
+	release2 := holdWithTimeout(t, agent)
+
+	release1()
+	release1() // idempotent: must not decrement twice
+	if err := agent.Prompt(context.Background(), "still held"); !errors.Is(err, ErrRunsHeld) {
+		t.Fatalf("one holder released, err = %v, want ErrRunsHeld", err)
+	}
+
+	release2()
+	if err := agent.Prompt(context.Background(), "released"); err != nil {
+		t.Fatalf("prompt after all releases failed: %v", err)
+	}
+	agent.WaitForIdle()
+}
+
+func TestHoldRunsRejectsListenerAutoContinueWithoutDeadlock(t *testing.T) {
+	started := make(chan struct{})
+	agent := NewAgent(WithModel(funcModel(func(ctx context.Context, _ *LLMRequest) (*LLMResponse, error) {
+		close(started)
+		<-ctx.Done()
+		return nil, ctx.Err()
+	})))
+
+	var injectErr error
+	injectDone := make(chan struct{})
+	agent.Subscribe(func(ev Event) {
+		if ev.Type == EventAgentEnd {
+			_, injectErr = agent.Inject(UserMsg("auto resume"))
+			close(injectDone)
+		}
+	})
+
+	if err := agent.Prompt(context.Background(), "start"); err != nil {
+		t.Fatalf("prompt failed: %v", err)
+	}
+	<-started
+
+	// The hold's cancel triggers EventAgentEnd, whose listener attempts an
+	// auto-continue while the hold is draining. It must fail fast — a blocking
+	// acquire here would deadlock HoldRuns against the listener goroutine.
+	release := holdWithTimeout(t, agent)
+	defer release()
+
+	select {
+	case <-injectDone:
+	case <-time.After(2 * time.Second):
+		t.Fatal("EventAgentEnd listener never ran")
+	}
+	if !errors.Is(injectErr, ErrRunsHeld) {
+		t.Fatalf("listener auto-continue: err = %v, want ErrRunsHeld", injectErr)
+	}
+	if agent.State().IsRunning {
+		t.Fatal("agent running after hold drained a listener-resume attempt")
+	}
+}
+
+func TestInjectDuringHoldFailsFastWithoutQueueing(t *testing.T) {
+	agent := NewAgent()
+	if err := agent.SetMessages([]AgentMessage{
+		UserMsg("q"),
+		assistantMsg("a", StopReasonStop),
+	}); err != nil {
+		t.Fatalf("set messages failed: %v", err)
+	}
+
+	release := holdWithTimeout(t, agent)
+	defer release()
+
+	if _, err := agent.Inject(UserMsg("dropped")); !errors.Is(err, ErrRunsHeld) {
+		t.Fatalf("inject during hold: err = %v, want ErrRunsHeld", err)
+	}
+	if agent.HasQueuedMessages() {
+		t.Fatal("held inject must not leave the message queued (double delivery once resumed)")
+	}
+}
+
+func TestHoldRunsVsConcurrentPromptRace(t *testing.T) {
+	agent := NewAgent(WithModel(funcModel(func(_ context.Context, _ *LLMRequest) (*LLMResponse, error) {
+		return &LLMResponse{Message: assistantMsg("quick", StopReasonStop)}, nil
+	})))
+
+	stop := make(chan struct{})
+	var wg sync.WaitGroup
+	wg.Go(func() {
+		for {
+			select {
+			case <-stop:
+				return
+			default:
+				_ = agent.Prompt(context.Background(), "spin")
+			}
+		}
+	})
+
+	for range 20 {
+		release := holdWithTimeout(t, agent)
+		if agent.State().IsRunning {
+			release()
+			t.Fatal("run in flight while held")
+		}
+		release()
+	}
+	close(stop)
+	wg.Wait()
+	agent.WaitForIdle()
+}
+
+func TestHoldRunsOnIdleAgentReturnsImmediately(t *testing.T) {
+	// Never ran: done is nil.
+	fresh := NewAgent()
+	release := holdWithTimeout(t, fresh)
+	release()
+
+	// Ran to completion: done is a closed channel.
+	agent := NewAgent(WithModel(mockModel(
+		assistantMsg("done", StopReasonStop),
+		assistantMsg("after", StopReasonStop),
+	)))
+	if err := agent.Prompt(context.Background(), "start"); err != nil {
+		t.Fatalf("prompt failed: %v", err)
+	}
+	agent.WaitForIdle()
+
+	release = holdWithTimeout(t, agent)
+	if err := agent.Prompt(context.Background(), "held"); !errors.Is(err, ErrRunsHeld) {
+		t.Fatalf("prompt during idle hold: err = %v, want ErrRunsHeld", err)
+	}
+	release()
+	if err := agent.Prompt(context.Background(), "released"); err != nil {
+		t.Fatalf("prompt after release failed: %v", err)
+	}
+	agent.WaitForIdle()
+}
+
+func TestResetDrainsActiveRunAndLeavesAgentUsable(t *testing.T) {
+	started := make(chan struct{})
+	var calls atomic.Int32
+	agent := NewAgent(WithModel(funcModel(func(ctx context.Context, _ *LLMRequest) (*LLMResponse, error) {
+		if calls.Add(1) == 1 {
+			close(started)
+			<-ctx.Done()
+			return nil, ctx.Err()
+		}
+		return &LLMResponse{Message: assistantMsg("fresh", StopReasonStop)}, nil
+	})))
+
+	if err := agent.Prompt(context.Background(), "start"); err != nil {
+		t.Fatalf("prompt failed: %v", err)
+	}
+	<-started
+
+	resetDone := make(chan struct{})
+	go func() {
+		agent.Reset()
+		close(resetDone)
+	}()
+	select {
+	case <-resetDone:
+	case <-time.After(2 * time.Second):
+		t.Fatal("Reset did not return while a run was in flight")
+	}
+
+	if agent.State().IsRunning {
+		t.Fatal("agent running after Reset")
+	}
+	if got := len(agent.Messages()); got != 0 {
+		t.Fatalf("history not cleared: %d messages remain", got)
+	}
+	if err := agent.Prompt(context.Background(), "again"); err != nil {
+		t.Fatalf("prompt after reset failed: %v", err)
+	}
+	agent.WaitForIdle()
+	msgs := agent.Messages()
+	if got := msgs[len(msgs)-1].TextContent(); got != "fresh" {
+		t.Fatalf("post-reset run did not complete: last message = %q", got)
+	}
+}
+
+func TestClearMessagesWhileRunningReturnsErrAlreadyRunning(t *testing.T) {
+	started := make(chan struct{})
+	release := make(chan struct{})
+	agent := NewAgent(WithModel(funcModel(func(_ context.Context, _ *LLMRequest) (*LLMResponse, error) {
+		close(started)
+		<-release
+		return &LLMResponse{Message: assistantMsg("done", StopReasonStop)}, nil
+	})))
+
+	if err := agent.Prompt(context.Background(), "start"); err != nil {
+		t.Fatalf("prompt failed: %v", err)
+	}
+	<-started
+	if err := agent.ClearMessages(); !errors.Is(err, ErrAlreadyRunning) {
+		t.Fatalf("clear during run: err = %v, want ErrAlreadyRunning", err)
+	}
+
+	close(release)
+	agent.WaitForIdle()
+	if err := agent.ClearMessages(); err != nil {
+		t.Fatalf("clear while idle failed: %v", err)
+	}
+	if got := len(agent.Messages()); got != 0 {
+		t.Fatalf("history not cleared: %d messages remain", got)
+	}
+}
+
+// TestInjectDuringHoldChurnNeverStrandsMessage races Inject against a
+// hold/release churn goroutine. The invariant under test is InjectContext's
+// atomic idle-resume: whenever an inject fails with ErrRunsHeld the message
+// must NOT be left queued (the caller reroutes it — a queued copy would
+// double-deliver on the next resume), and a reported resume really started.
+func TestInjectDuringHoldChurnNeverStrandsMessage(t *testing.T) {
+	agent := NewAgent(WithModel(funcModel(func(_ context.Context, _ *LLMRequest) (*LLMResponse, error) {
+		return &LLMResponse{Message: assistantMsg("reply", StopReasonStop)}, nil
+	})))
+	if err := agent.SetMessages([]AgentMessage{
+		UserMsg("q"),
+		assistantMsg("a", StopReasonStop),
+	}); err != nil {
+		t.Fatalf("set messages failed: %v", err)
+	}
+
+	stop := make(chan struct{})
+	var wg sync.WaitGroup
+	wg.Go(func() {
+		for {
+			select {
+			case <-stop:
+				return
+			default:
+				release := agent.HoldRuns()
+				release()
+			}
+		}
+	})
+
+	for range 50 {
+		// Per-iteration reset so the queue is provably empty going in: a run the
+		// churn cancels mid-flight leaves a user tail, and the next inject then
+		// queues legitimately — without the reset that queued message would trip
+		// the ErrRunsHeld assertion below. Only inject starts runs here, so the
+		// agent is reliably idle after WaitForIdle.
+		agent.WaitForIdle()
+		agent.ClearAllQueues()
+		if err := agent.SetMessages([]AgentMessage{
+			UserMsg("q"),
+			assistantMsg("a", StopReasonStop),
+		}); err != nil {
+			t.Fatalf("reset messages failed: %v", err)
+		}
+
+		res, err := agent.Inject(UserMsg("inject"))
+		switch {
+		case errors.Is(err, ErrRunsHeld):
+			if agent.HasQueuedMessages() {
+				t.Fatal("ErrRunsHeld inject left the message queued")
+			}
+		case err != nil:
+			t.Fatalf("inject failed: %v", err)
+		case res.Disposition == InjectResumedIdleRun:
+			agent.WaitForIdle()
+		}
+	}
+	close(stop)
+	wg.Wait()
+	agent.WaitForIdle()
+}
+
+func TestFollowUpSurvivesHoldAndDeliversAfterRelease(t *testing.T) {
+	agent := NewAgent(WithModel(mockModel(assistantMsg("follow-up reply", StopReasonStop))))
+	if err := agent.SetMessages([]AgentMessage{
+		UserMsg("q"),
+		assistantMsg("a", StopReasonStop),
+	}); err != nil {
+		t.Fatalf("set messages failed: %v", err)
+	}
+	agent.FollowUp(UserMsg("queued follow-up"))
+
+	release := holdWithTimeout(t, agent)
+	if err := agent.Continue(context.Background()); !errors.Is(err, ErrRunsHeld) {
+		t.Fatalf("Continue during hold: err = %v, want ErrRunsHeld", err)
+	}
+	if !agent.HasFollowUps() {
+		t.Fatal("hold consumed the follow-up queue")
+	}
+	release()
+
+	if err := agent.Continue(context.Background()); err != nil {
+		t.Fatalf("continue after release failed: %v", err)
+	}
+	agent.WaitForIdle()
+	if agent.HasFollowUps() {
+		t.Fatal("released Continue did not consume the follow-up")
+	}
+	var delivered bool
+	for _, m := range agent.Messages() {
+		if m.TextContent() == "queued follow-up" {
+			delivered = true
+		}
+	}
+	if !delivered {
+		t.Fatal("follow-up never delivered to the resumed run")
+	}
+}
+
+func TestTwoHoldersDrainOneActiveRun(t *testing.T) {
+	started := make(chan struct{})
+	var calls atomic.Int32
+	agent := NewAgent(WithModel(funcModel(func(ctx context.Context, _ *LLMRequest) (*LLMResponse, error) {
+		if calls.Add(1) == 1 {
+			close(started)
+			<-ctx.Done()
+			return nil, ctx.Err()
+		}
+		return &LLMResponse{Message: assistantMsg("fresh", StopReasonStop)}, nil
+	})))
+	if err := agent.Prompt(context.Background(), "start"); err != nil {
+		t.Fatalf("prompt failed: %v", err)
+	}
+	<-started
+
+	// Both holders target the same in-flight run: both must drain and return.
+	results := make(chan func(), 2)
+	for range 2 {
+		go func() { results <- agent.HoldRuns() }()
+	}
+	var releases []func()
+	for range 2 {
+		select {
+		case r := <-results:
+			releases = append(releases, r)
+		case <-time.After(2 * time.Second):
+			t.Fatal("concurrent HoldRuns on one active run did not both return")
+		}
+	}
+	if agent.State().IsRunning {
+		t.Fatal("run in flight while held twice")
+	}
+
+	releases[0]()
+	if err := agent.Prompt(context.Background(), "still held"); !errors.Is(err, ErrRunsHeld) {
+		t.Fatalf("one holder released, err = %v, want ErrRunsHeld", err)
+	}
+	releases[1]()
+	if err := agent.Prompt(context.Background(), "released"); err != nil {
+		t.Fatalf("prompt after all releases failed: %v", err)
+	}
+	agent.WaitForIdle()
+}
+
+// TestAbortWhileIdleDoesNotArmMarkerForLaterHold pins the idle-Abort guard: an
+// Abort with no run in flight must be a full no-op. Before the guard it armed
+// wantAbortMarker with nothing to consume it, so the next silent cancellation
+// (a HoldRuns drain) emitted an abort marker it never requested.
+func TestAbortWhileIdleDoesNotArmMarkerForLaterHold(t *testing.T) {
+	started := make(chan struct{})
+	agent := NewAgent(WithModel(funcModel(func(ctx context.Context, _ *LLMRequest) (*LLMResponse, error) {
+		close(started)
+		<-ctx.Done()
+		return nil, ctx.Err()
+	})))
+
+	agent.Abort() // idle: nothing to interrupt
+
+	if err := agent.Prompt(context.Background(), "start"); err != nil {
+		t.Fatalf("prompt failed: %v", err)
+	}
+	<-started
+	release := holdWithTimeout(t, agent)
+	defer release()
+
+	msgs := agent.Messages()
+	if len(msgs) != 1 || msgs[0].TextContent() != "start" {
+		var texts []string
+		for _, m := range msgs {
+			texts = append(texts, m.TextContent())
+		}
+		t.Fatalf("stale idle Abort polluted the hold drain: %v", texts)
 	}
 }
 

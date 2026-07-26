@@ -333,6 +333,9 @@ agent := agentcore.NewAgent(
 | `FollowUp(msg)` | 排队 follow-up 消息 |
 | `Abort()` | 取消当前执行 |
 | `AbortSilent()` | 静默取消（不发 abort 标记） |
+| `HoldRuns()` | 静默排空当前 run 并拒绝新启动（`ErrRunsHeld`），直到 release——用于原子性的状态手术 |
+| `Reset()` | 经 HoldRuns 排空后清空全部状态与队列 |
+| `ClearMessages() error` | 清空历史；运行中返回 `ErrAlreadyRunning` |
 | `WaitForIdle()` | 阻塞等待完成 |
 | `Subscribe(fn)` | 注册事件监听 |
 | `State()` | 获取当前状态快照 |

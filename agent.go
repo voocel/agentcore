@@ -67,6 +67,7 @@ type Agent struct {
 	listeners       []func(Event)
 	cancel          context.CancelFunc
 	done            chan struct{} // closed when loop finishes
+	held            int           // active HoldRuns count; >0 rejects new run starts
 	wantAbortMarker atomic.Bool   // set by Abort(), read by runLoop
 	mu              sync.Mutex
 }
@@ -109,6 +110,15 @@ func NewAgent(opts ...AgentOption) *Agent {
 // before a dispatcher reacts) may rely on this. The flip side: a slow listener
 // delays event delivery to all later listeners and backpressures the loop's
 // event channel; offload heavy work to your own goroutine.
+//
+// Lifecycle contract (stable API guarantee):
+//   - When EventAgentEnd listeners run, isRunning is already false — a
+//     listener may start the next run (Continue / InjectContext) directly.
+//   - The run's done channel — what WaitForIdle and HoldRuns wait on —
+//     closes only after all listeners for the final event have returned.
+//   - Therefore a listener must never call HoldRuns or Reset, and must never
+//     block on a lock that may be held by a goroutine waiting on
+//     WaitForIdle/HoldRuns: both are self-deadlocks.
 func (a *Agent) Subscribe(fn func(Event)) func() {
 	a.mu.Lock()
 	defer a.mu.Unlock()
@@ -132,6 +142,13 @@ func (a *Agent) Prompt(ctx context.Context, input string) error {
 // See Prompt for ctx semantics.
 func (a *Agent) PromptMessages(ctx context.Context, msgs ...AgentMessage) error {
 	a.mu.Lock()
+	// Checked before isRunning: during a hold's wind-down isRunning is still
+	// true, and the caller must see the stable ErrRunsHeld, not a
+	// timing-dependent ErrAlreadyRunning.
+	if a.held > 0 {
+		a.mu.Unlock()
+		return ErrRunsHeld
+	}
 	if a.isRunning {
 		a.mu.Unlock()
 		return fmt.Errorf("%w; use Steer() or FollowUp() to queue messages", ErrAlreadyRunning)
@@ -154,6 +171,12 @@ func (a *Agent) PromptMessages(ctx context.Context, msgs ...AgentMessage) error 
 // notifications that must never be lost.
 func (a *Agent) Continue(ctx context.Context) error {
 	a.mu.Lock()
+	// Before isRunning (stable error during wind-down) and before any dequeue
+	// (a held Continue must not consume queued messages just to drop them).
+	if a.held > 0 {
+		a.mu.Unlock()
+		return ErrRunsHeld
+	}
 	if a.isRunning {
 		a.mu.Unlock()
 		return ErrAlreadyRunning
@@ -166,14 +189,7 @@ func (a *Agent) Continue(ctx context.Context) error {
 	// If last message is assistant, try to dequeue pending messages as new prompt
 	lastMsg := a.messages[len(a.messages)-1]
 	if lastMsg.GetRole() == RoleAssistant {
-		if queued := dequeue(&a.steeringQ); len(queued) > 0 {
-			a.skipNextInitialSteeringPoll = true
-			a.startPromptRunLocked(ctx, queued)
-			return nil
-		}
-		if queued := dequeue(&a.followUpQ); len(queued) > 0 {
-			a.skipNextInitialSteeringPoll = true
-			a.startPromptRunLocked(ctx, queued)
+		if a.resumeQueuedLocked(ctx) {
 			return nil
 		}
 		a.mu.Unlock()
@@ -182,6 +198,24 @@ func (a *Agent) Continue(ctx context.Context) error {
 
 	a.startContinueRunLocked(ctx)
 	return nil
+}
+
+// resumeQueuedLocked dequeues pending messages (steering first, then
+// follow-up) and starts a prompt run with them. Caller must hold a.mu with an
+// assistant-tail idle agent; on true the run has started and the lock has been
+// released (by startPromptRunLocked), on false nothing was dequeued and the
+// lock is still held.
+func (a *Agent) resumeQueuedLocked(ctx context.Context) bool {
+	queued := dequeue(&a.steeringQ)
+	if len(queued) == 0 {
+		queued = dequeue(&a.followUpQ)
+	}
+	if len(queued) == 0 {
+		return false
+	}
+	a.skipNextInitialSteeringPoll = true
+	a.startPromptRunLocked(ctx, queued)
+	return true
 }
 
 // Steer queues a steering message to interrupt the agent mid-run.
@@ -209,12 +243,16 @@ func (a *Agent) FollowUp(msg AgentMessage) {
 // Continue). Harnesses that treat queued input as stale after an abort must
 // clear it explicitly.
 func (a *Agent) Abort() {
-	a.wantAbortMarker.Store(true)
 	a.mu.Lock()
 	defer a.mu.Unlock()
-	if a.cancel != nil {
-		a.cancel()
+	if a.cancel == nil {
+		// Idle: nothing to interrupt, and no run will consume the marker flag —
+		// arming it here would leak onto the next cancellation (e.g. a later
+		// HoldRuns drain, which must stay silent).
+		return
 	}
+	a.wantAbortMarker.Store(true)
+	a.cancel()
 }
 
 // AbortSilent cancels the current execution without emitting an abort marker.
@@ -225,6 +263,61 @@ func (a *Agent) AbortSilent() {
 	defer a.mu.Unlock()
 	if a.cancel != nil {
 		a.cancel()
+	}
+}
+
+// HoldRuns stops the world for state surgery: it silently cancels any
+// in-flight run, waits for it to drain, and rejects new run starts
+// (PromptMessages / Continue / InjectContext return ErrRunsHeld) until the
+// returned release is called. Use it to make multi-step mutations — swap the
+// conversation, clear history, retarget stores — atomic with respect to the
+// run lifecycle, including auto-continues a listener may attempt mid-surgery.
+//
+//	release := agent.HoldRuns()
+//	defer release()
+//	// no run is in flight and none can start
+//
+// Semantics:
+//   - Counting: concurrent holders each get their own release (idempotent);
+//     runs stay rejected until every release has been called. The hold only
+//     freezes the run lifecycle — it does NOT mutually exclude two holders'
+//     state mutations; serialize holders on the host side.
+//   - The cancel is silent: HoldRuns itself never requests an abort marker.
+//     (A concurrent Abort can still mark the dying run — the hold does not
+//     suppress user interruptions.)
+//   - Queues are untouched: like Abort, a hold never consumes or clears
+//     Steer/FollowUp messages — clear them explicitly if they must not
+//     outlive the held run (see Continue's queue-retention caveat).
+//   - WaitForIdle after HoldRuns returns immediately: "no run in flight" is
+//     guaranteed, but that does not mean starts are allowed again.
+//   - MUST NOT be called from an event listener: the drained run's done
+//     channel closes only after its listeners return, so a listener waiting
+//     on HoldRuns deadlocks itself. (The same restriction applies to Reset.)
+func (a *Agent) HoldRuns() (release func()) {
+	a.mu.Lock()
+	a.held++
+	// Snapshotted in the same critical section as held++: a takeover run
+	// cannot start after this point (its Continue fails ErrRunsHeld), so the
+	// snapshot cannot go stale.
+	cancel, done := a.cancel, a.done
+	a.mu.Unlock()
+
+	if cancel != nil {
+		cancel()
+	}
+	if done != nil {
+		// done closes after the dying run's listeners return; listeners never
+		// block on a hold (their run starts fail fast), so this cannot hang.
+		<-done
+	}
+
+	var once sync.Once
+	return func() {
+		once.Do(func() {
+			a.mu.Lock()
+			a.held--
+			a.mu.Unlock()
+		})
 	}
 }
 
@@ -309,12 +402,19 @@ func (a *Agent) ImportMessages(msgs []Message) error {
 	return a.SetMessages(ToAgentMessages(msgs))
 }
 
-// ClearMessages resets the message history.
-func (a *Agent) ClearMessages() {
+// ClearMessages drops the conversation history. Refused while a run is in
+// flight (ErrAlreadyRunning): the loop's context commit would resurrect the
+// cleared history as silent corruption. Hold the lifecycle first (HoldRuns)
+// when clearing around live runs.
+func (a *Agent) ClearMessages() error {
 	a.mu.Lock()
 	defer a.mu.Unlock()
+	if a.isRunning {
+		return fmt.Errorf("cannot clear messages: %w", ErrAlreadyRunning)
+	}
 	a.messages = nil
 	a.syncContextManagerLocked()
+	return nil
 }
 
 // startPromptRunLocked starts a prompt-based run. Caller must hold a.mu.
@@ -454,6 +554,13 @@ func (a *Agent) TotalUsage() Usage {
 }
 
 // SetModel changes the LLM provider. Takes effect on the next turn.
+//
+// Purity contract (stable API guarantee, shared by SetThinkingLevel, SetTools,
+// SetSystemPrompt and SetSystemBlocks): a pure field assignment under the
+// agent's internal mutex — no events emitted, no callbacks invoked — so it is
+// safe to call from event listeners and while holding host locks.
+// SetContextWindow is NOT part of this contract: it calls back into the
+// ContextManager outside the lock.
 func (a *Agent) SetModel(m ChatModel) {
 	a.mu.Lock()
 	defer a.mu.Unlock()
@@ -478,6 +585,7 @@ func (a *Agent) SetContextWindow(n int) {
 
 // SetSystemPrompt changes the system prompt (single-string mode).
 // Clears any multi-block system prompt set via SetSystemBlocks.
+// Purity contract: see SetModel.
 func (a *Agent) SetSystemPrompt(s string) {
 	a.mu.Lock()
 	defer a.mu.Unlock()
@@ -487,6 +595,7 @@ func (a *Agent) SetSystemPrompt(s string) {
 
 // SetSystemBlocks sets a multi-block system prompt with per-block cache control.
 // Takes precedence over SetSystemPrompt. Clears the single-string prompt.
+// Purity contract: see SetModel.
 func (a *Agent) SetSystemBlocks(blocks []SystemBlock) {
 	a.mu.Lock()
 	defer a.mu.Unlock()
@@ -560,6 +669,7 @@ func (a *Agent) BuildLLMTools() []ToolSpec {
 }
 
 // SetTools replaces the tool set. Takes effect on the next turn.
+// Purity contract: see SetModel.
 func (a *Agent) SetTools(tools ...Tool) {
 	a.mu.Lock()
 	defer a.mu.Unlock()
@@ -567,6 +677,7 @@ func (a *Agent) SetTools(tools ...Tool) {
 }
 
 // SetThinkingLevel changes the reasoning depth. Takes effect on the next turn.
+// Purity contract: see SetModel.
 func (a *Agent) SetThinkingLevel(level ThinkingLevel) {
 	a.mu.Lock()
 	defer a.mu.Unlock()
@@ -620,19 +731,13 @@ func (a *Agent) HasFollowUps() bool {
 	return len(a.followUpQ) > 0
 }
 
-// Reset clears all state and queues. If the agent is running, it cancels and waits first.
+// Reset clears all state and queues. A run already in flight is silently
+// cancelled, drained, and wiped with the rest of the state; a run start
+// attempted after the drain begins fails with ErrRunsHeld instead of being
+// silently clobbered. Must not be called from an event listener (see HoldRuns).
 func (a *Agent) Reset() {
-	a.mu.Lock()
-	cancel := a.cancel
-	done := a.done
-	a.mu.Unlock()
-
-	if cancel != nil {
-		cancel()
-	}
-	if done != nil {
-		<-done
-	}
+	release := a.HoldRuns()
+	defer release()
 
 	a.mu.Lock()
 	defer a.mu.Unlock()
