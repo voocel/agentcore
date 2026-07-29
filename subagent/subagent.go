@@ -43,6 +43,17 @@ type Config struct {
 	Tools            []agentcore.Tool
 	MaxTurns         int
 
+	// ToolGate, when non-nil, is called once per tool call in this
+	// sub-agent's runs — same contract as agentcore.WithToolGate for
+	// top-level agents (nil decision = allow, UpdatedArgs rewrites the
+	// executed arguments). Without it a sub-agent's tools run ungated, so
+	// a harness with a permission system should thread its gate here.
+	ToolGate agentcore.ToolGate
+
+	// Middlewares wrap each tool execution in this sub-agent's runs
+	// (outermost first). Mirrors agentcore.WithMiddlewares.
+	Middlewares []agentcore.ToolMiddleware
+
 	// ThinkingLevel sets the reasoning depth for this sub-agent's runs.
 	// Empty ("") leaves it unspecified (model/provider default). Mirrors
 	// agentcore.WithThinkingLevel for top-level agents. A runtime override
@@ -906,6 +917,8 @@ func (r *Runner) run(ctx context.Context, agentName, taskStr string, modelOverri
 		Model:            runModel,
 		MaxTurns:         cfg.MaxTurns,
 		MaxRetries:       cfg.MaxRetries,
+		ToolGate:         cfg.ToolGate,
+		Middlewares:      cfg.Middlewares,
 		ContextManager:   contextManager,
 		ConvertToLLM:     convertToLLM,
 		ThinkingLevel:    r.resolveThinking(agentName, cfg.ThinkingLevel),

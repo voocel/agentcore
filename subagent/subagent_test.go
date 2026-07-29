@@ -656,6 +656,90 @@ func TestRunner_SetThinkingLevelOverridesConfig(t *testing.T) {
 	}
 }
 
+// Config.ToolGate and Config.Middlewares must reach the sub-agent's loop —
+// without the pass-through a harness cannot gate sub-agent tool calls at all.
+// Gate semantics themselves are covered by TestAgentLoop_ToolGate; this test
+// only proves the threading.
+func TestTool_GateAndMiddlewarePassThrough(t *testing.T) {
+	echoModel := func() agentcore.ChatModel {
+		return newSequential(func(i int, req *agentcore.LLMRequest) (*agentcore.LLMResponse, error) {
+			if i == 0 {
+				return &agentcore.LLMResponse{Message: agentcore.Message{
+					Role: agentcore.RoleAssistant,
+					Content: []agentcore.ContentBlock{
+						agentcore.ToolCallBlock(agentcore.ToolCall{ID: "tc1", Name: "echo", Args: json.RawMessage(`{"value":"original"}`)}),
+					},
+					StopReason: agentcore.StopReasonToolUse,
+				}}, nil
+			}
+			return &agentcore.LLMResponse{Message: agentcore.Message{
+				Role:       agentcore.RoleAssistant,
+				Content:    []agentcore.ContentBlock{agentcore.TextBlock("done")},
+				StopReason: agentcore.StopReasonStop,
+			}}, nil
+		})
+	}
+	echoSchema := map[string]any{
+		"type": "object", "properties": map[string]any{"value": map[string]any{"type": "string"}},
+	}
+
+	t.Run("gate rewrite reaches the tool and middleware wraps execution", func(t *testing.T) {
+		var received string
+		middlewareCalls := 0
+		echo := agentcore.NewFuncTool("echo", "echo", echoSchema, func(ctx context.Context, args json.RawMessage) (json.RawMessage, error) {
+			received = string(args)
+			return json.Marshal("ok")
+		})
+		cfg := Config{
+			Name: "writer", Description: "w", Model: echoModel(), MaxTurns: 3,
+			Tools: []agentcore.Tool{echo},
+			ToolGate: func(ctx context.Context, req agentcore.GateRequest) (*agentcore.GateDecision, error) {
+				return &agentcore.GateDecision{Allowed: true, UpdatedArgs: json.RawMessage(`{"value":"rewritten"}`)}, nil
+			},
+			Middlewares: []agentcore.ToolMiddleware{
+				func(ctx context.Context, call agentcore.ToolCall, next agentcore.ToolExecuteFunc) (json.RawMessage, error) {
+					middlewareCalls++
+					return next(ctx, call.Args)
+				},
+			},
+		}
+		if _, err := NewRunner(cfg).Run(context.Background(), "writer", "go"); err != nil {
+			t.Fatal(err)
+		}
+		if received != `{"value":"rewritten"}` {
+			t.Fatalf("tool args = %s, want the gate rewrite", received)
+		}
+		if middlewareCalls != 1 {
+			t.Fatalf("middleware calls = %d, want 1", middlewareCalls)
+		}
+	})
+
+	t.Run("gate denial blocks execution", func(t *testing.T) {
+		executed := false
+		echo := agentcore.NewFuncTool("echo", "echo", echoSchema, func(ctx context.Context, args json.RawMessage) (json.RawMessage, error) {
+			executed = true
+			return json.Marshal("ok")
+		})
+		cfg := Config{
+			Name: "writer", Description: "w", Model: echoModel(), MaxTurns: 3,
+			Tools: []agentcore.Tool{echo},
+			ToolGate: func(ctx context.Context, req agentcore.GateRequest) (*agentcore.GateDecision, error) {
+				return &agentcore.GateDecision{Allowed: false, Reason: "denied by policy"}, nil
+			},
+		}
+		res, err := NewRunner(cfg).Run(context.Background(), "writer", "go")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if executed {
+			t.Fatal("tool executed despite gate denial")
+		}
+		if res.Output != "done" {
+			t.Fatalf("output = %q, want the loop to continue after denial", res.Output)
+		}
+	})
+}
+
 // ThinkingOff must be forwarded explicitly (not dropped like an empty level), so
 // downstream adapters can issue a real "disabled" request to turn off models
 // that think by default.
