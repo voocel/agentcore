@@ -64,6 +64,11 @@ type RewriteEvent struct {
 	TokensAfter  int
 	Info         *SummaryInfo
 	Steps        []RewriteStep
+	// View is what the rewrite produced. Carried on the event because the hook
+	// fires before the loop installs a committed view: a host that reacts to
+	// Committed by reading the agent's messages would still see the old
+	// baseline.
+	View []agentcore.AgentMessage
 	// Failures is set when Reason == "circuit_breaker": the consecutive failure
 	// count that triggered the bypass.
 	Failures int
@@ -272,6 +277,7 @@ func (e *ContextEngine) Project(ctx context.Context, msgs []agentcore.AgentMessa
 			TokensAfter:  EstimateTotal(r.View),
 			Info:         r.Info,
 			Steps:        r.Steps,
+			View:         r.View,
 		})
 	}
 	proj := agentcore.ContextProjection{
@@ -331,6 +337,7 @@ func (e *ContextEngine) RecoverOverflow(ctx context.Context, msgs []agentcore.Ag
 			TokensAfter:  EstimateTotal(r.View),
 			Info:         r.Info,
 			Steps:        r.Steps,
+			View:         r.View,
 		})
 	}
 	return agentcore.ContextRecoveryResult{

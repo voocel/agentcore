@@ -8,13 +8,24 @@ import (
 	"github.com/voocel/agentcore"
 )
 
-const defaultClearedToolResult = "[Tool result cleared to save context.]"
+// DefaultClearedToolResult replaces a tool result that microcompact dropped.
+// Exported so a host building on ClearedMessageFn can extend it rather than
+// re-spell it and drift.
+const DefaultClearedToolResult = "[Tool result cleared to save context.]"
 
 type ToolResultMicrocompactConfig struct {
 	Classifier     ToolClassifier
 	KeepRecent     int
 	ClearedMessage string
-	IdleThreshold  time.Duration
+	// ClearedMessageFn overrides ClearedMessage per result, so a host can carry
+	// forward whatever stays actionable after the content goes — a path to the
+	// output it persisted on disk, say. "" falls back to ClearedMessage.
+	//
+	// Must be idempotent: every pass re-clears results a previous pass already
+	// cleared, so feeding its own output back in has to yield the same text.
+	// Anything else rewrites the prefix on each pass and burns the cache.
+	ClearedMessageFn func(toolName string, original agentcore.Message) string
+	IdleThreshold    time.Duration
 }
 
 type ToolResultMicrocompactStrategy struct {
@@ -26,7 +37,7 @@ func NewToolResultMicrocompact(cfg ToolResultMicrocompactConfig) *ToolResultMicr
 		cfg.KeepRecent = 5
 	}
 	if cfg.ClearedMessage == "" {
-		cfg.ClearedMessage = defaultClearedToolResult
+		cfg.ClearedMessage = DefaultClearedToolResult
 	}
 	return &ToolResultMicrocompactStrategy{cfg: cfg}
 }
@@ -81,7 +92,7 @@ func (s *ToolResultMicrocompactStrategy) Apply(_ context.Context, _ []agentcore.
 			continue
 		}
 		next := msg
-		next.Content = []agentcore.ContentBlock{agentcore.TextBlock(s.cfg.ClearedMessage)}
+		next.Content = []agentcore.ContentBlock{agentcore.TextBlock(s.clearedText(candidate.ToolName, msg))}
 		next.Metadata = cloneMetadata(msg.Metadata)
 		if next.Metadata == nil {
 			next.Metadata = map[string]any{}
@@ -98,6 +109,15 @@ func (s *ToolResultMicrocompactStrategy) Apply(_ context.Context, _ []agentcore.
 		TokensSaved: saved,
 		Name:        s.Name(),
 	}, nil
+}
+
+func (s *ToolResultMicrocompactStrategy) clearedText(toolName string, original agentcore.Message) string {
+	if s.cfg.ClearedMessageFn != nil {
+		if text := s.cfg.ClearedMessageFn(toolName, original); text != "" {
+			return text
+		}
+	}
+	return s.cfg.ClearedMessage
 }
 
 type compactableToolResult struct {

@@ -212,7 +212,7 @@ func TestContextEngineForceCompactSummarizesOriginalTranscript(t *testing.T) {
 		generate: func(ctx context.Context, messages []agentcore.Message, tools []agentcore.ToolSpec, opts ...agentcore.CallOption) (*agentcore.LLMResponse, error) {
 			for _, msg := range messages {
 				text := msg.TextContent()
-				if strings.Contains(text, defaultClearedToolResult) {
+				if strings.Contains(text, DefaultClearedToolResult) {
 					sawClearedPlaceholder = true
 				}
 				if strings.Contains(text, "VERY_IMPORTANT_TOOL_RESULT") {
@@ -341,7 +341,7 @@ func TestToolResultMicrocompactDeduplicatesIdenticalCalls(t *testing.T) {
 		var cleared []int
 		for i, am := range msgs {
 			if msg, ok := am.(agentcore.Message); ok && msg.Role == agentcore.RoleTool &&
-				strings.Contains(msg.TextContent(), defaultClearedToolResult) {
+				strings.Contains(msg.TextContent(), DefaultClearedToolResult) {
 				cleared = append(cleared, i)
 			}
 		}
