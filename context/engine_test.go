@@ -73,8 +73,8 @@ func TestContextEngineProjectUpdatesUsageFromProjectedView(t *testing.T) {
 
 func TestContextEngineProjectCanRequestCommittedRewrite(t *testing.T) {
 	engine := NewEngine(EngineConfig{
-		ContextWindow:   1024,
-		CommitOnProject: true,
+		ContextWindow:    1024,
+		CommitStrategies: []string{"light_trim"},
 		Strategies: []Strategy{
 			NewLightTrim(LightTrimConfig{
 				KeepRecent:    1,
@@ -645,5 +645,67 @@ func TestCircuitBreaker_AllowsRetryAfterSkippedCycle(t *testing.T) {
 	}
 	if fs.callCount != 3 {
 		t.Fatalf("expected retry to call strategy again, got %d calls", fs.callCount)
+	}
+}
+
+// Default reserves must leave usable prompt space at every window size.
+func TestDefaultReserveScalesWithWindow(t *testing.T) {
+	for _, window := range []int{8_000, 16_000, 32_000, 128_000, 200_000} {
+		got := NewEngine(EngineConfig{ContextWindow: window}).computeBudget(nil).Threshold
+		if got <= 0 || got >= window {
+			t.Errorf("window %d: threshold %d, want a positive value below the window", window, got)
+		}
+	}
+	// Large windows retain the previous cap.
+	const large = 200_000
+	if got := NewEngine(EngineConfig{ContextWindow: large}).computeBudget(nil).Threshold; got != large-maxEngineReserveTokens {
+		t.Errorf("threshold %d, want %d for a large window", got, large-maxEngineReserveTokens)
+	}
+}
+
+// Zero restores the dynamic default reserve.
+func TestSetReserveTokensZeroRestoresTheDefault(t *testing.T) {
+	e := NewEngine(EngineConfig{ContextWindow: 128_000, ReserveTokens: 1_000})
+	if got := e.computeBudget(nil).Threshold; got != 127_000 {
+		t.Fatalf("explicit reserve ignored: threshold %d", got)
+	}
+	e.SetReserveTokens(0)
+	if got := e.computeBudget(nil).Threshold; got != 128_000-maxEngineReserveTokens {
+		t.Fatalf("threshold %d after SetReserveTokens(0), want the default reserve back", got)
+	}
+}
+
+// Failures must still close the strategy bracket.
+func TestStrategyBracketClosesOnFailure(t *testing.T) {
+	var started, finished int
+	engine := NewEngine(EngineConfig{
+		ContextWindow: 1024,
+		ReserveTokens: 1,
+		Strategies:    []Strategy{&failingStrategy{}},
+		OnStrategy: func(string) func() {
+			started++
+			return func() { finished++ }
+		},
+	})
+
+	msgs := []agentcore.AgentMessage{agentcore.UserMsg(strings.Repeat("a", 8000))}
+	if _, err := engine.Project(context.Background(), msgs); err == nil {
+		t.Fatal("expected the strategy failure to surface")
+	}
+	if started != 1 || finished != 1 {
+		t.Fatalf("bracket ran %d starts / %d finishes, want 1 / 1", started, finished)
+	}
+}
+
+// A nil finish callback is valid.
+func TestStrategyBracketToleratesNilFinish(t *testing.T) {
+	engine := NewEngine(EngineConfig{
+		ContextWindow: 1024,
+		ReserveTokens: 1,
+		Strategies:    []Strategy{&failingStrategy{}},
+		OnStrategy:    func(string) func() { return nil },
+	})
+	if _, err := engine.Project(context.Background(), []agentcore.AgentMessage{agentcore.UserMsg(strings.Repeat("a", 8000))}); err == nil {
+		t.Fatal("expected the strategy failure to surface")
 	}
 }

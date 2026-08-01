@@ -16,7 +16,8 @@ type FullSummaryConfig struct {
 	// StripImages controls whether images are removed before summarization.
 	// Nil defaults to true.
 	StripImages *bool
-	// KeepRecentTokens reserves a recent suffix to keep verbatim.
+	// KeepRecentTokens reserves a recent suffix to keep verbatim. Zero scales it
+	// from the budget instead.
 	KeepRecentTokens int
 	// PostSummaryHooks inject lightweight reminder messages after the summary.
 	PostSummaryHooks []PostSummaryHook
@@ -39,10 +40,15 @@ type FullSummaryStrategy struct {
 // NewFullSummary constructs the terminal summary strategy used when lighter
 // rewrites are insufficient. Model is required for actual summarization.
 func NewFullSummary(cfg FullSummaryConfig) *FullSummaryStrategy {
-	if cfg.KeepRecentTokens <= 0 {
-		cfg.KeepRecentTokens = defaultKeepRecentTokens
-	}
 	return &FullSummaryStrategy{cfg: cfg}
+}
+
+// keepRecentTokens scales the verbatim tail with the current threshold.
+func (s *FullSummaryStrategy) keepRecentTokens(budget Budget) int {
+	if s.cfg.KeepRecentTokens > 0 {
+		return s.cfg.KeepRecentTokens
+	}
+	return min(maxKeepRecentTokens, max(minKeepRecentTokens, budget.Threshold/4))
 }
 
 func (s *FullSummaryStrategy) Name() string { return "full_summary" }
@@ -83,7 +89,7 @@ func (s *FullSummaryStrategy) apply(ctx context.Context, view []agentcore.AgentM
 		Model:               s.cfg.Model,
 		ContextWindow:       ctxWindow,
 		ReserveTokens:       reserve,
-		KeepRecentTokens:    s.cfg.KeepRecentTokens,
+		KeepRecentTokens:    s.keepRecentTokens(budget),
 		SystemPrompt:        s.cfg.SystemPrompt,
 		SummaryPrompt:       s.cfg.SummaryPrompt,
 		UpdateSummaryPrompt: s.cfg.UpdateSummaryPrompt,

@@ -10,13 +10,17 @@ package context
 
 import (
 	"context"
+	"slices"
 	"sync"
 
 	"github.com/voocel/agentcore"
 )
 
 const (
-	defaultEngineReserveTokens    = 16384
+	// Default headroom scales with the window up to the previous 16K limit.
+	defaultReserveRatio           = 0.13
+	minEngineReserveTokens        = 4096
+	maxEngineReserveTokens        = 16384
 	defaultMaxConsecutiveFailures = 3
 )
 
@@ -31,9 +35,10 @@ type EngineConfig struct {
 	ReserveTokens int
 	// Strategies are applied in order until the projected view fits.
 	Strategies []Strategy
-	// CommitOnProject makes threshold-triggered Project rewrites replace the
-	// runtime baseline before the current call continues.
-	CommitOnProject bool
+	// CommitStrategies lists rewrites that replace the runtime baseline.
+	CommitStrategies []string
+	// OnStrategy brackets execution; its finish callback also runs on failure.
+	OnStrategy func(strategy string) func()
 	// OnProject is called when Project rewrites the prompt view.
 	OnProject func(RewriteEvent)
 	// OnRecover is called when RecoverOverflow rewrites the prompt view.
@@ -100,9 +105,6 @@ type changeState struct {
 
 // NewEngine constructs a ContextEngine from an explicit strategy pipeline.
 func NewEngine(cfg EngineConfig) *ContextEngine {
-	if cfg.ReserveTokens <= 0 {
-		cfg.ReserveTokens = defaultEngineReserveTokens
-	}
 	maxFail := cfg.MaxConsecutiveFailures
 	if maxFail <= 0 {
 		maxFail = defaultMaxConsecutiveFailures
@@ -135,6 +137,13 @@ func (e *ContextEngine) SetProjectHook(fn func(RewriteEvent)) {
 	e.mu.Lock()
 	defer e.mu.Unlock()
 	e.cfg.OnProject = fn
+}
+
+// SetStrategyHook installs the strategy execution hook.
+func (e *ContextEngine) SetStrategyHook(fn func(strategy string) func()) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	e.cfg.OnStrategy = fn
 }
 
 // SetRecoverHook installs the callback fired when RecoverOverflow rewrites the
@@ -272,7 +281,7 @@ func (e *ContextEngine) Project(ctx context.Context, msgs []agentcore.AgentMessa
 			Reason:       "threshold",
 			Strategy:     r.Strategy,
 			Changed:      true,
-			Committed:    r.Changed && e.cfg.CommitOnProject,
+			Committed:    e.commits(r.Strategy),
 			TokensBefore: EstimateTotal(msgs),
 			TokensAfter:  EstimateTotal(r.View),
 			Info:         r.Info,
@@ -284,11 +293,16 @@ func (e *ContextEngine) Project(ctx context.Context, msgs []agentcore.AgentMessa
 		Messages: r.View,
 		Usage:    r.Usage,
 	}
-	if r.Changed && e.cfg.CommitOnProject {
+	if e.commits(r.Strategy) {
 		proj.CommitMessages = copyMessages(r.View)
 		proj.ShouldCommit = true
 	}
 	return proj, nil
+}
+
+// commits reports whether a strategy replaces the runtime baseline.
+func (e *ContextEngine) commits(strategy string) bool {
+	return strategy != "" && slices.Contains(e.cfg.CommitStrategies, strategy)
 }
 
 // Compact performs a forced rewrite suitable for explicit committed actions
@@ -380,7 +394,7 @@ func (e *ContextEngine) apply(ctx context.Context, msgs []agentcore.AgentMessage
 			}
 
 			tokensBefore := budget.Tokens
-			nextView, result, err := strategy.Apply(ctx, e.snapshotTranscript(), view, budget)
+			nextView, result, err := e.runStrategy(ctx, strategy, view, budget)
 			if err != nil {
 				return r, err
 			}
@@ -415,7 +429,7 @@ func (e *ContextEngine) apply(ctx context.Context, msgs []agentcore.AgentMessage
 				continue
 			}
 			tokensBefore := budget.Tokens
-			nextView, result, err := forced.ForceApply(ctx, e.snapshotTranscript(), copyMessages(msgs), budget)
+			nextView, result, err := e.forceStrategy(ctx, forced, msgs, budget)
 			if err != nil {
 				return r, err
 			}
@@ -451,18 +465,47 @@ func (e *ContextEngine) apply(ctx context.Context, msgs []agentcore.AgentMessage
 	return r, nil
 }
 
+// Strategy calls are centralized so hooks cannot be bypassed.
+func (e *ContextEngine) runStrategy(ctx context.Context, s Strategy, view []agentcore.AgentMessage, budget Budget) ([]agentcore.AgentMessage, StrategyResult, error) {
+	defer e.beginStrategy(s.Name())()
+	return s.Apply(ctx, e.snapshotTranscript(), view, budget)
+}
+
+func (e *ContextEngine) forceStrategy(ctx context.Context, s ForceCompactionStrategy, msgs []agentcore.AgentMessage, budget Budget) ([]agentcore.AgentMessage, StrategyResult, error) {
+	defer e.beginStrategy(s.Name())()
+	return s.ForceApply(ctx, e.snapshotTranscript(), copyMessages(msgs), budget)
+}
+
+// beginStrategy always returns a callable finish function.
+func (e *ContextEngine) beginStrategy(name string) func() {
+	e.mu.Lock()
+	hook := e.cfg.OnStrategy
+	e.mu.Unlock()
+	if hook == nil {
+		return func() {}
+	}
+	if done := hook(name); done != nil {
+		return done
+	}
+	return func() {}
+}
+
 func (e *ContextEngine) computeBudget(msgs []agentcore.AgentMessage) Budget {
 	window := e.cfg.ContextWindow
 	estimate := EstimateContextTokens(msgs)
-	threshold := window - e.cfg.ReserveTokens
-	if threshold < 0 {
-		threshold = 0
-	}
 	return Budget{
 		Tokens:    estimate.Tokens,
 		Window:    window,
-		Threshold: threshold,
+		Threshold: max(0, window-e.reserveTokens(window)),
 	}
+}
+
+// reserveTokens resolves dynamic headroom after window changes.
+func (e *ContextEngine) reserveTokens(window int) int {
+	if e.cfg.ReserveTokens > 0 {
+		return e.cfg.ReserveTokens
+	}
+	return min(maxEngineReserveTokens, max(minEngineReserveTokens, int(float64(window)*defaultReserveRatio)))
 }
 
 func (e *ContextEngine) setLastState(view []agentcore.AgentMessage, usage *agentcore.ContextUsage, scope, strategy string, changed bool, info *SummaryInfo) {

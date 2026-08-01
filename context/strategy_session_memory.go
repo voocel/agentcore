@@ -23,7 +23,7 @@ type SessionMemoryConfig struct {
 
 	// KeepRecentTokens reserves a recent suffix to keep verbatim. Matches the
 	// FullSummaryStrategy field with the same name; defaults to
-	// defaultKeepRecentTokens when zero.
+	// maxKeepRecentTokens when zero.
 	KeepRecentTokens int
 
 	// MaxSeedRunes caps how much of the seed we inject. Oversized memory
@@ -55,7 +55,7 @@ type SessionMemoryStrategy struct {
 // via SetSeedFn.
 func NewSessionMemory(cfg SessionMemoryConfig) *SessionMemoryStrategy {
 	if cfg.KeepRecentTokens <= 0 {
-		cfg.KeepRecentTokens = defaultKeepRecentTokens
+		cfg.KeepRecentTokens = maxKeepRecentTokens
 	}
 	if cfg.MaxSeedRunes == 0 {
 		cfg.MaxSeedRunes = defaultMaxSeedRunes

@@ -12,8 +12,10 @@ import (
 )
 
 const (
-	defaultReserveTokens    = 16384
-	defaultKeepRecentTokens = 20000
+	defaultReserveTokens = 16384
+	// Bounds for the dynamically sized verbatim tail.
+	minKeepRecentTokens = 2000
+	maxKeepRecentTokens = 20000
 )
 
 // SummaryInfo holds details about a completed compaction for observability.
