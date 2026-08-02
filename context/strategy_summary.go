@@ -2,6 +2,7 @@ package context
 
 import (
 	"context"
+	"sync/atomic"
 	"time"
 
 	"github.com/voocel/agentcore"
@@ -35,6 +36,8 @@ type FullSummaryConfig struct {
 // while keeping a recent suffix of messages verbatim.
 type FullSummaryStrategy struct {
 	cfg FullSummaryConfig
+	// fork is updated by the loop and may be read by /compact concurrently.
+	fork atomic.Pointer[agentcore.LLMPrefix]
 }
 
 // NewFullSummary constructs the terminal summary strategy used when lighter
@@ -70,6 +73,11 @@ func (s *FullSummaryStrategy) SetPostSummaryHooks(hooks ...PostSummaryHook) {
 	s.cfg.PostSummaryHooks = hooks
 }
 
+// SetForkPrefix installs the parent prefix used by cache-aware summaries.
+func (s *FullSummaryStrategy) SetForkPrefix(p agentcore.LLMPrefix) {
+	s.fork.Store(&p)
+}
+
 func (s *FullSummaryStrategy) apply(ctx context.Context, view []agentcore.AgentMessage, budget Budget, force bool) ([]agentcore.AgentMessage, StrategyResult, error) {
 	if len(view) == 0 || s.cfg.Model == nil {
 		return view, StrategyResult{Name: s.Name()}, nil
@@ -94,6 +102,7 @@ func (s *FullSummaryStrategy) apply(ctx context.Context, view []agentcore.AgentM
 		SummaryPrompt:       s.cfg.SummaryPrompt,
 		UpdateSummaryPrompt: s.cfg.UpdateSummaryPrompt,
 		TurnPrefixPrompt:    s.cfg.TurnPrefixPrompt,
+		Fork:                s.fork.Load(),
 	}
 	stripImages := true
 	if s.cfg.StripImages != nil {
@@ -108,7 +117,11 @@ func (s *FullSummaryStrategy) apply(ctx context.Context, view []agentcore.AgentM
 		return view, StrategyResult{Name: s.Name()}, nil
 	}
 
-	next, err = s.applyHooks(ctx, next, *info)
+	// View deltas exclude static system and tool-schema overhead.
+	saved := max(0, EstimateTotal(view)-EstimateTotal(next))
+	room := max(0, budget.Threshold-applySaving(budget.Tokens, saved))
+
+	next, err = s.applyHooks(ctx, next, *info, room)
 	if err != nil {
 		return nil, StrategyResult{Name: s.Name()}, err
 	}
@@ -120,13 +133,14 @@ func (s *FullSummaryStrategy) apply(ctx context.Context, view []agentcore.AgentM
 
 	return next, StrategyResult{
 		Applied:     true,
-		TokensSaved: max(0, budget.Tokens-EstimateTotal(next)),
+		TokensSaved: max(0, EstimateTotal(view)-EstimateTotal(next)),
 		Name:        s.Name(),
 		Info:        info,
 	}, nil
 }
 
-func (s *FullSummaryStrategy) applyHooks(ctx context.Context, msgs []agentcore.AgentMessage, info SummaryInfo) ([]agentcore.AgentMessage, error) {
+// applyHooks draws each injection from the remaining room.
+func (s *FullSummaryStrategy) applyHooks(ctx context.Context, msgs []agentcore.AgentMessage, info SummaryInfo, room int) ([]agentcore.AgentMessage, error) {
 	if len(s.cfg.PostSummaryHooks) == 0 || len(msgs) == 0 {
 		return msgs, nil
 	}
@@ -135,11 +149,12 @@ func (s *FullSummaryStrategy) applyHooks(ctx context.Context, msgs []agentcore.A
 	var err error
 	for _, hook := range s.cfg.PostSummaryHooks {
 		var extra []agentcore.AgentMessage
-		extra, err = hook(ctx, info, kept)
+		extra, err = hook(ctx, info, kept, room)
 		if err != nil {
 			return nil, err
 		}
 		injected = append(injected, extra...)
+		room = max(0, room-EstimateTotal(extra))
 	}
 	if len(injected) == 0 {
 		return msgs, nil

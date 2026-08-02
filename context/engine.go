@@ -154,6 +154,18 @@ func (e *ContextEngine) SetRecoverHook(fn func(RewriteEvent)) {
 	e.cfg.OnRecover = fn
 }
 
+// SetForkPrefix forwards the loop prefix to fork-aware strategies.
+func (e *ContextEngine) SetForkPrefix(p agentcore.LLMPrefix) {
+	e.mu.Lock()
+	strategies := e.cfg.Strategies
+	e.mu.Unlock()
+	for _, s := range strategies {
+		if r, ok := s.(agentcore.ForkPrefixReceiver); ok {
+			r.SetForkPrefix(p)
+		}
+	}
+}
+
 // Sync records msgs as the current runtime baseline and resets the active view
 // remembered by the engine to that baseline.
 func (e *ContextEngine) Sync(msgs []agentcore.AgentMessage) {
@@ -404,7 +416,7 @@ func (e *ContextEngine) apply(ctx context.Context, msgs []agentcore.AgentMessage
 				view = nextView
 				r.Changed = true
 				r.Strategy = result.Name
-				budget = e.computeBudget(view)
+				budget.Tokens = applySaving(budget.Tokens, result.TokensSaved)
 				tokensAfter = budget.Tokens
 			}
 			if result.Info != nil {
@@ -439,7 +451,7 @@ func (e *ContextEngine) apply(ctx context.Context, msgs []agentcore.AgentMessage
 				view = nextView
 				r.Changed = true
 				r.Strategy = result.Name
-				budget = e.computeBudget(view)
+				budget.Tokens = applySaving(budget.Tokens, result.TokensSaved)
 				tokensAfter = budget.Tokens
 			}
 			if result.Info != nil {
@@ -463,6 +475,11 @@ func (e *ContextEngine) apply(ctx context.Context, msgs []agentcore.AgentMessage
 	r.Usage = ptrUsage(e.estimateUsage(view))
 	e.setLastState(view, r.Usage, scopeFor(force), r.Strategy, r.Changed, r.Info)
 	return r, nil
+}
+
+// applySaving applies the strategy delta without reusing stale provider Usage.
+func applySaving(tokens, saved int) int {
+	return max(0, tokens-saved)
 }
 
 // Strategy calls are centralized so hooks cannot be bypassed.

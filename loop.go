@@ -168,6 +168,11 @@ func runLoop(ctx context.Context, currentCtx *AgentContext, newMessages *[]Agent
 		maxTurns = defaultMaxTurns
 	}
 
+	// Share the parent prefix with fork-aware side calls.
+	if r, ok := config.ContextManager.(ForkPrefixReceiver); ok {
+		r.SetForkPrefix(loopPrefix(*currentCtx, config))
+	}
+
 	firstTurn := true
 	turnCount := 0
 	lengthRecoveryCount := 0
@@ -622,28 +627,7 @@ func callLLM(ctx context.Context, agentCtx *AgentContext, config LoopConfig, sin
 	// Prepend the static system prompt as first message(s). Keeping it at the
 	// head and byte-stable across turns lets providers with prefix-based
 	// caching (OpenAI) serve it from cache.
-	var prefix []Message
-	if len(agentCtx.SystemBlocks) > 0 {
-		for _, b := range agentCtx.SystemBlocks {
-			m := SystemMsg(b.Text)
-			if b.CacheControl != "" {
-				m.Metadata = map[string]any{"cache_control": b.CacheControl}
-			}
-			prefix = append(prefix, m)
-		}
-	} else if agentCtx.SystemPrompt != "" {
-		m := SystemMsg(agentCtx.SystemPrompt)
-		if config.CacheLastMessage != "" {
-			// Cache floor: pin the static system prompt with its own
-			// breakpoint so a fresh session — or a turn whose tail entry was
-			// evicted — still reads the system+tools prefix from cache.
-			// SystemBlocks users control placement explicitly and are left
-			// untouched.
-			m.Metadata = map[string]any{"cache_control": config.CacheLastMessage}
-		}
-		prefix = append(prefix, m)
-	}
-	if len(prefix) > 0 {
+	if prefix := systemPrefixMessages(agentCtx.SystemBlocks, agentCtx.SystemPrompt, config.CacheLastMessage); len(prefix) > 0 {
 		llmMessages = append(prefix, llmMessages...)
 	}
 
@@ -655,7 +639,7 @@ func callLLM(ctx context.Context, agentCtx *AgentContext, config LoopConfig, sin
 	// an entry covering the latest tool_use+tool_result, so the next call in
 	// the loop reads them from cache instead of re-uploading.
 	if config.CacheLastMessage != "" {
-		llmMessages = markLastMessageForCache(llmMessages, config.CacheLastMessage)
+		llmMessages = MarkLastMessageForCache(llmMessages, config.CacheLastMessage)
 	}
 
 	if config.Model == nil {
@@ -683,12 +667,73 @@ func callLLM(ctx context.Context, agentCtx *AgentContext, config LoopConfig, sin
 	return callLLMStream(ctx, config.Model, llmMessages, toolSpecs, callOpts, sink)
 }
 
-// markLastMessageForCache returns a copy of messages with cache_control attached
-// to the metadata of the last non-system message. System messages are skipped so
-// trailing per-turn reminders (which change every turn) don't end up carrying
-// the breakpoint. The caller's slice and the original Message values are left
-// untouched.
-func markLastMessageForCache(messages []Message, cacheControl string) []Message {
+// LLMPrefix holds the byte-stable parent prefix needed for cache reuse.
+type LLMPrefix struct {
+	System      []Message
+	Tools       []ToolSpec
+	CallOptions []CallOption
+	// Model owns the cache entry.
+	Model ChatModel
+	// ConvertToLLM preserves the loop's message encoding.
+	ConvertToLLM func([]AgentMessage) []Message
+	// CacheControl marks the end of the shared span.
+	CacheControl string
+}
+
+// ForkPrefixReceiver accepts the parent prefix for side-channel calls.
+type ForkPrefixReceiver interface {
+	SetForkPrefix(LLMPrefix)
+}
+
+// loopPrefix mirrors the prefix assembly in callLLM.
+func loopPrefix(agentCtx AgentContext, config LoopConfig) LLMPrefix {
+	// Only these two options reach the provider on the main call.
+	var opts []CallOption
+	if config.ThinkingLevel != "" {
+		opts = append(opts, WithThinking(config.ThinkingLevel))
+	}
+	if config.PromptCacheKey != "" {
+		opts = append(opts, WithCallPromptCacheKey(config.PromptCacheKey))
+	}
+	convert := config.ConvertToLLM
+	if convert == nil {
+		convert = DefaultConvertToLLM
+	}
+	return LLMPrefix{
+		System:       systemPrefixMessages(agentCtx.SystemBlocks, agentCtx.SystemPrompt, config.CacheLastMessage),
+		Tools:        buildToolSpecs(agentCtx.Tools),
+		CallOptions:  opts,
+		Model:        config.Model,
+		ConvertToLLM: convert,
+		CacheControl: config.CacheLastMessage,
+	}
+}
+
+// systemPrefixMessages is the shared system-prefix encoder for loop and forks.
+// SystemBlocks own their cache markers; cacheFloor applies only to plain text.
+func systemPrefixMessages(blocks []SystemBlock, prompt, cacheFloor string) []Message {
+	if len(blocks) > 0 {
+		out := make([]Message, len(blocks))
+		for i, b := range blocks {
+			out[i] = SystemMsg(b.Text)
+			if b.CacheControl != "" {
+				out[i].Metadata = map[string]any{"cache_control": b.CacheControl}
+			}
+		}
+		return out
+	}
+	if prompt == "" {
+		return nil
+	}
+	m := SystemMsg(prompt)
+	if cacheFloor != "" {
+		m.Metadata = map[string]any{"cache_control": cacheFloor}
+	}
+	return []Message{m}
+}
+
+// MarkLastMessageForCache marks the last non-system message on a copied slice.
+func MarkLastMessageForCache(messages []Message, cacheControl string) []Message {
 	idx := -1
 	for i := len(messages) - 1; i >= 0; i-- {
 		if messages[i].Role != RoleSystem {

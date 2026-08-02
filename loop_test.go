@@ -1529,6 +1529,46 @@ func (m projectionCommitManager) Usage() *ContextUsage {
 
 func (m projectionCommitManager) Snapshot() *ContextSnapshot { return nil }
 
+// forkPrefixManager records the loop prefix.
+type forkPrefixManager struct {
+	projectionCommitManager
+	got *LLMPrefix
+}
+
+func (m forkPrefixManager) SetForkPrefix(p LLMPrefix) { *m.got = p }
+
+func TestAgentLoop_HandsForkPrefixToContextManager(t *testing.T) {
+	var got LLMPrefix
+	tools := []Tool{echoTool(&[]string{})}
+
+	runTestLoop(t,
+		[]AgentMessage{UserMsg("hi")},
+		AgentContext{SystemPrompt: "you are a bot", Tools: tools},
+		LoopConfig{
+			Model:            mockModel(assistantMsg("hello", StopReasonStop)),
+			ContextManager:   forkPrefixManager{got: &got},
+			ThinkingLevel:    ThinkingMedium,
+			CacheLastMessage: "ephemeral",
+		},
+	)
+
+	if len(got.System) != 1 || got.System[0].TextContent() != "you are a bot" {
+		t.Fatalf("expected the loop's system prefix, got %+v", got.System)
+	}
+	if len(got.Tools) != 1 || got.Tools[0].Name != "echo" {
+		t.Fatalf("expected the loop's tool list, got %+v", got.Tools)
+	}
+	if got.Model == nil {
+		t.Fatal("expected the prefix to carry the model it was cached against")
+	}
+	if got.CacheControl != "ephemeral" {
+		t.Fatalf("expected the loop's cache breakpoint value, got %q", got.CacheControl)
+	}
+	if len(got.CallOptions) != 1 {
+		t.Fatalf("expected thinking to ride along in the call options, got %d", len(got.CallOptions))
+	}
+}
+
 func assistantMsg(text string, stop StopReason) Message {
 	return Message{
 		Role:       RoleAssistant,
@@ -1669,7 +1709,7 @@ func TestMarkLastMessageForCache_TagsLastNonSystemMessage(t *testing.T) {
 				{Role: RoleAssistant, Content: []ContentBlock{TextBlock("a1")}},
 				tc.buildLast(),
 			}
-			out := markLastMessageForCache(msgs, "ephemeral")
+			out := MarkLastMessageForCache(msgs, "ephemeral")
 
 			last := out[len(out)-1]
 			if last.Role != tc.lastRole {
@@ -1694,7 +1734,7 @@ func TestMarkLastMessageForCache_SkipsTrailingSystemReminders(t *testing.T) {
 		SystemMsg("<system-reminder>per-turn reminder</system-reminder>"),
 		SystemMsg("<system-reminder>another reminder</system-reminder>"),
 	}
-	out := markLastMessageForCache(msgs, "ephemeral")
+	out := MarkLastMessageForCache(msgs, "ephemeral")
 
 	// Marker should land on the user message (index 1), not on the trailing system reminders.
 	if out[1].Metadata["cache_control"] != "ephemeral" {
@@ -1715,7 +1755,7 @@ func TestMarkLastMessageForCache_DoesNotMutateInput(t *testing.T) {
 	original.Metadata = map[string]any{"keep": "me"}
 	msgs := []Message{original}
 
-	out := markLastMessageForCache(msgs, "ephemeral")
+	out := MarkLastMessageForCache(msgs, "ephemeral")
 
 	if _, has := msgs[0].Metadata["cache_control"]; has {
 		t.Fatalf("input slice was mutated")

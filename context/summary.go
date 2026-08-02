@@ -3,8 +3,10 @@ package context
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"math"
+	"slices"
 	"strings"
 	"unicode/utf8"
 
@@ -87,6 +89,13 @@ Use this EXACT format:
 ## Critical Context
 - [Any data, file paths, function names, or references needed to continue]`
 
+// forkGuard stops the parent task and makes tagged output the success signal.
+const forkGuard = `Stop working on the task. Do NOT call any tool, do NOT continue the conversation, and do NOT answer any question asked in it.
+
+Think briefly inside <analysis>...</analysis>, then output the checkpoint inside <summary>...</summary>. The <summary> tags are required.
+
+`
+
 const turnPrefixPrompt = `This is the PREFIX of a conversation turn that was too large to keep intact. The SUFFIX (recent work) is retained separately.
 
 Summarize the prefix to provide context for the retained suffix:
@@ -155,14 +164,17 @@ func generateTurnPrefixSummary(ctx context.Context, model agentcore.ChatModel, p
 	return extractStoredSummary(resp.Message.TextContent()), nil
 }
 
+// errEmptySummary lets a failed fork retry with the standalone prompt.
+var errEmptySummary = errors.New("summarization returned empty content")
+
 // generateSummary calls the ChatModel to produce a conversation summary.
 // If previousSummary is non-empty, uses incremental update prompt.
-func generateSummary(ctx context.Context, model agentcore.ChatModel, prompts summaryPrompts, msgs []agentcore.AgentMessage, previousSummary string, opts ...agentcore.CallOption) (string, error) {
+func generateSummary(ctx context.Context, model agentcore.ChatModel, prompts summaryPrompts, fork *agentcore.LLMPrefix, msgs []agentcore.AgentMessage, previousSummary string, opts ...agentcore.CallOption) (string, error) {
 	const maxRetries = 3
 	current := append([]agentcore.AgentMessage(nil), msgs...)
 	var lastErr error
 	for attempt := 0; attempt < maxRetries; attempt++ {
-		summary, err := generateSummaryOnce(ctx, model, prompts, current, previousSummary, opts...)
+		summary, err := generateSummaryOnce(ctx, model, prompts, fork, current, previousSummary, opts...)
 		if err == nil {
 			return summary, nil
 		}
@@ -182,35 +194,72 @@ func generateSummary(ctx context.Context, model agentcore.ChatModel, prompts sum
 	return "", fmt.Errorf("summarization failed")
 }
 
-func generateSummaryOnce(ctx context.Context, model agentcore.ChatModel, prompts summaryPrompts, msgs []agentcore.AgentMessage, previousSummary string, opts ...agentcore.CallOption) (string, error) {
-	conversation := serializeConversation(msgs)
-	if conversation == "" {
+func generateSummaryOnce(ctx context.Context, model agentcore.ChatModel, prompts summaryPrompts, fork *agentcore.LLMPrefix, msgs []agentcore.AgentMessage, previousSummary string, opts ...agentcore.CallOption) (string, error) {
+	instruction := prompts.summary()
+	if previousSummary != "" {
+		instruction = "<previous-summary>\n" + previousSummary + "\n</previous-summary>\n\n" + prompts.update()
+	}
+
+	req := buildSummaryRequest(prompts, fork, msgs, instruction)
+	if len(req) == 0 {
 		return "", fmt.Errorf("no conversation content to summarize")
 	}
 
-	var userPrompt string
-	if previousSummary != "" {
-		userPrompt = "<conversation>\n" + conversation + "\n</conversation>\n\n" +
-			"<previous-summary>\n" + previousSummary + "\n</previous-summary>\n\n" +
-			prompts.update()
-	} else {
-		userPrompt = "<conversation>\n" + conversation + "\n</conversation>\n\n" +
-			prompts.summary()
+	var tools []agentcore.ToolSpec
+	if fork != nil {
+		tools = fork.Tools
+		opts = append(slices.Clone(fork.CallOptions), opts...)
 	}
 
-	resp, err := model.Generate(ctx, []agentcore.Message{
-		agentcore.SystemMsg(prompts.system()),
-		agentcore.UserMsg(userPrompt),
-	}, nil, opts...)
+	resp, err := model.Generate(ctx, req, tools, opts...)
 	if err != nil {
 		return "", fmt.Errorf("summarization failed: %w", err)
 	}
 
-	summary := extractStoredSummary(resp.Message.TextContent())
+	// Forks require tags so ordinary task replies cannot become checkpoints.
+	text := resp.Message.TextContent()
+	var summary string
+	if fork != nil {
+		summary = strings.TrimSpace(extractTaggedBlock(stripAnalysisBlock(strings.TrimSpace(text)), "summary"))
+	} else {
+		summary = extractStoredSummary(text)
+	}
 	if summary == "" {
-		return "", fmt.Errorf("summarization returned empty content")
+		return "", errEmptySummary
 	}
 	return summary, nil
+}
+
+// buildSummaryRequest builds either a standalone prompt or a byte-stable fork
+// of the parent request for prompt-cache reuse.
+func buildSummaryRequest(prompts summaryPrompts, fork *agentcore.LLMPrefix, msgs []agentcore.AgentMessage, instruction string) []agentcore.Message {
+	if fork == nil {
+		conversation := serializeConversation(msgs)
+		if conversation == "" {
+			return nil
+		}
+		return []agentcore.Message{
+			agentcore.SystemMsg(prompts.system()),
+			agentcore.UserMsg("<conversation>\n" + conversation + "\n</conversation>\n\n" + instruction),
+		}
+	}
+
+	convert := fork.ConvertToLLM
+	if convert == nil {
+		convert = agentcore.DefaultConvertToLLM
+	}
+	body := agentcore.RepairMessageSequence(convert(msgs))
+	if len(body) == 0 {
+		return nil
+	}
+	if fork.CacheControl != "" {
+		body = agentcore.MarkLastMessageForCache(body, fork.CacheControl)
+	}
+
+	out := make([]agentcore.Message, 0, len(fork.System)+len(body)+1)
+	out = append(out, fork.System...)
+	out = append(out, body...)
+	return append(out, agentcore.UserMsg(forkGuard+instruction))
 }
 
 func extractStoredSummary(text string) string {

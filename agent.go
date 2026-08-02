@@ -608,6 +608,7 @@ func (a *Agent) BuildLLMMessages() ([]Message, error) {
 	sp := a.systemPrompt
 	mgr := a.contextManager
 	convertFn := a.convertToLLM
+	cacheFloor := a.cacheLastMessage
 	a.mu.Unlock()
 
 	if mgr != nil {
@@ -625,17 +626,8 @@ func (a *Agent) BuildLLMMessages() ([]Message, error) {
 	}
 	llmMessages := RepairMessageSequence(convertFn(msgs))
 
-	if len(blocks) > 0 {
-		sysMsgs := make([]Message, len(blocks))
-		for i, b := range blocks {
-			sysMsgs[i] = SystemMsg(b.Text)
-			if b.CacheControl != "" {
-				sysMsgs[i].Metadata = map[string]any{"cache_control": b.CacheControl}
-			}
-		}
-		llmMessages = append(sysMsgs, llmMessages...)
-	} else if sp != "" {
-		llmMessages = append([]Message{SystemMsg(sp)}, llmMessages...)
+	if prefix := systemPrefixMessages(blocks, sp, cacheFloor); len(prefix) > 0 {
+		llmMessages = append(prefix, llmMessages...)
 	}
 	return llmMessages, nil
 }

@@ -3,7 +3,6 @@ package context
 import (
 	"context"
 	"fmt"
-	"time"
 
 	"github.com/voocel/agentcore"
 )
@@ -25,7 +24,11 @@ type ToolResultMicrocompactConfig struct {
 	// cleared, so feeding its own output back in has to yield the same text.
 	// Anything else rewrites the prefix on each pass and burns the cache.
 	ClearedMessageFn func(toolName string, original agentcore.Message) string
-	IdleThreshold    time.Duration
+	// MinResultTokens leaves results below this size alone. Clearing one costs a
+	// placeholder plus a rewritten prefix, so below some size the pass spends
+	// cache to save nothing — and small results are typically state transitions
+	// whose text is the only record that they happened. Zero disables the floor.
+	MinResultTokens int
 }
 
 type ToolResultMicrocompactStrategy struct {
@@ -49,26 +52,18 @@ func (s *ToolResultMicrocompactStrategy) Apply(_ context.Context, _ []agentcore.
 		return view, StrategyResult{Name: s.Name()}, nil
 	}
 
-	candidates := findCompactableToolResults(view, s.cfg.Classifier)
+	candidates := findCompactableToolResults(view, s.cfg.Classifier, s.cfg.MinResultTokens)
 	if len(candidates) == 0 {
 		return view, StrategyResult{Name: s.Name()}, nil
-	}
-
-	keepRecent := s.cfg.KeepRecent
-	if s.cfg.IdleThreshold > 0 {
-		lastAssistant := latestAssistantTimestamp(view)
-		if !lastAssistant.IsZero() && time.Since(lastAssistant) > s.cfg.IdleThreshold && keepRecent > 1 {
-			keepRecent = max(1, keepRecent/2)
-		}
 	}
 
 	// Protect the most recent keepRecent results, deduplicated by (tool, args):
 	// when the model re-issues the identical call, only the newest result is
 	// worth protecting — older copies carry no extra information and would
 	// crowd genuinely distinct results out of the protection window.
-	protected := make(map[int]struct{}, keepRecent)
-	seenKeys := make(map[string]struct{}, keepRecent)
-	for i := len(candidates) - 1; i >= 0 && len(protected) < keepRecent; i-- {
+	protected := make(map[int]struct{}, s.cfg.KeepRecent)
+	seenKeys := make(map[string]struct{}, s.cfg.KeepRecent)
+	for i := len(candidates) - 1; i >= 0 && len(protected) < s.cfg.KeepRecent; i-- {
 		c := candidates[i]
 		if _, dup := seenKeys[c.Key]; dup {
 			continue
@@ -133,7 +128,7 @@ type pendingToolCall struct {
 	key  string
 }
 
-func findCompactableToolResults(msgs []agentcore.AgentMessage, classifier ToolClassifier) []compactableToolResult {
+func findCompactableToolResults(msgs []agentcore.AgentMessage, classifier ToolClassifier, minTokens int) []compactableToolResult {
 	pending := map[string]pendingToolCall{}
 	var results []compactableToolResult
 
@@ -165,20 +160,13 @@ func findCompactableToolResults(msgs []agentcore.AgentMessage, classifier ToolCl
 		if classifier != nil && !classifier(call.name) {
 			continue
 		}
+		if minTokens > 0 && EstimateTokens(msg) < minTokens {
+			continue
+		}
 		results = append(results, compactableToolResult{Index: i, ToolName: call.name, Key: call.key})
 	}
 
 	return results
-}
-
-func latestAssistantTimestamp(msgs []agentcore.AgentMessage) time.Time {
-	for i := len(msgs) - 1; i >= 0; i-- {
-		msg, ok := msgs[i].(agentcore.Message)
-		if ok && msg.Role == agentcore.RoleAssistant {
-			return msg.Timestamp
-		}
-	}
-	return time.Time{}
 }
 
 func formatTrimmedPlaceholder(n int) string {

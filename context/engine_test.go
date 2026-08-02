@@ -156,7 +156,7 @@ func TestContextEngineCompactProducesCommittedSummaryWithHooks(t *testing.T) {
 			return &agentcore.LLMResponse{
 				Message: agentcore.Message{
 					Role:    agentcore.RoleAssistant,
-					Content: []agentcore.ContentBlock{agentcore.TextBlock("<analysis>scratch</analysis><summary>摘要内容</summary>")},
+					Content: []agentcore.ContentBlock{agentcore.TextBlock("<analysis>scratch</analysis><summary>checkpoint body</summary>")},
 				},
 			}, nil
 		},
@@ -166,7 +166,7 @@ func TestContextEngineCompactProducesCommittedSummaryWithHooks(t *testing.T) {
 		Model:            model,
 		KeepRecentTokens: 1,
 		PostSummaryHooks: []PostSummaryHook{
-			func(ctx context.Context, info SummaryInfo, kept []agentcore.AgentMessage) ([]agentcore.AgentMessage, error) {
+			func(ctx context.Context, info SummaryInfo, kept []agentcore.AgentMessage, room int) ([]agentcore.AgentMessage, error) {
 				return []agentcore.AgentMessage{agentcore.UserMsg("hook reminder")}, nil
 			},
 		},
@@ -222,7 +222,7 @@ func TestContextEngineForceCompactSummarizesOriginalTranscript(t *testing.T) {
 			return &agentcore.LLMResponse{
 				Message: agentcore.Message{
 					Role:    agentcore.RoleAssistant,
-					Content: []agentcore.ContentBlock{agentcore.TextBlock("<summary>摘要内容</summary>")},
+					Content: []agentcore.ContentBlock{agentcore.TextBlock("<summary>checkpoint body</summary>")},
 				},
 			}, nil
 		},
@@ -707,5 +707,85 @@ func TestStrategyBracketToleratesNilFinish(t *testing.T) {
 	})
 	if _, err := engine.Project(context.Background(), []agentcore.AgentMessage{agentcore.UserMsg(strings.Repeat("a", 8000))}); err == nil {
 		t.Fatal("expected the strategy failure to surface")
+	}
+}
+
+// A stale provider Usage anchor must not hide the microcompact delta.
+func TestMicrocompactSavingReachesTheBudget(t *testing.T) {
+	t.Parallel()
+
+	big := strings.Repeat("x", 40000) // ~10k tokens per tool result
+	var msgs []agentcore.AgentMessage
+	// Use complete turns so summary remains a valid fallback.
+	for i := range 10 {
+		id := fmt.Sprintf("call-%d", i)
+		msgs = append(msgs, agentcore.Message{
+			Role:    agentcore.RoleUser,
+			Content: []agentcore.ContentBlock{agentcore.TextBlock(fmt.Sprintf("step %d", i))},
+		})
+		// Distinct args avoid recency-window deduplication.
+		msgs = append(msgs, agentcore.Message{
+			Role: agentcore.RoleAssistant,
+			Content: []agentcore.ContentBlock{agentcore.ToolCallBlock(
+				agentcore.ToolCall{ID: id, Name: "bash", Args: fmt.Appendf(nil, `{"command":"ls dir%d"}`, i)})},
+			// Provider Usage still includes every result.
+			Usage: &agentcore.Usage{Input: 190000, Output: 50},
+		})
+		msgs = append(msgs, agentcore.Message{
+			Role:     agentcore.RoleTool,
+			Content:  []agentcore.ContentBlock{agentcore.TextBlock(big)},
+			Metadata: map[string]any{"tool_call_id": id},
+		})
+	}
+
+	summaryCalls := 0
+	model := stubModel{
+		generate: func(context.Context, []agentcore.Message, []agentcore.ToolSpec, ...agentcore.CallOption) (*agentcore.LLMResponse, error) {
+			summaryCalls++
+			return &agentcore.LLMResponse{Message: agentcore.Message{
+				Role:    agentcore.RoleAssistant,
+				Content: []agentcore.ContentBlock{agentcore.TextBlock("<summary>s</summary>")},
+			}}, nil
+		},
+	}
+	engine := NewEngine(EngineConfig{
+		ContextWindow: 200000,
+		ReserveTokens: 16000,
+		Strategies: []Strategy{
+			NewToolResultMicrocompact(ToolResultMicrocompactConfig{KeepRecent: 3}),
+			NewFullSummary(FullSummaryConfig{Model: model}),
+		},
+	})
+
+	view, err := engine.Project(context.Background(), msgs)
+	if err != nil {
+		t.Fatalf("project: %v", err)
+	}
+	if summaryCalls != 0 {
+		t.Fatalf("summary ran %d time(s); microcompact freed enough on its own", summaryCalls)
+	}
+	if EstimateTotal(view.Messages) >= EstimateTotal(msgs) {
+		t.Fatal("microcompact did not shrink the view")
+	}
+}
+
+func TestContextEngine_ForwardsForkPrefixToSummary(t *testing.T) {
+	summary := NewFullSummary(FullSummaryConfig{})
+	engine := NewEngine(EngineConfig{
+		ContextWindow: 200000,
+		Strategies: []Strategy{
+			NewToolResultMicrocompact(ToolResultMicrocompactConfig{KeepRecent: 3}),
+			summary,
+		},
+	})
+
+	engine.SetForkPrefix(agentcore.LLMPrefix{CacheControl: "ephemeral"})
+
+	fork := summary.fork.Load()
+	if fork == nil {
+		t.Fatal("expected the engine to hand the fork prefix to the summary strategy")
+	}
+	if fork.CacheControl != "ephemeral" {
+		t.Fatalf("expected the loop's prefix, got %q", fork.CacheControl)
 	}
 }

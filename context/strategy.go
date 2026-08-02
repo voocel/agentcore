@@ -46,7 +46,11 @@ type ForceCompactionStrategy interface {
 // by tool-result microcompact strategies.
 type ToolClassifier func(toolName string) bool
 
-// PostSummaryHook injects lightweight reminder messages after a summary
-// checkpoint is produced. Hooks must be side-effect free and should not
-// perform I/O such as file reads or tool execution.
-type PostSummaryHook func(ctx context.Context, info SummaryInfo, kept []agentcore.AgentMessage) ([]agentcore.AgentMessage, error)
+// PostSummaryHook injects messages after a summary checkpoint is produced.
+//
+// room is how many tokens the injection may occupy: what is left under the
+// threshold once the summary and its verbatim tail are counted, already reduced
+// by whatever earlier hooks injected. Honoring it is the hook's job — the
+// summary is the last strategy in the chain, so anything it pushes back over the
+// threshold stays over.
+type PostSummaryHook func(ctx context.Context, info SummaryInfo, kept []agentcore.AgentMessage, room int) ([]agentcore.AgentMessage, error)

@@ -3,7 +3,9 @@ package context
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"reflect"
 	"slices"
 	"strings"
 	"time"
@@ -45,6 +47,8 @@ type summaryRunConfig struct {
 	SummaryPrompt       string
 	UpdateSummaryPrompt string
 	TurnPrefixPrompt    string
+	// Fork is nil when the summary must use a standalone prompt.
+	Fork *agentcore.LLMPrefix
 }
 
 func runSummaryCompaction(ctx context.Context, cfg summaryRunConfig, msgs []agentcore.AgentMessage, stripImages bool) ([]agentcore.AgentMessage, *SummaryInfo, error) {
@@ -60,39 +64,18 @@ func runSummaryCompaction(ctx context.Context, cfg summaryRunConfig, msgs []agen
 		historyEnd = cut.turnStartIndex
 	}
 
-	toSummarize := msgs[:historyEnd]
 	toKeep := msgs[cut.firstKeptIndex:]
 
-	if stripImages {
-		toSummarize = stripImageBlocks(toSummarize)
-	}
+	previousSummary, history := splitPreviousSummary(msgs[:historyEnd])
 
-	var previousSummary string
-	for _, m := range toSummarize {
-		if cs, ok := m.(ContextSummary); ok {
-			previousSummary = cs.Summary
-		}
-	}
-
-	historyOpts := []agentcore.CallOption{
-		agentcore.WithMaxTokens(int(float64(cfg.ReserveTokens) * 0.8)),
-		agentcore.WithThinking(agentcore.ThinkingOff),
-	}
-	prefixOpts := []agentcore.CallOption{
-		agentcore.WithMaxTokens(int(float64(cfg.ReserveTokens) * 0.5)),
-		agentcore.WithThinking(agentcore.ThinkingOff),
-	}
-
-	var summary string
-
-	needTurnPrefix := cut.isSplitTurn && cut.turnStartIndex >= 0
 	var turnPrefix []agentcore.AgentMessage
-	if needTurnPrefix {
+	if cut.isSplitTurn && cut.turnStartIndex >= 0 {
 		turnPrefix = msgs[cut.turnStartIndex:cut.firstKeptIndex]
-		if stripImages {
-			turnPrefix = stripImageBlocks(turnPrefix)
-		}
-		needTurnPrefix = len(turnPrefix) > 0
+	}
+
+	// A split-turn prefix is new history even when only the prior summary precedes it.
+	if len(history) == 0 && len(turnPrefix) == 0 && previousSummary != "" {
+		return msgs, nil, nil
 	}
 
 	prompts := summaryPrompts{
@@ -102,32 +85,14 @@ func runSummaryCompaction(ctx context.Context, cfg summaryRunConfig, msgs []agen
 		TurnPrefix: cfg.TurnPrefixPrompt,
 	}
 
-	if needTurnPrefix {
-		// Run sequentially. ChatModel does not promise concurrent Generate safety,
-		// so split-turn summarization must not assume shared model instances are
-		// goroutine-safe.
-		if len(toSummarize) == 0 {
-			summary = "No prior history."
-		} else {
-			var err error
-			summary, err = generateSummary(ctx, cfg.Model, prompts, toSummarize, previousSummary, historyOpts...)
-			if err != nil {
-				return nil, nil, fmt.Errorf("compaction: %w", err)
-			}
-		}
-
-		prefixSummary, err := generateTurnPrefixSummary(ctx, cfg.Model, prompts, turnPrefix, prefixOpts...)
+	summary, err := forkedSummary(ctx, cfg, prompts, msgs)
+	if err != nil {
+		return nil, nil, fmt.Errorf("compaction: %w", err)
+	}
+	if summary == "" {
+		summary, err = standaloneSummary(ctx, cfg, prompts, history, previousSummary, turnPrefix, stripImages)
 		if err != nil {
-			return nil, nil, fmt.Errorf("compaction turn prefix: %w", err)
-		}
-		if prefixSummary != "" {
-			summary += "\n\n---\n\n**Turn Context (split turn):**\n\n" + prefixSummary
-		}
-	} else {
-		var err error
-		summary, err = generateSummary(ctx, cfg.Model, prompts, toSummarize, previousSummary, historyOpts...)
-		if err != nil {
-			return nil, nil, fmt.Errorf("compaction: %w", err)
+			return nil, nil, err
 		}
 	}
 
@@ -155,7 +120,7 @@ func runSummaryCompaction(ctx context.Context, cfg summaryRunConfig, msgs []agen
 		MessagesAfter:  len(result),
 		CompactedCount: len(allCompacted),
 		KeptCount:      len(toKeep),
-		IsSplitTurn:    needTurnPrefix,
+		IsSplitTurn:    len(turnPrefix) > 0,
 		IsIncremental:  previousSummary != "",
 		SummaryLen:     len([]rune(summary)),
 		Duration:       time.Since(start),
@@ -163,6 +128,82 @@ func runSummaryCompaction(ctx context.Context, cfg summaryRunConfig, msgs []agen
 		ModifiedFiles:  modifiedFiles,
 	}
 	return result, info, nil
+}
+
+// splitPreviousSummary separates the checkpoint from new standalone history.
+func splitPreviousSummary(msgs []agentcore.AgentMessage) (string, []agentcore.AgentMessage) {
+	var previous string
+	out := msgs[:0:0]
+	for _, m := range msgs {
+		if cs, ok := m.(ContextSummary); ok {
+			previous = cs.Summary
+			continue
+		}
+		out = append(out, m)
+	}
+	return previous, out
+}
+
+// forkedSummary returns "" when the caller should use standaloneSummary.
+func forkedSummary(ctx context.Context, cfg summaryRunConfig, prompts summaryPrompts, view []agentcore.AgentMessage) (string, error) {
+	// Prompt caches are model-specific.
+	if cfg.Fork == nil || !sameModel(cfg.Fork.Model, cfg.Model) {
+		return "", nil
+	}
+
+	// Preserve the whole view and thinking options so the cached prefix remains
+	// byte-stable. The retained tail is therefore also present in the summary input.
+	summary, err := generateSummary(ctx, cfg.Model, prompts, cfg.Fork, view, "",
+		agentcore.WithMaxTokens(int(float64(cfg.ReserveTokens)*0.8)))
+	if errors.Is(err, errEmptySummary) {
+		return "", nil
+	}
+	return summary, err
+}
+
+// sameModel compares model instances without panicking on non-comparable values.
+func sameModel(a, b agentcore.ChatModel) bool {
+	if a == nil || b == nil {
+		return false
+	}
+	ta, tb := reflect.TypeOf(a), reflect.TypeOf(b)
+	return ta == tb && ta.Comparable() && a == b
+}
+
+// standaloneSummary uses a dedicated prompt with thinking disabled.
+func standaloneSummary(ctx context.Context, cfg summaryRunConfig, prompts summaryPrompts, history []agentcore.AgentMessage, previousSummary string, turnPrefix []agentcore.AgentMessage, stripImages bool) (string, error) {
+	if stripImages {
+		history = stripImageBlocks(history)
+		turnPrefix = stripImageBlocks(turnPrefix)
+	}
+
+	summary := "No prior history."
+	if len(history) > 0 {
+		var err error
+		summary, err = generateSummary(ctx, cfg.Model, prompts, nil, history, previousSummary,
+			agentcore.WithMaxTokens(int(float64(cfg.ReserveTokens)*0.8)),
+			agentcore.WithThinking(agentcore.ThinkingOff))
+		if err != nil {
+			return "", fmt.Errorf("compaction: %w", err)
+		}
+	}
+	if len(turnPrefix) == 0 {
+		return summary, nil
+	}
+
+	// Run sequentially. ChatModel does not promise concurrent Generate safety,
+	// so split-turn summarization must not assume shared model instances are
+	// goroutine-safe.
+	prefixSummary, err := generateTurnPrefixSummary(ctx, cfg.Model, prompts, turnPrefix,
+		agentcore.WithMaxTokens(int(float64(cfg.ReserveTokens)*0.5)),
+		agentcore.WithThinking(agentcore.ThinkingOff))
+	if err != nil {
+		return "", fmt.Errorf("compaction turn prefix: %w", err)
+	}
+	if prefixSummary != "" {
+		summary += "\n\n---\n\n**Turn Context (split turn):**\n\n" + prefixSummary
+	}
+	return summary, nil
 }
 
 // stripImageBlocks returns a copy of msgs with image content blocks removed.
