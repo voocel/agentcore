@@ -31,6 +31,7 @@ const (
 )
 
 // ProgressPayload is the structured progress envelope emitted by tools.
+// Message carries complete text; presentation limits belong to consumers.
 type ProgressPayload struct {
 	Kind       ProgressPayloadKind `json:"kind"`
 	Agent      string              `json:"agent,omitempty"`
