@@ -1080,12 +1080,17 @@ func (r *Runner) run(ctx context.Context, agentName, taskStr string, modelOverri
 			}
 		case agentcore.EventRetry:
 			if opts.reportProgress && ev.RetryInfo != nil {
+				var meta json.RawMessage
+				if ev.RetryInfo.Delay > 0 {
+					meta = json.RawMessage(fmt.Sprintf(`{"retry_delay_ms":%d}`, ev.RetryInfo.Delay.Milliseconds()))
+				}
 				agentcore.ReportToolProgress(ctx, agentcore.ProgressPayload{
 					Kind:       agentcore.ProgressRetry,
 					Agent:      agentName,
 					Attempt:    ev.RetryInfo.Attempt,
 					MaxRetries: ev.RetryInfo.MaxRetries,
 					Message:    ev.RetryInfo.Err.Error(),
+					Meta:       meta,
 				})
 			}
 		case agentcore.EventError:

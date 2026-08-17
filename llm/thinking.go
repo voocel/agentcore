@@ -27,16 +27,35 @@ func ThinkingPolicyFor(model any) ThinkingPolicy {
 }
 
 func ThinkingPolicyFromCapabilities(caps Capabilities) ThinkingPolicy {
-	if caps.Thinking.Supported == SupportUnknown &&
-		caps.Thinking.Disable == SupportUnknown &&
-		len(caps.Thinking.Efforts) == 0 {
+	if !caps.ProviderBaseline {
+		return exactThinkingPolicy(caps.Thinking)
+	}
+	return baselineThinkingPolicy(caps.Thinking)
+}
+
+func baselineThinkingPolicy(caps ThinkingCapabilities) ThinkingPolicy {
+	if caps.Supported == SupportNo {
+		return ThinkingPolicy{Available: []agentcore.ThinkingLevel{ThinkingAuto}}
+	}
+	available := []agentcore.ThinkingLevel{ThinkingAuto}
+	for _, level := range ThinkingLevelOrder {
+		if level == agentcore.ThinkingOff && caps.Disable == SupportNo {
+			continue
+		}
+		available = append(available, level)
+	}
+	return ThinkingPolicy{Available: available}
+}
+
+func exactThinkingPolicy(caps ThinkingCapabilities) ThinkingPolicy {
+	if caps.Supported == SupportUnknown && caps.Disable == SupportUnknown && len(caps.Efforts) == 0 {
 		return ThinkingPolicy{Available: append([]agentcore.ThinkingLevel{ThinkingAuto}, ThinkingLevelOrder...)}
 	}
 	available := []agentcore.ThinkingLevel{ThinkingAuto}
-	if caps.Thinking.Disable == SupportYes || caps.Thinking.Disable == SupportPartial {
+	if caps.Disable == SupportYes || caps.Disable == SupportPartial {
 		available = append(available, agentcore.ThinkingOff)
 	}
-	available = append(available, caps.Thinking.Efforts...)
+	available = append(available, caps.Efforts...)
 	return ThinkingPolicy{Available: uniqueThinkingLevels(available)}
 }
 

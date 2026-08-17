@@ -185,7 +185,7 @@ type CallConfig struct {
 	SessionID      string // provider session caching identifier
 	PromptCacheKey string // prompt-cache routing identity, empty = no hint
 	MaxTokens      int    // per-call max tokens override, 0 = use model default
-	ToolChoice     any    // "auto" / "required" / "none" / {"type":"tool","name":"xxx"}, nil = provider default
+	ToolChoice     any    // portable: "auto", "required", "none"; objects are provider-specific
 	ResponseFormat *ResponseFormat
 }
 
@@ -257,8 +257,7 @@ func WithMaxTokens(tokens int) CallOption {
 	return func(c *CallConfig) { c.MaxTokens = tokens }
 }
 
-// WithToolChoice controls whether the model must call a tool.
-// Accepted values: "auto" (default), "required" (must call a tool), "none" (no tools).
+// WithToolChoice sets "auto", "required", "none", or a provider-specific object.
 func WithToolChoice(choice any) CallOption {
 	return func(c *CallConfig) { c.ToolChoice = choice }
 }

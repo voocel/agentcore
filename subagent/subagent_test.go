@@ -132,6 +132,51 @@ func TestRunner_Run(t *testing.T) {
 	}
 }
 
+type retryWithDelayError struct{}
+
+func (retryWithDelayError) Error() string             { return "temporary network failure" }
+func (retryWithDelayError) Retryable() bool           { return true }
+func (retryWithDelayError) RetryAfter() time.Duration { return 25 * time.Millisecond }
+
+func TestRunnerRetryProgressIncludesDelay(t *testing.T) {
+	model := newSequential(func(i int, _ *agentcore.LLMRequest) (*agentcore.LLMResponse, error) {
+		if i == 0 {
+			return nil, retryWithDelayError{}
+		}
+		return &agentcore.LLMResponse{Message: agentcore.Message{
+			Role:       agentcore.RoleAssistant,
+			Content:    []agentcore.ContentBlock{agentcore.TextBlock("done")},
+			StopReason: agentcore.StopReasonStop,
+		}}, nil
+	})
+
+	var retryMeta json.RawMessage
+	ctx := agentcore.WithToolProgress(context.Background(), func(progress agentcore.ProgressPayload) {
+		if progress.Kind == agentcore.ProgressRetry {
+			retryMeta = progress.Meta
+		}
+	})
+	_, err := NewRunner(Config{
+		Name:       "writer",
+		Model:      model,
+		MaxTurns:   2,
+		MaxRetries: 1,
+	}).Run(ctx, "writer", "write")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	var meta struct {
+		DelayMS int64 `json:"retry_delay_ms"`
+	}
+	if err := json.Unmarshal(retryMeta, &meta); err != nil {
+		t.Fatalf("decode retry metadata: %v", err)
+	}
+	if meta.DelayMS != 25 {
+		t.Fatalf("retry delay = %dms, want 25ms", meta.DelayMS)
+	}
+}
+
 func TestNewRunnerRejectsInvalidRegistry(t *testing.T) {
 	tests := []struct {
 		name   string

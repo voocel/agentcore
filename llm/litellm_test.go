@@ -247,6 +247,9 @@ func TestLiteLLMAdapterCapabilities(t *testing.T) {
 	if caps.Provider != "capture" || caps.Model != "m" {
 		t.Fatalf("identity = %s/%s, want capture/m", caps.Provider, caps.Model)
 	}
+	if !caps.ProviderBaseline {
+		t.Fatal("litellm capabilities must be marked as a provider baseline")
+	}
 	if caps.Thinking.Supported != SupportYes || caps.Thinking.Disable != SupportYes {
 		t.Fatalf("thinking support = %+v", caps.Thinking)
 	}

@@ -24,8 +24,9 @@ type CapabilityProvider interface {
 
 // Capabilities is agentcore's provider-neutral view of model capabilities.
 type Capabilities struct {
-	Provider string
-	Model    string
+	Provider         string
+	Model            string
+	ProviderBaseline bool // model-specific limits are enforced by the provider
 
 	Thinking   ThinkingCapabilities
 	Tools      ToolCapabilities
@@ -90,8 +91,9 @@ type UsageCapabilities struct {
 
 func fromLiteLLMCapabilities(c litellm.Capabilities) Capabilities {
 	return Capabilities{
-		Provider: c.Provider,
-		Model:    c.Model,
+		Provider:         c.Provider,
+		Model:            c.Model,
+		ProviderBaseline: true,
 		Thinking: ThinkingCapabilities{
 			Supported:     fromLiteLLMSupport(c.Thinking.Supported),
 			Disable:       fromLiteLLMSupport(c.Thinking.Disable),
