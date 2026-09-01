@@ -518,3 +518,59 @@ func TestGenerateStreamPreservesRefusal(t *testing.T) {
 		t.Fatalf("metadata = %#v", final.Metadata)
 	}
 }
+
+// TestGenerateStreamAttributesInterleavedToolCallDeltas asserts each toolcall
+// delta carries its call ID, even for continuation chunks keyed by index only.
+func TestGenerateStreamAttributesInterleavedToolCallDeltas(t *testing.T) {
+	sse := strings.Join([]string{
+		`data: {"choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"id":"call_a","function":{"name":"write_a","arguments":"{\"a\":"}}]}}]}`,
+		`data: {"choices":[{"index":0,"delta":{"tool_calls":[{"index":1,"id":"call_b","function":{"name":"write_b","arguments":"{\"b\":"}}]}}]}`,
+		`data: {"choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"function":{"arguments":"1}"}}]}}]}`,
+		`data: {"choices":[{"index":0,"delta":{"tool_calls":[{"index":1,"function":{"arguments":"2}"}}]}}]}`,
+		`data: {"choices":[{"index":0,"delta":{},"finish_reason":"tool_calls"}]}`,
+		`data: [DONE]`,
+		``,
+	}, "\n")
+	provider, err := compat.New(compat.Config{
+		BaseURL: "https://compat.test/v1",
+		HTTPClient: roundTripFunc(func(*http.Request) (*http.Response, error) {
+			return &http.Response{
+				StatusCode: http.StatusOK,
+				Body:       io.NopCloser(strings.NewReader(sse)),
+				Header:     make(http.Header),
+			}, nil
+		}),
+	}, compat.Spec{Name: "mimo"})
+	if err != nil {
+		t.Fatalf("compat.New: %v", err)
+	}
+	model := NewLiteLLMAdapter("mimo-v2.5", mustClient(t, provider))
+	ch, err := model.GenerateStream(context.Background(), []agentcore.Message{agentcore.UserMsg("hi")}, nil)
+	if err != nil {
+		t.Fatalf("GenerateStream: %v", err)
+	}
+	type attributed struct{ id, delta string }
+	var got []attributed
+	for ev := range ch {
+		if ev.Type == agentcore.StreamEventError {
+			t.Fatalf("stream error: %v", ev.Err)
+		}
+		if ev.Type == agentcore.StreamEventToolCallDelta {
+			got = append(got, attributed{ev.ToolID, ev.Delta})
+		}
+	}
+	want := []attributed{
+		{"call_a", `{"a":`},
+		{"call_b", `{"b":`},
+		{"call_a", "1}"},
+		{"call_b", "2}"},
+	}
+	if len(got) != len(want) {
+		t.Fatalf("delta events = %+v, want %+v", got, want)
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Fatalf("delta %d = %+v, want %+v", i, got[i], want[i])
+		}
+	}
+}

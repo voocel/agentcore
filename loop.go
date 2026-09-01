@@ -795,7 +795,7 @@ func callLLMStream(ctx context.Context, model ChatModel, messages []Message, too
 			case StreamEventToolCallDelta:
 				dk = DeltaToolCall
 			}
-			sink.emit(Event{Type: EventMessageUpdate, Message: partial, Delta: ev.Delta, DeltaKind: dk})
+			sink.emit(Event{Type: EventMessageUpdate, Message: partial, Delta: ev.Delta, DeltaKind: dk, ToolID: ev.ToolID})
 
 		case StreamEventTextEnd, StreamEventThinkingEnd, StreamEventToolCallEnd:
 			partial = ev.Message

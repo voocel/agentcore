@@ -118,13 +118,18 @@ func (p *Model) GenerateStream(ctx context.Context, messages []agentcore.Message
 					ID:   fr.ToolCallID,
 					Name: fr.ToolName,
 				}))
-				out <- agentcore.StreamEvent{Type: agentcore.StreamEventToolCallStart, Message: partial}
+				out <- agentcore.StreamEvent{Type: agentcore.StreamEventToolCallStart, ToolID: fr.ToolCallID, Message: partial}
 
 			case FrameToolCallDelta:
+				callID := fr.ToolCallID
 				if idx := lastToolCall(partial.Content); idx >= 0 && partial.Content[idx].ToolCall != nil {
 					partial.Content[idx].ToolCall.Args = append(partial.Content[idx].ToolCall.Args, json.RawMessage(fr.Delta)...)
+					// delta frames may omit the ID: resolve from the block
+					if callID == "" {
+						callID = partial.Content[idx].ToolCall.ID
+					}
 				}
-				out <- agentcore.StreamEvent{Type: agentcore.StreamEventToolCallDelta, Delta: fr.Delta, Message: partial}
+				out <- agentcore.StreamEvent{Type: agentcore.StreamEventToolCallDelta, ToolID: callID, Delta: fr.Delta, Message: partial}
 
 			case FrameDone:
 				partial.StopReason = fr.StopReason

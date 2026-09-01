@@ -381,10 +381,11 @@ func (l *LiteLLMAdapter) GenerateStream(ctx context.Context, messages []agentcor
 				if key != "" {
 					toolBlockIndices[key] = idx
 				}
-				eventChan <- agentcore.StreamEvent{Type: agentcore.StreamEventToolCallStart, Message: partial}
+				eventChan <- agentcore.StreamEvent{Type: agentcore.StreamEventToolCallStart, ToolID: e.ID, Message: partial}
 			case litellm.ToolUseDelta:
 				key := toolUseEventKey(e.ID, e.ItemID, e.Index, e.OutputIndex)
 				idx := findPendingToolCallBlock(partial.Content, toolBlockIndices, key)
+				callID := e.ID
 				if idx >= 0 {
 					block := partial.Content[idx]
 					if block.ToolCall != nil {
@@ -395,6 +396,10 @@ func (l *LiteLLMAdapter) GenerateStream(ctx context.Context, messages []agentcor
 							block.ToolCall.ThoughtSignature = e.Signature
 						}
 						partial.Content[idx] = block
+						// continuation chunks may omit the ID: resolve from the block
+						if callID == "" {
+							callID = block.ToolCall.ID
+						}
 					}
 					if key != "" {
 						toolBlockIndices[key] = idx
@@ -402,7 +407,7 @@ func (l *LiteLLMAdapter) GenerateStream(ctx context.Context, messages []agentcor
 				}
 				if len(e.ArgumentsDelta) > 0 {
 					toolArgs[key] = append(toolArgs[key], e.ArgumentsDelta...)
-					eventChan <- agentcore.StreamEvent{Type: agentcore.StreamEventToolCallDelta, Delta: string(e.ArgumentsDelta), Message: partial}
+					eventChan <- agentcore.StreamEvent{Type: agentcore.StreamEventToolCallDelta, ToolID: callID, Delta: string(e.ArgumentsDelta), Message: partial}
 				}
 			case litellm.ToolUseDone:
 				key := toolUseEventKey(e.ID, e.ItemID, e.Index, e.OutputIndex)
@@ -422,7 +427,7 @@ func (l *LiteLLMAdapter) GenerateStream(ctx context.Context, messages []agentcor
 					partial.Content = append(partial.Content, agentcore.ToolCallBlock(completed))
 					idx = len(partial.Content) - 1
 				}
-				eventChan <- agentcore.StreamEvent{Type: agentcore.StreamEventToolCallEnd, ContentIndex: idx, Message: partial, CompletedToolCall: &completed}
+				eventChan <- agentcore.StreamEvent{Type: agentcore.StreamEventToolCallEnd, ToolID: completed.ID, ContentIndex: idx, Message: partial, CompletedToolCall: &completed}
 			}
 			return nil
 		})

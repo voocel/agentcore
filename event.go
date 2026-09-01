@@ -75,7 +75,7 @@ type Event struct {
 	Message     AgentMessage    // for message_start/update/end, turn_end
 	Delta       string          // text delta for message_update
 	DeltaKind   DeltaKind       // for message_update: what kind of delta
-	ToolID      string          // for tool_exec_*
+	ToolID      string          // for tool_exec_* and toolcall message_update deltas
 	Tool        string          // tool name for tool_exec_*
 	ToolLabel   string          // human-readable tool label (from ToolLabeler)
 	Args        json.RawMessage // tool args for tool_exec_start/tool_exec_update
