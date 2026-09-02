@@ -98,17 +98,17 @@ func (s *SessionMemoryStrategy) Apply(ctx context.Context, _ []agentcore.AgentMe
 		return view, StrategyResult{Name: s.Name()}, nil
 	}
 
-	cut := findCutPoint(view, s.cfg.KeepRecentTokens)
-	if cut.firstKeptIndex <= 0 {
+	cut := FindCutPoint(view, s.cfg.KeepRecentTokens)
+	if cut.FirstKeptIndex <= 0 {
 		return view, StrategyResult{Name: s.Name()}, nil
 	}
 
 	// For split turns we include the preceding user turn start in the kept
 	// suffix — we cannot synthesize a turn-prefix summary without an LLM,
 	// but the seed is a living document that already tracks current state.
-	keepStart := cut.firstKeptIndex
-	if cut.isSplitTurn && cut.turnStartIndex >= 0 {
-		keepStart = cut.turnStartIndex
+	keepStart := cut.FirstKeptIndex
+	if cut.IsSplitTurn && cut.TurnStartIndex >= 0 {
+		keepStart = cut.TurnStartIndex
 	}
 
 	truncated, wasTruncated := truncateSeed(seed, s.cfg.MaxSeedRunes)
@@ -143,7 +143,7 @@ func (s *SessionMemoryStrategy) Apply(ctx context.Context, _ []agentcore.AgentMe
 		MessagesAfter:  len(result),
 		CompactedCount: len(allCompacted),
 		KeptCount:      len(toKeep),
-		IsSplitTurn:    cut.isSplitTurn,
+		IsSplitTurn:    cut.IsSplitTurn,
 		IsIncremental:  true, // seed is a continuously updated living document
 		SummaryLen:     len([]rune(body)),
 		Duration:       time.Since(start),

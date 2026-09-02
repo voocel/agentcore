@@ -52,25 +52,25 @@ type summaryRunConfig struct {
 }
 
 func runSummaryCompaction(ctx context.Context, cfg summaryRunConfig, msgs []agentcore.AgentMessage, stripImages bool) ([]agentcore.AgentMessage, *SummaryInfo, error) {
-	cut := findCutPoint(msgs, cfg.KeepRecentTokens)
-	if cut.firstKeptIndex <= 0 {
+	cut := FindCutPoint(msgs, cfg.KeepRecentTokens)
+	if cut.FirstKeptIndex <= 0 {
 		return msgs, nil, nil
 	}
 
 	start := time.Now()
 
-	historyEnd := cut.firstKeptIndex
-	if cut.isSplitTurn && cut.turnStartIndex >= 0 {
-		historyEnd = cut.turnStartIndex
+	historyEnd := cut.FirstKeptIndex
+	if cut.IsSplitTurn && cut.TurnStartIndex >= 0 {
+		historyEnd = cut.TurnStartIndex
 	}
 
-	toKeep := msgs[cut.firstKeptIndex:]
+	toKeep := msgs[cut.FirstKeptIndex:]
 
 	previousSummary, history := splitPreviousSummary(msgs[:historyEnd])
 
 	var turnPrefix []agentcore.AgentMessage
-	if cut.isSplitTurn && cut.turnStartIndex >= 0 {
-		turnPrefix = msgs[cut.turnStartIndex:cut.firstKeptIndex]
+	if cut.IsSplitTurn && cut.TurnStartIndex >= 0 {
+		turnPrefix = msgs[cut.TurnStartIndex:cut.FirstKeptIndex]
 	}
 
 	// A split-turn prefix is new history even when only the prior summary precedes it.
@@ -96,7 +96,7 @@ func runSummaryCompaction(ctx context.Context, cfg summaryRunConfig, msgs []agen
 		}
 	}
 
-	allCompacted := msgs[:cut.firstKeptIndex]
+	allCompacted := msgs[:cut.FirstKeptIndex]
 	readFiles, modifiedFiles := extractFileOps(allCompacted)
 	summary += formatFileOps(readFiles, modifiedFiles)
 
@@ -245,35 +245,28 @@ func stripImageBlocks(msgs []agentcore.AgentMessage) []agentcore.AgentMessage {
 	return out
 }
 
-// cutResult holds the result of findCutPoint, including turn split information.
-type cutResult struct {
-	// firstKeptIndex is the index of the first message to keep.
-	firstKeptIndex int
-	// turnStartIndex is the index where the current turn starts, or -1 if
-	// the cut is at a turn boundary (user message).
-	turnStartIndex int
-	// isSplitTurn is true when the cut falls in the middle of a turn.
-	// In this case, msgs[turnStartIndex:firstKeptIndex] is the turn prefix
-	// that needs a separate summary.
-	isSplitTurn bool
+// CutPoint is where a compaction splits history from the kept suffix.
+type CutPoint struct {
+	// FirstKeptIndex is the index of the first message to keep; 0 means no cut.
+	FirstKeptIndex int
+	// TurnStartIndex is the index of the user message that started the turn
+	// containing the cut, or -1 when the cut sits on a turn boundary.
+	TurnStartIndex int
+	// IsSplitTurn reports a cut inside a turn; msgs[TurnStartIndex:FirstKeptIndex]
+	// is the turn prefix that needs its own summary.
+	IsSplitTurn bool
 }
 
-// findCutPoint walks backwards from the end, accumulating tokens until
-// keepTokens is reached. Returns the cut result with turn-awareness.
+// FindCutPoint walks backwards from the end, accumulating tokens until
+// keepTokens is reached, then aligns the cut to a message boundary. Tool
+// results belong to the assistant call that issued them, so a cut landing on
+// a result retreats to that call and the whole group stays in the kept suffix.
+// Every other message starts a unit and is a valid cut point.
 //
-// Rules:
-//   - Never cut between an assistant message (with tool calls) and its tool results
-//   - Prefer cutting at user message boundaries
-//   - Detect split turns and report the turn start index
-func findCutPoint(msgs []agentcore.AgentMessage, keepTokens int) cutResult {
-	if len(msgs) == 0 {
-		return cutResult{}
-	}
-
-	accumulated := 0
-	cutIndex := len(msgs) // start past end
-
-	// Walk backwards
+// A zero FirstKeptIndex means nothing can be compacted: the suffix already
+// covers everything, or the newest tool group alone exceeds keepTokens.
+func FindCutPoint(msgs []agentcore.AgentMessage, keepTokens int) CutPoint {
+	cutIndex, accumulated := -1, 0
 	for i := len(msgs) - 1; i >= 0; i-- {
 		accumulated += EstimateTokens(msgs[i])
 		if accumulated >= keepTokens {
@@ -281,72 +274,34 @@ func findCutPoint(msgs []agentcore.AgentMessage, keepTokens int) cutResult {
 			break
 		}
 	}
-
-	// If we couldn't accumulate enough, keep everything
-	if cutIndex >= len(msgs) {
-		return cutResult{}
+	for cutIndex > 0 && isRole(msgs[cutIndex], agentcore.RoleTool) {
+		cutIndex--
+	}
+	if cutIndex <= 0 {
+		return CutPoint{}
 	}
 
-	// Align to a valid cut point: walk forward to find a user message boundary
-	// Never split tool pair (assistant with toolCalls + following tool results)
-	for cutIndex < len(msgs) {
-		msg := msgs[cutIndex]
-		if m, ok := msg.(agentcore.Message); ok {
-			// Don't cut at a tool result — it belongs to the previous assistant
-			if m.Role == agentcore.RoleTool {
-				cutIndex++
-				continue
-			}
-			// Good cut point: user message
-			if m.Role == agentcore.RoleUser {
-				break
-			}
-			// Assistant message with tool calls: skip past all its tool results
-			if m.Role == agentcore.RoleAssistant && m.HasToolCalls() {
-				cutIndex++
-				for cutIndex < len(msgs) {
-					if next, ok := msgs[cutIndex].(agentcore.Message); ok && next.Role == agentcore.RoleTool {
-						cutIndex++
-					} else {
-						break
-					}
-				}
-				continue
-			}
-			// Assistant without tool calls — valid cut point
+	cut := CutPoint{FirstKeptIndex: cutIndex, TurnStartIndex: -1}
+	if isRole(msgs[cutIndex], agentcore.RoleUser) {
+		return cut
+	}
+	for i := cutIndex - 1; i >= 0; i-- {
+		if isRole(msgs[i], agentcore.RoleUser) {
+			cut.TurnStartIndex, cut.IsSplitTurn = i, true
 			break
 		}
-		// ContextSummary or other custom type — valid cut point
-		break
 	}
-
-	// Safety: don't compact everything
-	if cutIndex >= len(msgs) {
-		return cutResult{}
-	}
-
-	// Detect split turn: if cut is not at a user message, find the turn start
-	isSplitTurn := false
-	turnStartIndex := -1
-	if m, ok := msgs[cutIndex].(agentcore.Message); !ok || m.Role != agentcore.RoleUser {
-		// Walk backwards from cutIndex to find the user message that started this turn
-		for i := cutIndex - 1; i >= 0; i-- {
-			if um, ok := msgs[i].(agentcore.Message); ok && um.Role == agentcore.RoleUser {
-				turnStartIndex = i
-				isSplitTurn = true
-				break
-			}
-		}
-	}
-
-	return cutResult{
-		firstKeptIndex: cutIndex,
-		turnStartIndex: turnStartIndex,
-		isSplitTurn:    isSplitTurn,
-	}
+	return cut
 }
 
-// extractFileOps scans messages for tool calls and extracts file paths.
+// isRole reports whether m is a plain LLM message with the given role.
+// Summaries and other custom entries never match: they neither belong to a
+// tool group nor count as turn boundaries.
+func isRole(m agentcore.AgentMessage, role agentcore.Role) bool {
+	msg, ok := m.(agentcore.Message)
+	return ok && msg.Role == role
+}
+
 func extractFileOps(msgs []agentcore.AgentMessage) (readFiles, modifiedFiles []string) {
 	readSet := make(map[string]struct{})
 	modifiedSet := make(map[string]struct{})

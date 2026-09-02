@@ -2,6 +2,7 @@ package context
 
 import (
 	"context"
+	"strconv"
 	"strings"
 	"testing"
 
@@ -22,23 +23,26 @@ func (m stubModel) GenerateStream(ctx context.Context, messages []agentcore.Mess
 
 func (m stubModel) SupportsTools() bool { return true }
 
-func TestFindCutPoint_SkipsToolResultBoundary(t *testing.T) {
-	msgs := []agentcore.AgentMessage{
-		agentcore.UserMsg("old"),
+func toolGroup(id string, result string) []agentcore.AgentMessage {
+	return []agentcore.AgentMessage{
 		agentcore.Message{
 			Role:    agentcore.RoleAssistant,
-			Content: []agentcore.ContentBlock{agentcore.ToolCallBlock(agentcore.ToolCall{ID: "tc1", Name: "read"})},
+			Content: []agentcore.ContentBlock{agentcore.ToolCallBlock(agentcore.ToolCall{ID: id, Name: "read"})},
 		},
-		agentcore.ToolResultMsg("tc1", []byte(`"ok"`), false),
-		agentcore.UserMsg("recent"),
+		agentcore.ToolResultMsg(id, []byte(strconv.Quote(result)), false),
+	}
+}
+
+func TestFindCutPoint_StopsAtUserBoundary(t *testing.T) {
+	msgs := []agentcore.AgentMessage{
+		agentcore.UserMsg("old"),
+		agentcore.Message{Role: agentcore.RoleAssistant, Content: []agentcore.ContentBlock{agentcore.TextBlock("done")}},
+		agentcore.UserMsg(strings.Repeat("recent", 100)),
 	}
 
-	cut := findCutPoint(msgs, 2)
-	if cut.firstKeptIndex != 3 {
-		t.Fatalf("expected cut to advance past tool result to index 3, got %d", cut.firstKeptIndex)
-	}
-	if cut.isSplitTurn {
-		t.Fatal("expected cut at user boundary, got split turn")
+	cut := FindCutPoint(msgs, 10)
+	if cut.FirstKeptIndex != 2 || cut.IsSplitTurn || cut.TurnStartIndex != -1 {
+		t.Fatalf("expected clean cut at user index 2, got %+v", cut)
 	}
 }
 
@@ -50,15 +54,68 @@ func TestFindCutPoint_ReportsSplitTurn(t *testing.T) {
 		agentcore.Message{Role: agentcore.RoleAssistant, Content: []agentcore.ContentBlock{agentcore.TextBlock("working")}},
 	}
 
-	cut := findCutPoint(msgs, 1)
-	if cut.firstKeptIndex != 3 {
-		t.Fatalf("expected assistant message to be first kept item, got %d", cut.firstKeptIndex)
+	cut := FindCutPoint(msgs, 1)
+	if cut.FirstKeptIndex != 3 {
+		t.Fatalf("expected assistant message to be first kept item, got %d", cut.FirstKeptIndex)
 	}
-	if !cut.isSplitTurn {
-		t.Fatal("expected split turn to be reported")
+	if !cut.IsSplitTurn || cut.TurnStartIndex != 2 {
+		t.Fatalf("expected split turn starting at index 2, got %+v", cut)
 	}
-	if cut.turnStartIndex != 2 {
-		t.Fatalf("expected split turn to start at index 2, got %d", cut.turnStartIndex)
+}
+
+// A cut landing on a tool result retreats to the assistant call that issued
+// it, so parallel results are never separated from their call.
+func TestFindCutPoint_RetreatsToToolCallOnResult(t *testing.T) {
+	msgs := []agentcore.AgentMessage{
+		agentcore.UserMsg(strings.Repeat("b", 400)),
+		agentcore.Message{
+			Role: agentcore.RoleAssistant,
+			Content: []agentcore.ContentBlock{
+				agentcore.ToolCallBlock(agentcore.ToolCall{ID: "1", Name: "read"}),
+				agentcore.ToolCallBlock(agentcore.ToolCall{ID: "2", Name: "read"}),
+			},
+		},
+		agentcore.ToolResultMsg("1", []byte(strconv.Quote(strings.Repeat("a", 400))), false),
+		agentcore.ToolResultMsg("2", []byte(strconv.Quote(strings.Repeat("a", 400))), false),
+		agentcore.UserMsg("recent"),
+	}
+
+	cut := FindCutPoint(msgs, 120)
+	if cut.FirstKeptIndex != 1 {
+		t.Fatalf("expected cut to retreat to the tool call at index 1, got %+v", cut)
+	}
+	if !cut.IsSplitTurn || cut.TurnStartIndex != 0 {
+		t.Fatalf("expected split turn starting at index 0, got %+v", cut)
+	}
+}
+
+// Sub-agent runs are one user task followed by tool groups only; the cut must
+// still land inside the loop instead of walking off the end.
+func TestFindCutPoint_ToolLoopWithoutTextTurns(t *testing.T) {
+	msgs := []agentcore.AgentMessage{agentcore.UserMsg("task")}
+	for i := 1; i <= 4; i++ {
+		msgs = append(msgs, toolGroup(strconv.Itoa(i), strings.Repeat("a", 400))...)
+	}
+
+	cut := FindCutPoint(msgs, 150)
+	if cut.FirstKeptIndex != 5 {
+		t.Fatalf("expected cut at the third tool call (index 5), got %+v", cut)
+	}
+	if m, ok := msgs[cut.FirstKeptIndex].(agentcore.Message); !ok || !m.HasToolCalls() {
+		t.Fatal("kept suffix must start with a tool call")
+	}
+	if !cut.IsSplitTurn || cut.TurnStartIndex != 0 {
+		t.Fatalf("expected split turn from the task message, got %+v", cut)
+	}
+}
+
+func TestFindCutPoint_NoCutWhenNothingPrecedesKeptGroup(t *testing.T) {
+	msgs := append([]agentcore.AgentMessage{agentcore.UserMsg("task")}, toolGroup("1", strings.Repeat("a", 400))...)
+	if cut := FindCutPoint(msgs, 10000); cut.FirstKeptIndex != 0 {
+		t.Fatalf("suffix covering everything must report no cut, got %+v", cut)
+	}
+	if cut := FindCutPoint(msgs[1:], 50); cut.FirstKeptIndex != 0 {
+		t.Fatalf("retreating to a tool call at index 0 must report no cut, got %+v", cut)
 	}
 }
 
