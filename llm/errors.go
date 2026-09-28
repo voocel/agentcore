@@ -16,7 +16,7 @@ import (
 // classification facts (agentcore.RetryableError / RetryHinter, and the
 // ErrContextOverflow / ErrProvider* sentinels via errors.Is) without importing
 // litellm. Unwrap exposes the original error, so callers that DO know litellm
-// can still match it with errors.As(&litellm.LiteLLMError{}).
+// can still match it with errors.As(&litellm.Error{}).
 type providerError struct{ err error }
 
 // wrapProviderError wraps a raw litellm error for kernel consumption. Control
@@ -34,29 +34,23 @@ func wrapProviderError(err error) error {
 }
 
 // Error appends the structured facts litellm carries but keeps out of its own
-// Error() text (error type, HTTP status, provider, model). Gateway messages
+// Error() text (error type, HTTP status); the provider already leads it. Gateway messages
 // are often as vague as "Provider returned error"; without these facts users
 // cannot tell a config mistake from an upstream outage. This is the single
 // seam every provider error string flows through (engine retry events, host
 // surfaces, logs), so enriching here fixes them all at once.
 func (e *providerError) Error() string {
 	msg := e.err.Error()
-	var le *litellm.LiteLLMError
+	var le *litellm.Error
 	if !errors.As(e.err, &le) {
 		return msg
 	}
-	facts := make([]string, 0, 4)
+	facts := make([]string, 0, 2)
 	if le.Type != "" {
 		facts = append(facts, string(le.Type))
 	}
 	if le.StatusCode != 0 {
 		facts = append(facts, fmt.Sprintf("HTTP %d", le.StatusCode))
-	}
-	if le.Provider != "" {
-		facts = append(facts, le.Provider)
-	}
-	if le.Model != "" {
-		facts = append(facts, le.Model)
 	}
 	if len(facts) == 0 {
 		return msg
@@ -66,18 +60,12 @@ func (e *providerError) Error() string {
 
 func (e *providerError) Unwrap() error { return e.err }
 
-// Retryable reports litellm's own retryability verdict (network, timeout,
-// rate-limit, overloaded, and upstream provider errors are retryable).
-func (e *providerError) Retryable() bool { return litellm.IsRetryableError(e.err) }
+// Retryable reports litellm's verdict that the failure may be transient
+// (network, timeout, rate-limit, overloaded and retryable HTTP statuses).
+func (e *providerError) Retryable() bool { return litellm.IsTemporaryError(e.err) }
 
-// RetryAfter surfaces a provider Retry-After hint (rate-limit responses) as a
-// duration, or 0 when none is present.
-func (e *providerError) RetryAfter() time.Duration {
-	if s := litellm.GetRetryAfter(e.err); s > 0 {
-		return time.Duration(s) * time.Second
-	}
-	return 0
-}
+// RetryAfter surfaces a provider Retry-After hint, or 0 when none is present.
+func (e *providerError) RetryAfter() time.Duration { return litellm.RetryAfter(e.err) }
 
 // Is maps litellm's category checks onto the kernel's sentinels so callers can
 // classify provider failures with a plain errors.Is. Other targets fall through
@@ -89,7 +77,7 @@ func (e *providerError) Is(target error) bool {
 	case agentcore.ErrProviderRateLimit:
 		return litellm.IsRateLimitError(e.err)
 	case agentcore.ErrProviderQuota:
-		return isQuotaError(e.err)
+		return litellm.IsQuotaError(e.err)
 	case agentcore.ErrProviderTimeout:
 		return litellm.IsTimeoutError(e.err)
 	case agentcore.ErrProviderStreamIdle:
@@ -104,9 +92,4 @@ func (e *providerError) Is(target error) bool {
 		return litellm.IsContentFilterError(e.err)
 	}
 	return false
-}
-
-func isQuotaError(err error) bool {
-	var e *litellm.LiteLLMError
-	return errors.As(err, &e) && e.Type == litellm.ErrorTypeQuota
 }

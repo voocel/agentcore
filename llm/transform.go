@@ -67,7 +67,8 @@ func transformContent(msg agentcore.Message, targetProvider string, idMap map[st
 					idMap[tc.ID] = newID
 					tc.ID = newID
 				}
-				newContent = append(newContent, agentcore.ToolCallBlock(tc))
+				block.ToolCall = &tc
+				newContent = append(newContent, block)
 			}
 
 		default:

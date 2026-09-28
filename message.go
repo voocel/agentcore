@@ -45,6 +45,19 @@ type ContentBlock struct {
 	ToolCall *ToolCall   `json:"tool_call,omitempty"`
 	Image    *ImageData  `json:"image,omitempty"`
 	ToolName string      `json:"tool_name,omitempty"` // tool_reference: referenced tool name
+	// State is provider replay data on text, thinking and tool call blocks.
+	State *ProviderState `json:"state,omitempty"`
+}
+
+// ProviderState is data a provider attached to a block it produced so the
+// block can be sent back to it: a reasoning signature, encrypted reasoning or
+// an item id. Persist it with the message and never interpret it; only the
+// provider that produced it reads it. Thinking whose text was changed must
+// drop it, as signatures cover the text.
+type ProviderState struct {
+	Provider string          `json:"provider"`
+	Model    string          `json:"model,omitempty"`
+	Data     json.RawMessage `json:"data"`
 }
 
 // ImageData holds image content as base64 data or a URL.

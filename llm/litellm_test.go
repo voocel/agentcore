@@ -5,12 +5,15 @@ import (
 	"encoding/json"
 	"io"
 	"net/http"
+	"reflect"
+	"slices"
 	"strings"
 	"testing"
 
 	"github.com/voocel/agentcore"
 	"github.com/voocel/litellm"
-	"github.com/voocel/litellm/provider/compat"
+	"github.com/voocel/litellm/provider/deepseek"
+	"github.com/voocel/litellm/provider/mimo"
 )
 
 type captureProvider struct {
@@ -48,7 +51,9 @@ func (p *captureStreamProvider) Stream(_ context.Context, req *litellm.Request) 
 	events := p.events
 	if len(events) == 0 {
 		events = []litellm.Event{
-			litellm.ContentDelta{Text: "ok"},
+			litellm.BlockStart{Block: litellm.TextBlock{}},
+			litellm.TextDelta{Text: "ok"},
+			litellm.BlockEnd{},
 			litellm.DoneEvent{FinishReason: litellm.FinishReasonStop, Provider: "capture", Model: req.Model},
 		}
 	}
@@ -151,7 +156,7 @@ func TestGenerateNormalizesMalformedToolArgumentsFromModel(t *testing.T) {
 	}
 }
 
-func TestGeneratePreservesRefusalMetadata(t *testing.T) {
+func TestGenerateReportsRefusalAsSafety(t *testing.T) {
 	provider := &captureProvider{}
 	provider.chatFunc = func(context.Context, *litellm.Request) (*litellm.Response, error) {
 		return &litellm.Response{
@@ -159,7 +164,6 @@ func TestGeneratePreservesRefusalMetadata(t *testing.T) {
 			Model:           "m",
 			FinishReason:    litellm.FinishReasonSafety,
 			FinishReasonRaw: "content_filter",
-			Refusal:         "I can't help.",
 			Blocks:          []litellm.Block{litellm.Text("I can't help.")},
 		}, nil
 	}
@@ -171,7 +175,7 @@ func TestGeneratePreservesRefusalMetadata(t *testing.T) {
 	if resp.Message.StopReason != agentcore.StopReasonSafety || resp.Message.TextContent() != "I can't help." {
 		t.Fatalf("stop/text = %q/%q", resp.Message.StopReason, resp.Message.TextContent())
 	}
-	if resp.Message.Metadata["refusal"] != "I can't help." || resp.Message.Metadata["finish_reason_raw"] != "content_filter" {
+	if resp.Message.Metadata["finish_reason_raw"] != "content_filter" {
 		t.Fatalf("metadata = %#v", resp.Message.Metadata)
 	}
 }
@@ -190,100 +194,42 @@ type capabilityProvider struct {
 	caps litellm.Capabilities
 }
 
-func (p *capabilityProvider) Capabilities(string) litellm.Capabilities {
-	return p.caps
-}
+func (p *capabilityProvider) Capabilities() litellm.Capabilities { return p.caps }
 
 func TestLiteLLMAdapterCapabilities(t *testing.T) {
-	provider := &capabilityProvider{
-		caps: litellm.Capabilities{
-			Provider: "capture",
-			Model:    "m",
-			Thinking: litellm.ThinkingCapabilities{
-				Supported:     litellm.SupportYes,
-				Disable:       litellm.SupportYes,
-				Efforts:       []string{"minimal", "high", "max", "vendor-only"},
-				BudgetTokens:  litellm.SupportPartial,
-				IncludeOutput: litellm.SupportYes,
-				Notes:         []string{"budget varies by model"},
-			},
-			Tools: litellm.ToolCapabilities{
-				Calls:               litellm.SupportYes,
-				ParallelCalls:       litellm.SupportPartial,
-				StrictSchema:        litellm.SupportYes,
-				Choice:              litellm.SupportNo,
-				MultimodalResults:   litellm.SupportUnknown,
-				RequiresAdjacency:   true,
-				RoundTripSignatures: litellm.SupportYes,
-				HostedProviderTools: litellm.SupportPartial,
-			},
-			Structured: litellm.StructuredCapabilities{
-				JSONObject: litellm.SupportYes,
-				JSONSchema: litellm.SupportYes,
-				Strict:     litellm.SupportPartial,
-				PromptOnly: true,
-			},
-			Streaming: litellm.StreamingCapabilities{
-				Supported:       litellm.SupportYes,
-				Usage:           litellm.SupportPartial,
-				ReasoningDeltas: litellm.SupportYes,
-				ToolCallDeltas:  litellm.SupportYes,
-				NativeResponses: litellm.SupportNo,
-				IdleTimeout:     litellm.SupportYes,
-			},
-			Usage: litellm.UsageCapabilities{
-				InputTokens:      litellm.SupportYes,
-				OutputTokens:     litellm.SupportYes,
-				TotalTokens:      litellm.SupportYes,
-				ReasoningTokens:  litellm.SupportPartial,
-				CacheReadTokens:  litellm.SupportYes,
-				CacheWriteTokens: litellm.SupportNo,
-			},
-		},
+	tests := []struct {
+		name string
+		caps litellm.Capabilities
+		want []agentcore.ThinkingLevel
+	}{
+		{"no thinking", litellm.Capabilities{}, []agentcore.ThinkingLevel{ThinkingAuto}},
+		{"switch only", litellm.Capabilities{Thinking: true, DisableThinking: true}, []agentcore.ThinkingLevel{ThinkingAuto, agentcore.ThinkingOff}},
+		{"effort without disable", litellm.Capabilities{Thinking: true, ThinkingEffort: true}, append([]agentcore.ThinkingLevel{ThinkingAuto}, ThinkingLevelOrder[1:]...)},
+		{"all", litellm.Capabilities{Thinking: true, DisableThinking: true, ThinkingEffort: true}, append([]agentcore.ThinkingLevel{ThinkingAuto}, ThinkingLevelOrder...)},
 	}
-	model := NewLiteLLMAdapter("m", mustClient(t, provider))
-	caps := model.Capabilities()
-
-	if caps.Provider != "capture" || caps.Model != "m" {
-		t.Fatalf("identity = %s/%s, want capture/m", caps.Provider, caps.Model)
-	}
-	if !caps.ProviderBaseline {
-		t.Fatal("litellm capabilities must be marked as a provider baseline")
-	}
-	if caps.Thinking.Supported != SupportYes || caps.Thinking.Disable != SupportYes {
-		t.Fatalf("thinking support = %+v", caps.Thinking)
-	}
-	if !caps.Thinking.SupportsEffort(agentcore.ThinkingMinimal) || !caps.Thinking.SupportsEffort(agentcore.ThinkingMax) {
-		t.Fatalf("thinking efforts = %#v", caps.Thinking.Efforts)
-	}
-	if caps.Thinking.SupportsEffort(agentcore.ThinkingLevel("vendor-only")) {
-		t.Fatalf("vendor-only effort leaked into agentcore capabilities: %#v", caps.Thinking.Efforts)
-	}
-	if caps.Tools.StrictSchema != SupportYes || !caps.Tools.RequiresAdjacency {
-		t.Fatalf("tool capabilities = %+v", caps.Tools)
-	}
-	if caps.Structured.JSONSchema != SupportYes || caps.Structured.Strict != SupportPartial || !caps.Structured.PromptOnly {
-		t.Fatalf("structured capabilities = %+v", caps.Structured)
-	}
-	if caps.Streaming.Usage != SupportPartial || caps.Streaming.IdleTimeout != SupportYes {
-		t.Fatalf("streaming capabilities = %+v", caps.Streaming)
-	}
-	if caps.Usage.CacheReadTokens != SupportYes || caps.Usage.CacheWriteTokens != SupportNo {
-		t.Fatalf("usage capabilities = %+v", caps.Usage)
-	}
-	if len(caps.Thinking.Notes) != 1 || caps.Thinking.Notes[0] != "budget varies by model" {
-		t.Fatalf("thinking notes = %#v", caps.Thinking.Notes)
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			tt.caps.ProviderOptions = []string{"prompt_cache_key"}
+			model := NewLiteLLMAdapter("m", mustClient(t, &capabilityProvider{caps: tt.caps}))
+			caps, ok := model.Capabilities()
+			if !ok || caps.Thinking != tt.caps.Thinking || caps.ThinkingEffort != tt.caps.ThinkingEffort || !slices.Equal(caps.ProviderOptions, tt.caps.ProviderOptions) {
+				t.Fatalf("caps = %+v, %v", caps, ok)
+			}
+			if got := ThinkingPolicyFor(model).Available; !slices.Equal(got, tt.want) {
+				t.Fatalf("thinking levels = %v, want %v", got, tt.want)
+			}
+		})
 	}
 }
 
-func TestLiteLLMAdapterCapabilitiesFallback(t *testing.T) {
+// A provider that declares nothing leaves every level to the vendor.
+func TestLiteLLMAdapterCapabilitiesUnknown(t *testing.T) {
 	model := NewLiteLLMAdapter("m", mustClient(t, &captureProvider{}))
-	caps := model.Capabilities()
-	if caps.Provider != "capture" || caps.Model != "m" {
-		t.Fatalf("identity = %s/%s, want capture/m", caps.Provider, caps.Model)
+	if _, ok := model.Capabilities(); ok {
+		t.Fatal("undeclared capabilities reported as known")
 	}
-	if caps.Thinking.Supported != SupportUnknown || caps.Tools.Calls != SupportUnknown {
-		t.Fatalf("fallback should be unknown support, got %+v / %+v", caps.Thinking, caps.Tools)
+	if got := ThinkingPolicyFor(model).Available; len(got) != len(ThinkingLevelOrder)+1 {
+		t.Fatalf("thinking levels = %v", got)
 	}
 }
 
@@ -304,7 +250,7 @@ func (f roundTripFunc) Do(req *http.Request) (*http.Response, error) { return f(
 // mimo novel_context regression: a streaming, argument-less tool call over a
 // compat provider must surface with normalized "{}" arguments, not empty (which
 // would fail json validation on the next turn). It exercises the full path —
-// compat stream emitting ToolUseStart/ToolUseDone, then this adapter finalizing
+// compat stream opening and closing the tool block, then this adapter finalizing
 // via normalizeArgs.
 func TestGenerateStreamFinalizesArglessToolCall(t *testing.T) {
 	sse := strings.Join([]string{
@@ -313,7 +259,8 @@ func TestGenerateStreamFinalizesArglessToolCall(t *testing.T) {
 		`data: [DONE]`,
 		``,
 	}, "\n")
-	provider, err := compat.New(compat.Config{
+	provider, err := mimo.New(mimo.Config{
+		APIKey:  "test",
 		BaseURL: "https://compat.test/v1",
 		HTTPClient: roundTripFunc(func(*http.Request) (*http.Response, error) {
 			return &http.Response{
@@ -322,9 +269,9 @@ func TestGenerateStreamFinalizesArglessToolCall(t *testing.T) {
 				Header:     make(http.Header),
 			}, nil
 		}),
-	}, compat.Spec{Name: "mimo"})
+	})
 	if err != nil {
-		t.Fatalf("compat.New: %v", err)
+		t.Fatalf("mimo.New: %v", err)
 	}
 	model := NewLiteLLMAdapter("mimo-v2.5", mustClient(t, provider))
 	ch, err := model.GenerateStream(context.Background(), []agentcore.Message{agentcore.UserMsg("hi")}, nil)
@@ -364,7 +311,8 @@ func TestGenerateStreamMarksMalformedToolArgumentsInvalid(t *testing.T) {
 		`data: [DONE]`,
 		``,
 	}, "\n")
-	provider, err := compat.New(compat.Config{
+	provider, err := deepseek.New(deepseek.Config{
+		APIKey:  "test",
 		BaseURL: "https://compat.test/v1",
 		HTTPClient: roundTripFunc(func(*http.Request) (*http.Response, error) {
 			return &http.Response{
@@ -373,9 +321,9 @@ func TestGenerateStreamMarksMalformedToolArgumentsInvalid(t *testing.T) {
 				Header:     make(http.Header),
 			}, nil
 		}),
-	}, compat.Spec{Name: "compat"})
+	})
 	if err != nil {
-		t.Fatalf("compat.New: %v", err)
+		t.Fatalf("deepseek.New: %v", err)
 	}
 	model := NewLiteLLMAdapter("deepseek-v4-flash-free", mustClient(t, provider))
 	ch, err := model.GenerateStream(context.Background(), []agentcore.Message{agentcore.UserMsg("hi")}, nil)
@@ -456,8 +404,9 @@ func TestGenerateStreamNormalizesMalformedHistoricalToolArguments(t *testing.T) 
 func TestGenerateStreamFinalMessageNormalizesToolArgumentsWithoutDoneEvent(t *testing.T) {
 	provider := &captureStreamProvider{
 		events: []litellm.Event{
-			litellm.ToolUseStart{ID: "call_bad", Name: "subagent"},
-			litellm.ToolUseDelta{ID: "call_bad", ArgumentsDelta: []byte(`{"agent":"writer",`)},
+			litellm.BlockStart{Block: litellm.ToolUseBlock{ID: "call_bad", Name: "subagent"}},
+			litellm.ToolUseDelta{Arguments: `{"agent":"writer",`},
+			litellm.BlockEnd{},
 			litellm.DoneEvent{FinishReason: litellm.FinishReasonToolCall, Provider: "capture", Model: "m"},
 		},
 	}
@@ -492,10 +441,12 @@ func TestGenerateStreamFinalMessageNormalizesToolArgumentsWithoutDoneEvent(t *te
 	}
 }
 
-func TestGenerateStreamPreservesRefusal(t *testing.T) {
+func TestGenerateStreamReportsRefusalAsSafety(t *testing.T) {
 	provider := &captureStreamProvider{events: []litellm.Event{
-		litellm.RefusalDelta{Text: "I can't help."},
-		litellm.DoneEvent{FinishReason: litellm.FinishReasonStop, FinishReasonRaw: "completed", Provider: "capture", Model: "m"},
+		litellm.BlockStart{Block: litellm.TextBlock{}},
+		litellm.TextDelta{Text: "I can't help."},
+		litellm.BlockEnd{},
+		litellm.DoneEvent{FinishReason: litellm.FinishReasonSafety, FinishReasonRaw: "completed", Provider: "capture", Model: "m"},
 	}}
 	model := NewLiteLLMAdapter("m", mustClient(t, provider))
 	ch, err := model.GenerateStream(context.Background(), []agentcore.Message{agentcore.UserMsg("hi")}, nil)
@@ -514,7 +465,7 @@ func TestGenerateStreamPreservesRefusal(t *testing.T) {
 	if final.StopReason != agentcore.StopReasonSafety || final.TextContent() != "I can't help." {
 		t.Fatalf("stop/text = %q/%q", final.StopReason, final.TextContent())
 	}
-	if final.Metadata["refusal"] != "I can't help." || final.Metadata["finish_reason_raw"] != "completed" {
+	if final.Metadata["finish_reason_raw"] != "completed" {
 		t.Fatalf("metadata = %#v", final.Metadata)
 	}
 }
@@ -531,7 +482,8 @@ func TestGenerateStreamAttributesInterleavedToolCallDeltas(t *testing.T) {
 		`data: [DONE]`,
 		``,
 	}, "\n")
-	provider, err := compat.New(compat.Config{
+	provider, err := mimo.New(mimo.Config{
+		APIKey:  "test",
 		BaseURL: "https://compat.test/v1",
 		HTTPClient: roundTripFunc(func(*http.Request) (*http.Response, error) {
 			return &http.Response{
@@ -540,9 +492,9 @@ func TestGenerateStreamAttributesInterleavedToolCallDeltas(t *testing.T) {
 				Header:     make(http.Header),
 			}, nil
 		}),
-	}, compat.Spec{Name: "mimo"})
+	})
 	if err != nil {
-		t.Fatalf("compat.New: %v", err)
+		t.Fatalf("mimo.New: %v", err)
 	}
 	model := NewLiteLLMAdapter("mimo-v2.5", mustClient(t, provider))
 	ch, err := model.GenerateStream(context.Background(), []agentcore.Message{agentcore.UserMsg("hi")}, nil)
@@ -572,5 +524,90 @@ func TestGenerateStreamAttributesInterleavedToolCallDeltas(t *testing.T) {
 		if got[i] != want[i] {
 			t.Fatalf("delta %d = %+v, want %+v", i, got[i], want[i])
 		}
+	}
+}
+
+// Streamed content matches Generate's conversion: one content block per
+// litellm block, in order, with replay state.
+func TestGenerateStreamMatchesResponseContent(t *testing.T) {
+	redacted := &litellm.ProviderState{Provider: "capture", Data: json.RawMessage(`{"data":"x"}`)}
+	signed := &litellm.ProviderState{Provider: "capture", Data: json.RawMessage(`{"signature":"sig"}`)}
+	events := []litellm.Event{
+		litellm.BlockStart{Index: 0, Block: litellm.ReasoningBlock{}},
+		litellm.BlockStart{Index: 1, Block: litellm.ReasoningBlock{}},
+		litellm.ReasoningDelta{Index: 1, Text: "plan"},
+		litellm.BlockStart{Index: 2, Block: litellm.TextBlock{Text: "a"}},
+		litellm.TextDelta{Index: 2, Text: "b"},
+		litellm.BlockEnd{Index: 0, Block: litellm.ReasoningBlock{State: redacted}},
+		litellm.BlockStart{Index: 3, Block: litellm.ToolUseBlock{ID: "call_1", Name: "f", State: signed}},
+		litellm.ToolUseDelta{Index: 3, Arguments: `{"q":1}`},
+		litellm.BlockEnd{Index: 1},
+		litellm.BlockEnd{Index: 2},
+		litellm.BlockEnd{Index: 3},
+		litellm.DoneEvent{FinishReason: litellm.FinishReasonToolCall, Provider: "capture", Model: "m"},
+	}
+	model := NewLiteLLMAdapter("m", mustClient(t, &captureStreamProvider{events: events}))
+	ch, err := model.GenerateStream(context.Background(), []agentcore.Message{agentcore.UserMsg("hi")}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var final agentcore.Message
+	var ends []agentcore.StreamEventType
+	for ev := range ch {
+		switch ev.Type {
+		case agentcore.StreamEventError:
+			t.Fatal(ev.Err)
+		case agentcore.StreamEventThinkingEnd, agentcore.StreamEventTextEnd, agentcore.StreamEventToolCallEnd:
+			ends = append(ends, ev.Type)
+		case agentcore.StreamEventDone:
+			final = ev.Message
+		}
+	}
+	want := convertResponseContent(&litellm.Response{Blocks: []litellm.Block{
+		litellm.ReasoningBlock{State: redacted},
+		litellm.ReasoningBlock{Text: "plan"},
+		litellm.TextBlock{Text: "ab"},
+		litellm.ToolUseBlock{ID: "call_1", Name: "f", Arguments: json.RawMessage(`{"q":1}`), State: signed},
+	}})
+	got, _ := json.Marshal(final.Content)
+	wantJSON, _ := json.Marshal(want)
+	if string(got) != string(wantJSON) || final.StopReason != agentcore.StopReasonToolUse {
+		t.Fatalf("content = %s\nwant %s", got, wantJSON)
+	}
+	if !slices.Equal(ends, []agentcore.StreamEventType{agentcore.StreamEventThinkingEnd, agentcore.StreamEventThinkingEnd, agentcore.StreamEventTextEnd, agentcore.StreamEventToolCallEnd}) {
+		t.Fatalf("end events = %v", ends)
+	}
+}
+
+func TestWithDefaultHeaderKeepsExplicitHeader(t *testing.T) {
+	if got := withDefaultHeader(nil, "anthropic-beta", "b"); got["anthropic-beta"] != "b" {
+		t.Fatalf("headers = %v", got)
+	}
+	explicit := map[string]string{"Anthropic-Beta": "user"}
+	if got := withDefaultHeader(explicit, "anthropic-beta", "b"); len(got) != 1 || got["Anthropic-Beta"] != "user" {
+		t.Fatalf("headers = %v", got)
+	}
+}
+
+// Replay state survives persistence and reaches the provider unchanged.
+func TestProviderStateRoundTrip(t *testing.T) {
+	state := func(data string) *litellm.ProviderState {
+		return &litellm.ProviderState{Provider: "p", Model: "m", Data: json.RawMessage(data)}
+	}
+	blocks := []litellm.Block{
+		litellm.ReasoningBlock{State: state(`{"type":"redacted_thinking","data":"x"}`)},
+		litellm.TextBlock{Text: "a", State: state(`{"id":"msg_1"}`)},
+		litellm.ToolUseBlock{ID: "call_1", Name: "f", Arguments: json.RawMessage(`{}`), State: state(`{"thoughtSignature":"s"}`)},
+	}
+	data, err := json.Marshal(convertResponse(&litellm.Response{Blocks: blocks}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var restored agentcore.Message
+	if err := json.Unmarshal(data, &restored); err != nil {
+		t.Fatal(err)
+	}
+	if got := convertMessages([]agentcore.Message{restored}); len(got) != 1 || !reflect.DeepEqual(got[0].Blocks, blocks) {
+		t.Fatalf("replayed %#v\nwant %#v", got, blocks)
 	}
 }
