@@ -140,10 +140,10 @@ func (c *Cost) Add(other *Cost) {
 // Usage tracks token consumption for a single LLM call.
 //
 // Field semantics:
-//   - Input: prompt tokens sent to the model (includes cached tokens for some providers)
+//   - Input: all prompt tokens sent to the model, cache reads and writes included
 //   - Output: completion tokens generated (includes reasoning tokens if applicable)
-//   - CacheRead: tokens served from prompt cache (Anthropic: cache_read_input_tokens)
-//   - CacheWrite: tokens written to prompt cache (Anthropic: cache_creation_input_tokens)
+//   - CacheRead: the part of Input served from prompt cache
+//   - CacheWrite: the part of Input written to prompt cache
 //   - TotalTokens: provider-reported total, typically Input + Output
 //   - Provider/Model: actual provider/model that produced this call, if reported
 //   - Cost: monetary cost computed from model pricing (nil if pricing unavailable)

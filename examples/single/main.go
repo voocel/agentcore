@@ -8,6 +8,7 @@ import (
 	"github.com/voocel/agentcore"
 	"github.com/voocel/agentcore/llm"
 	"github.com/voocel/agentcore/tools"
+	"github.com/voocel/litellm/providers"
 )
 
 func main() {
@@ -17,7 +18,7 @@ func main() {
 		os.Exit(1)
 	}
 
-	model, err := llm.NewModel("openai", "gpt-5-mini", llm.WithAPIKey(apiKey))
+	model, err := llm.NewModel("openai", "gpt-5-mini", providers.Config{APIKey: apiKey})
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "model error: %v\n", err)
 		os.Exit(1)

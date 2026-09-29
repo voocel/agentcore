@@ -6,8 +6,8 @@ package proxy
 
 import (
 	"context"
-	"encoding/json"
 	"errors"
+	"fmt"
 	"time"
 
 	"github.com/voocel/agentcore"
@@ -21,18 +21,26 @@ const (
 	FrameThinkingDelta FrameType = "thinking_delta"
 	FrameToolCallStart FrameType = "toolcall_start"
 	FrameToolCallDelta FrameType = "toolcall_delta"
+	FrameBlockEnd      FrameType = "block_end"
 	FrameDone          FrameType = "done"
 	FrameError         FrameType = "error"
 )
 
 // Frame is a single bandwidth-optimized event from a remote proxy server.
+//
+// Content frames address a content block of the message by Index: a text or
+// thinking delta for the next index opens that block, as FrameToolCallStart
+// opens a tool call, and FrameBlockEnd closes a block with the provider replay
+// state the server received for it. Blocks may interleave.
 type Frame struct {
-	Type       FrameType            `json:"type"`
-	Delta      string               `json:"delta,omitempty"`
-	ToolCallID string               `json:"tool_call_id,omitempty"`
-	ToolName   string               `json:"tool_name,omitempty"`
-	StopReason agentcore.StopReason `json:"stop_reason,omitempty"`
-	Usage      *agentcore.Usage     `json:"usage,omitempty"`
+	Type       FrameType                `json:"type"`
+	Index      int                      `json:"index,omitempty"`
+	Delta      string                   `json:"delta,omitempty"`
+	ToolCallID string                   `json:"tool_call_id,omitempty"`
+	ToolName   string                   `json:"tool_name,omitempty"`
+	State      *agentcore.ProviderState `json:"state,omitempty"`
+	StopReason agentcore.StopReason     `json:"stop_reason,omitempty"`
+	Usage      *agentcore.Usage         `json:"usage,omitempty"`
 	// Error carries a FrameError message. It is a string (not error) so it
 	// survives the JSON wire round-trip — the whole point of this adapter.
 	Error string `json:"error,omitempty"`
@@ -86,57 +94,14 @@ func (p *Model) GenerateStream(ctx context.Context, messages []agentcore.Message
 	out := make(chan agentcore.StreamEvent, 100)
 	go func() {
 		defer close(out)
-
-		var (
-			partial      = agentcore.Message{Role: agentcore.RoleAssistant}
-			textStarted  bool
-			thinkStarted bool
-		)
-
+		a := &assembler{msg: agentcore.Message{Role: agentcore.RoleAssistant}, out: out}
 		for fr := range frames {
 			switch fr.Type {
-			case FrameTextDelta:
-				idx := findOrCreate(&partial.Content, agentcore.ContentText)
-				partial.Content[idx].Text += fr.Delta
-				if !textStarted {
-					textStarted = true
-					out <- agentcore.StreamEvent{Type: agentcore.StreamEventTextStart, ContentIndex: idx, Message: partial}
-				}
-				out <- agentcore.StreamEvent{Type: agentcore.StreamEventTextDelta, ContentIndex: idx, Delta: fr.Delta, Message: partial}
-
-			case FrameThinkingDelta:
-				idx := findOrCreate(&partial.Content, agentcore.ContentThinking)
-				partial.Content[idx].Thinking += fr.Delta
-				if !thinkStarted {
-					thinkStarted = true
-					out <- agentcore.StreamEvent{Type: agentcore.StreamEventThinkingStart, ContentIndex: idx, Message: partial}
-				}
-				out <- agentcore.StreamEvent{Type: agentcore.StreamEventThinkingDelta, ContentIndex: idx, Delta: fr.Delta, Message: partial}
-
-			case FrameToolCallStart:
-				partial.Content = append(partial.Content, agentcore.ToolCallBlock(agentcore.ToolCall{
-					ID:   fr.ToolCallID,
-					Name: fr.ToolName,
-				}))
-				out <- agentcore.StreamEvent{Type: agentcore.StreamEventToolCallStart, ToolID: fr.ToolCallID, Message: partial}
-
-			case FrameToolCallDelta:
-				callID := fr.ToolCallID
-				if idx := lastToolCall(partial.Content); idx >= 0 && partial.Content[idx].ToolCall != nil {
-					partial.Content[idx].ToolCall.Args = append(partial.Content[idx].ToolCall.Args, json.RawMessage(fr.Delta)...)
-					// delta frames may omit the ID: resolve from the block
-					if callID == "" {
-						callID = partial.Content[idx].ToolCall.ID
-					}
-				}
-				out <- agentcore.StreamEvent{Type: agentcore.StreamEventToolCallDelta, ToolID: callID, Delta: fr.Delta, Message: partial}
-
 			case FrameDone:
-				partial.StopReason = fr.StopReason
-				partial.Usage = fr.Usage
-				partial.Timestamp = time.Now()
-				out <- agentcore.StreamEvent{Type: agentcore.StreamEventDone, Message: partial, StopReason: fr.StopReason}
-
+				a.msg.StopReason = fr.StopReason
+				a.msg.Usage = fr.Usage
+				a.msg.Timestamp = time.Now()
+				a.emit(agentcore.StreamEvent{Type: agentcore.StreamEventDone, StopReason: fr.StopReason})
 			case FrameError:
 				msg := fr.Error
 				if msg == "" {
@@ -144,6 +109,11 @@ func (p *Model) GenerateStream(ctx context.Context, messages []agentcore.Message
 				}
 				out <- agentcore.StreamEvent{Type: agentcore.StreamEventError, Err: errors.New(msg)}
 				return
+			default:
+				if err := a.apply(fr); err != nil {
+					out <- agentcore.StreamEvent{Type: agentcore.StreamEventError, Err: err}
+					return
+				}
 			}
 		}
 	}()
@@ -154,29 +124,92 @@ func (p *Model) GenerateStream(ctx context.Context, messages []agentcore.Message
 // SupportsTools reports that the proxy can handle tool calls.
 func (p *Model) SupportsTools() bool { return true }
 
-// findOrCreate returns the index of the last block of the given type, or
-// appends a new empty block and returns its index.
-func findOrCreate(blocks *[]agentcore.ContentBlock, ct agentcore.ContentType) int {
-	for i := len(*blocks) - 1; i >= 0; i-- {
-		if (*blocks)[i].Type == ct {
-			return i
-		}
-	}
-	switch ct {
-	case agentcore.ContentText:
-		*blocks = append(*blocks, agentcore.TextBlock(""))
-	case agentcore.ContentThinking:
-		*blocks = append(*blocks, agentcore.ThinkingBlock(""))
-	}
-	return len(*blocks) - 1
+// assembler rebuilds the streamed message from content frames.
+type assembler struct {
+	msg agentcore.Message
+	out chan<- agentcore.StreamEvent
 }
 
-// lastToolCall returns the index of the last tool call block, or -1.
-func lastToolCall(blocks []agentcore.ContentBlock) int {
-	for i := len(blocks) - 1; i >= 0; i-- {
-		if blocks[i].Type == agentcore.ContentToolCall {
-			return i
+func (a *assembler) emit(ev agentcore.StreamEvent) {
+	ev.Message = a.msg
+	a.out <- ev
+}
+
+func (a *assembler) apply(fr Frame) error {
+	next := len(a.msg.Content)
+	switch fr.Type {
+	case FrameTextDelta:
+		if fr.Index == next {
+			a.open(agentcore.TextBlock(""), agentcore.StreamEventTextStart)
 		}
+		block, err := a.block(fr.Index, agentcore.ContentText)
+		if err != nil {
+			return err
+		}
+		block.Text += fr.Delta
+		a.emit(agentcore.StreamEvent{Type: agentcore.StreamEventTextDelta, ContentIndex: fr.Index, Delta: fr.Delta})
+
+	case FrameThinkingDelta:
+		if fr.Index == next {
+			a.open(agentcore.ThinkingBlock(""), agentcore.StreamEventThinkingStart)
+		}
+		block, err := a.block(fr.Index, agentcore.ContentThinking)
+		if err != nil {
+			return err
+		}
+		block.Thinking += fr.Delta
+		a.emit(agentcore.StreamEvent{Type: agentcore.StreamEventThinkingDelta, ContentIndex: fr.Index, Delta: fr.Delta})
+
+	case FrameToolCallStart:
+		if fr.Index != next {
+			return fmt.Errorf("proxy: tool call starts block %d, but the next block is %d", fr.Index, next)
+		}
+		a.open(agentcore.ToolCallBlock(agentcore.ToolCall{ID: fr.ToolCallID, Name: fr.ToolName}), agentcore.StreamEventToolCallStart)
+
+	case FrameToolCallDelta:
+		block, err := a.block(fr.Index, agentcore.ContentToolCall)
+		if err != nil {
+			return err
+		}
+		block.ToolCall.Args = append(block.ToolCall.Args, fr.Delta...)
+		a.emit(agentcore.StreamEvent{Type: agentcore.StreamEventToolCallDelta, ToolID: block.ToolCall.ID, ContentIndex: fr.Index, Delta: fr.Delta})
+
+	case FrameBlockEnd:
+		if fr.Index < 0 || fr.Index >= next {
+			return fmt.Errorf("proxy: block %d ends before it starts", fr.Index)
+		}
+		block := &a.msg.Content[fr.Index]
+		block.State = fr.State
+		ev := agentcore.StreamEvent{ContentIndex: fr.Index}
+		switch block.Type {
+		case agentcore.ContentText:
+			ev.Type = agentcore.StreamEventTextEnd
+		case agentcore.ContentThinking:
+			ev.Type = agentcore.StreamEventThinkingEnd
+		case agentcore.ContentToolCall:
+			completed := *block.ToolCall
+			ev.Type, ev.ToolID, ev.CompletedToolCall = agentcore.StreamEventToolCallEnd, completed.ID, &completed
+		}
+		a.emit(ev)
 	}
-	return -1
+	return nil
+}
+
+// open appends the next content block and emits its start event.
+func (a *assembler) open(block agentcore.ContentBlock, start agentcore.StreamEventType) {
+	a.msg.Content = append(a.msg.Content, block)
+	ev := agentcore.StreamEvent{Type: start, ContentIndex: len(a.msg.Content) - 1}
+	if block.ToolCall != nil {
+		ev.ToolID = block.ToolCall.ID
+	}
+	a.emit(ev)
+}
+
+// block returns content block i. Frames come from a remote server, so one
+// that addresses a missing block or changes a block's type fails the stream.
+func (a *assembler) block(i int, ct agentcore.ContentType) (*agentcore.ContentBlock, error) {
+	if i < 0 || i >= len(a.msg.Content) || a.msg.Content[i].Type != ct {
+		return nil, fmt.Errorf("proxy: frame addresses block %d as %s", i, ct)
+	}
+	return &a.msg.Content[i], nil
 }

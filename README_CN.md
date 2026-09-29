@@ -53,10 +53,11 @@ import (
     "github.com/voocel/agentcore"
     "github.com/voocel/agentcore/llm"
     "github.com/voocel/agentcore/tools"
+    "github.com/voocel/litellm/providers"
 )
 
 func main() {
-    model, err := llm.NewModel("openai", "gpt-5-mini", llm.WithAPIKey(os.Getenv("OPENAI_API_KEY")))
+    model, err := llm.NewModel("openai", "gpt-5-mini", providers.Config{APIKey: os.Getenv("OPENAI_API_KEY")})
     if err != nil {
         panic(err)
     }
@@ -105,22 +106,17 @@ agent := agentcore.NewAgent(
 
 可选的 `agentcore/permission` 子包提供更完整的决策引擎（模式、规则、文件系统根、审计）。几行 wrapper 即可适配为 `ToolGate`。
 
-### Provider 级配置
+### 模型配置
 
-`llm.WithExtra` 会并入每次请求的 body；需要设置 HTTP 头、`User-Agent` 或 provider 客户端选项时，使用 `llm.WithProviderExtra`：
+`llm.NewModel` 按 `providers.Names()` 中的名字构造 provider，连接设置放在 litellm 的 `providers.Config`。`llm.WithMaxTokens`、`llm.WithTemperature` 等请求默认值只在设置时发送，否则沿用厂商默认；Anthropic 必须设置 `llm.WithMaxTokens`。`llm.WithExtra` 设置 provider options，即每次请求 body 的顶层字段。litellm 的 `catalog` 包提供已收录模型的上下文窗口、输出上限和价格，可用于 `llm.WithMaxTokens` 和 `llm.WithPricing`：
 
 ```go
-model, err := llm.NewModel("anthropic", "claude-sonnet-4",
-    llm.WithAPIKey(apiKey),
-    llm.WithBaseURL(baseURL),
-    llm.WithProviderExtra(map[string]any{
-        "user_agent": "my-client/1.0",
-        "anthropic_beta": "beta-name",
-        "headers": map[string]string{
-            "X-Custom-Client": "my-client",
-        },
-    }),
-)
+model, err := llm.NewModel("anthropic", "claude-sonnet-4", providers.Config{
+    APIKey:    apiKey,
+    BaseURL:   baseURL,
+    UserAgent: "my-client/1.0",
+    Headers:   map[string]string{"anthropic-beta": "beta-name"},
+}, llm.WithMaxTokens(8192))
 ```
 
 ### 多 Agent（SubAgent 工具）
@@ -133,9 +129,10 @@ import (
     "github.com/voocel/agentcore/llm"
     "github.com/voocel/agentcore/subagent"
     "github.com/voocel/agentcore/tools"
+    "github.com/voocel/litellm/providers"
 )
 
-model, _ := llm.NewModel("openai", "gpt-5-mini", llm.WithAPIKey(apiKey))
+model, _ := llm.NewModel("openai", "gpt-5-mini", providers.Config{APIKey: apiKey})
 
 // 每个子 Agent 独立的 FileReadState — 各自有独立的 read 历史。
 scoutState := tools.NewFileReadState()
@@ -268,12 +265,12 @@ agent.Subscribe(func(ev agentcore.Event) {
 如果需要运行时换模型，可以用 `SwappableModel` 包一层。切换会在下一次调用生效。`subagent.Config.Model` 会在每次子 Agent 运行开始时重新解引用，所以同一个包装器对主 Agent 和子 Agent 都生效。
 
 ```go
-defaultModel, _ := llm.NewModel("openai", "gpt-5-mini", llm.WithAPIKey(apiKey))
+defaultModel, _ := llm.NewModel("openai", "gpt-5-mini", providers.Config{APIKey: apiKey})
 sw := agentcore.NewSwappableModel(defaultModel)
 
 agent := agentcore.NewAgent(agentcore.WithModel(sw))
 
-nextModel, _ := llm.NewModel("openai", "gpt-5", llm.WithAPIKey(apiKey))
+nextModel, _ := llm.NewModel("openai", "gpt-5", providers.Config{APIKey: apiKey})
 sw.Swap(nextModel) // 下一轮开始使用新模型
 ```
 

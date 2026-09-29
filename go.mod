@@ -1,8 +1,8 @@
 module github.com/voocel/agentcore
 
-go 1.25.0
+go 1.26
 
 require (
-	github.com/voocel/litellm v1.8.10
+	github.com/voocel/litellm v1.9.1
 	golang.org/x/image v0.45.0
 )

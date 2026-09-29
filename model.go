@@ -185,7 +185,7 @@ type CallConfig struct {
 	SessionID      string // provider session caching identifier
 	PromptCacheKey string // prompt-cache routing identity, empty = no hint
 	MaxTokens      int    // per-call max tokens override, 0 = use model default
-	ToolChoice     any    // portable: "auto", "required", "none"; objects are provider-specific
+	ToolChoice     any    // portable: "auto", "required", "none"; adapters may accept their own values
 	ResponseFormat *ResponseFormat
 }
 
@@ -228,7 +228,8 @@ func WithThinking(level ThinkingLevel) CallOption {
 	return func(c *CallConfig) { c.ThinkingLevel = NormalizeThinkingLevel(level) }
 }
 
-// WithThinkingBudget sets the max thinking tokens for a single LLM call.
+// WithThinkingBudget sets the max thinking tokens for a single LLM call. At
+// the auto level, a budget alone requests thinking.
 func WithThinkingBudget(tokens int) CallOption {
 	return func(c *CallConfig) { c.ThinkingBudget = tokens }
 }
@@ -257,7 +258,8 @@ func WithMaxTokens(tokens int) CallOption {
 	return func(c *CallConfig) { c.MaxTokens = tokens }
 }
 
-// WithToolChoice sets "auto", "required", "none", or a provider-specific object.
+// WithToolChoice sets "auto", "required" or "none"; model adapters may accept
+// their own values, such as a named tool.
 func WithToolChoice(choice any) CallOption {
 	return func(c *CallConfig) { c.ToolChoice = choice }
 }

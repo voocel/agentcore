@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"io"
+	"maps"
 	"net/http"
 	"reflect"
 	"slices"
@@ -12,8 +13,10 @@ import (
 
 	"github.com/voocel/agentcore"
 	"github.com/voocel/litellm"
+	"github.com/voocel/litellm/catalog"
 	"github.com/voocel/litellm/provider/deepseek"
 	"github.com/voocel/litellm/provider/mimo"
+	"github.com/voocel/litellm/providers"
 )
 
 type captureProvider struct {
@@ -77,40 +80,157 @@ func (s *staticStream) Next() (litellm.Event, error) {
 
 func (s *staticStream) Close() error { return nil }
 
-func TestLiteLLMAdapterOmitsDefaultTemperature(t *testing.T) {
+// Unset defaults leave the vendor's; set ones reach every request, and a
+// per-call cap overrides the model's.
+func TestRequestDefaults(t *testing.T) {
+	msgs := []agentcore.Message{agentcore.UserMsg("hi")}
+
 	provider := &captureProvider{}
-	model := NewLiteLLMAdapter("m", mustClient(t, provider))
-	_, err := model.Generate(context.Background(), []agentcore.Message{agentcore.UserMsg("hi")}, nil)
-	if err != nil {
-		t.Fatalf("Generate: %v", err)
+	if _, err := mustModel(t, "m", provider).Generate(context.Background(), msgs, nil); err != nil {
+		t.Fatal(err)
 	}
-	if provider.lastReq == nil {
-		t.Fatal("provider was not called")
+	if r := provider.lastReq; r.MaxTokens != nil || r.Temperature != nil || r.TopP != nil || r.Stop != nil || len(r.ProviderOptions) != 0 {
+		t.Fatalf("unset defaults were sent: %+v", r)
 	}
-	if provider.lastReq.Temperature != nil {
-		t.Fatalf("default temperature should be omitted, got %v", *provider.lastReq.Temperature)
+
+	provider = &captureProvider{}
+	model := mustModel(t, "m", provider,
+		WithMaxTokens(1024), WithTemperature(0.2), WithTopP(0.9), WithStop("END"),
+		WithExtra(map[string]any{"min_p": 0.1}))
+	if _, err := model.Generate(context.Background(), msgs, nil); err != nil {
+		t.Fatal(err)
+	}
+	r := provider.lastReq
+	if *r.MaxTokens != 1024 || *r.Temperature != 0.2 || *r.TopP != 0.9 || !slices.Equal(r.Stop, []string{"END"}) || string(r.ProviderOptions["min_p"]) != "0.1" {
+		t.Fatalf("defaults not sent: %+v", r)
+	}
+
+	if _, err := model.Generate(context.Background(), msgs, nil, agentcore.WithMaxTokens(64)); err != nil {
+		t.Fatal(err)
+	}
+	if *provider.lastReq.MaxTokens != 64 {
+		t.Fatalf("max tokens = %d, want the per-call 64", *provider.lastReq.MaxTokens)
 	}
 }
 
-func TestLiteLLMAdapterSendsNonDefaultTemperature(t *testing.T) {
-	provider := &captureProvider{}
-	model := NewLiteLLMAdapter("m", mustClient(t, provider))
-	model.GetConfig().Temperature = 0.2
-	_, err := model.Generate(context.Background(), []agentcore.Message{agentcore.UserMsg("hi")}, nil)
+// Session and cache routing reach only providers that list the option;
+// strict providers would reject the unknown key.
+func TestRequestSendsHintsOnlyWhereListed(t *testing.T) {
+	call := []agentcore.CallOption{agentcore.WithCallSessionID("s"), agentcore.WithCallPromptCacheKey("k")}
+	for _, tt := range []struct {
+		name    string
+		options []string
+		want    []string
+	}{
+		{"unlisted", nil, nil},
+		{"listed", []string{"prompt_cache_key", "session_id"}, []string{"prompt_cache_key", "session_id"}},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			provider := &capabilityProvider{caps: litellm.Capabilities{ProviderOptions: tt.options}}
+			if _, err := mustModel(t, "m", provider).Generate(context.Background(), []agentcore.Message{agentcore.UserMsg("hi")}, nil, call...); err != nil {
+				t.Fatal(err)
+			}
+			if got := slices.Sorted(maps.Keys(provider.lastReq.ProviderOptions)); !slices.Equal(got, tt.want) {
+				t.Fatalf("provider options = %v, want %v", got, tt.want)
+			}
+		})
+	}
+}
+
+func TestNewLiteLLMAdapterRejectsClientOptions(t *testing.T) {
+	client, err := litellm.New(&captureProvider{})
 	if err != nil {
-		t.Fatalf("Generate: %v", err)
+		t.Fatal(err)
 	}
-	if provider.lastReq == nil || provider.lastReq.Temperature == nil {
-		t.Fatal("non-default temperature should be sent")
+	if _, err := NewLiteLLMAdapter("m", client, WithClientOptions(litellm.WithCaptureRawResponse(true))); err == nil {
+		t.Fatal("client option accepted for a prebuilt client")
 	}
-	if *provider.lastReq.Temperature != 0.2 {
-		t.Fatalf("temperature = %v, want 0.2", *provider.lastReq.Temperature)
+}
+
+func TestNewModel(t *testing.T) {
+	if _, err := NewModel("nope", "m", providers.Config{}); err == nil {
+		t.Fatal("unknown provider accepted")
+	}
+	model, err := NewModel("anthropic", "claude", providers.Config{APIKey: "k"}, WithMaxTokens(8))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if model.ProviderName() != "anthropic" || model.ModelName() != "claude" || *model.maxTokens != 8 {
+		t.Fatalf("model = %s/%s", model.ProviderName(), model.ModelName())
+	}
+}
+
+// A per-call key overrides the configured one for that call only.
+func TestNewModelPerCallAPIKey(t *testing.T) {
+	var auth []string
+	httpClient := roundTripFunc(func(req *http.Request) (*http.Response, error) {
+		auth = append(auth, req.Header.Get("Authorization"))
+		return &http.Response{StatusCode: http.StatusUnauthorized, Header: make(http.Header), Body: io.NopCloser(strings.NewReader(`{}`))}, nil
+	})
+	model, err := NewModel("compat", "m", providers.Config{APIKey: "default", BaseURL: "https://compat.test/v1", HTTPClient: httpClient})
+	if err != nil {
+		t.Fatal(err)
+	}
+	msgs := []agentcore.Message{agentcore.UserMsg("hi")}
+	_, _ = model.Generate(context.Background(), msgs, nil, agentcore.WithAPIKey("call"))
+	_, _ = model.Generate(context.Background(), msgs, nil)
+	if !slices.Equal(auth, []string{"Bearer call", "Bearer default"}) {
+		t.Fatalf("authorization = %v", auth)
+	}
+}
+
+// Usage is priced with the configured rates; InputTokens includes the cache
+// counts, so only the uncached part is billed at the input rate.
+func TestGenerateUsageAndCost(t *testing.T) {
+	provider := &captureProvider{chatFunc: func(context.Context, *litellm.Request) (*litellm.Response, error) {
+		return &litellm.Response{
+			Provider: "capture",
+			Model:    "m-2026",
+			Blocks:   []litellm.Block{litellm.Text("ok")},
+			Usage:    litellm.Usage{InputTokens: new(100), OutputTokens: new(10), TotalTokens: new(110), CacheReadTokens: new(60), CacheWriteTokens: new(30)},
+		}, nil
+	}}
+	msgs := []agentcore.Message{agentcore.UserMsg("hi")}
+
+	resp, err := mustModel(t, "m", provider).Generate(context.Background(), msgs, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	u := resp.Message.Usage
+	if u.Provider != "capture" || u.Model != "m-2026" || u.Input != 100 || u.CacheRead != 60 || u.CacheWrite != 30 || u.TotalTokens != 110 || u.Cost != nil {
+		t.Fatalf("usage = %+v", u)
+	}
+
+	price := catalog.Pricing{InputCostPerToken: 1, OutputCostPerToken: 2, CacheReadCostPerToken: new(0.5), CacheWriteCostPerToken: new(3.0)}
+	resp, err = mustModel(t, "m", provider, WithPricing(price)).Generate(context.Background(), msgs, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := agentcore.Cost{Input: 10, Output: 20, CacheRead: 30, CacheWrite: 90, Total: 150}
+	if c := resp.Message.Usage.Cost; c == nil || *c != want {
+		t.Fatalf("cost = %+v, want %+v", c, want)
+	}
+}
+
+func TestGenerateKeepsWarnings(t *testing.T) {
+	provider := &captureProvider{chatFunc: func(context.Context, *litellm.Request) (*litellm.Response, error) {
+		return &litellm.Response{
+			Blocks:   []litellm.Block{litellm.Text("{}")},
+			Warnings: []litellm.Warning{{Code: "litellm.schema_prompt", Message: "schema sent as a prompt"}},
+		}, nil
+	}}
+	resp, err := mustModel(t, "m", provider).Generate(context.Background(), []agentcore.Message{agentcore.UserMsg("hi")}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := resp.Message.Metadata["warnings"]; !reflect.DeepEqual(got, []string{"litellm.schema_prompt: schema sent as a prompt"}) {
+		t.Fatalf("warnings = %#v", got)
 	}
 }
 
 func TestLiteLLMAdapterTreatsAutoThinkingAsUnspecified(t *testing.T) {
 	provider := &captureProvider{}
-	model := NewLiteLLMAdapter("m", mustClient(t, provider))
+	model := mustModel(t, "m", provider)
 	_, err := model.Generate(context.Background(), []agentcore.Message{agentcore.UserMsg("hi")}, nil, agentcore.WithThinking("auto"))
 	if err != nil {
 		t.Fatalf("Generate: %v", err)
@@ -135,7 +255,7 @@ func TestGenerateNormalizesMalformedToolArgumentsFromModel(t *testing.T) {
 			},
 		}, nil
 	}
-	model := NewLiteLLMAdapter("m", mustClient(t, provider))
+	model := mustModel(t, "m", provider)
 
 	resp, err := model.Generate(context.Background(), []agentcore.Message{agentcore.UserMsg("hi")}, nil)
 	if err != nil {
@@ -167,7 +287,7 @@ func TestGenerateReportsRefusalAsSafety(t *testing.T) {
 			Blocks:          []litellm.Block{litellm.Text("I can't help.")},
 		}, nil
 	}
-	model := NewLiteLLMAdapter("m", mustClient(t, provider))
+	model := mustModel(t, "m", provider)
 	resp, err := model.Generate(context.Background(), []agentcore.Message{agentcore.UserMsg("hi")}, nil)
 	if err != nil {
 		t.Fatalf("Generate: %v", err)
@@ -177,15 +297,6 @@ func TestGenerateReportsRefusalAsSafety(t *testing.T) {
 	}
 	if resp.Message.Metadata["finish_reason_raw"] != "content_filter" {
 		t.Fatalf("metadata = %#v", resp.Message.Metadata)
-	}
-}
-
-func TestNewBaseModelClonesDefaultConfig(t *testing.T) {
-	a := NewBaseModel(ModelInfo{Name: "a"}, nil)
-	b := NewBaseModel(ModelInfo{Name: "b"}, nil)
-	a.GetConfig().Temperature = 0.2
-	if b.GetConfig().Temperature != DefaultGenerationConfig.Temperature {
-		t.Fatalf("default config was shared: b temperature = %v", b.GetConfig().Temperature)
 	}
 }
 
@@ -210,7 +321,7 @@ func TestLiteLLMAdapterCapabilities(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			tt.caps.ProviderOptions = []string{"prompt_cache_key"}
-			model := NewLiteLLMAdapter("m", mustClient(t, &capabilityProvider{caps: tt.caps}))
+			model := mustModel(t, "m", &capabilityProvider{caps: tt.caps})
 			caps, ok := model.Capabilities()
 			if !ok || caps.Thinking != tt.caps.Thinking || caps.ThinkingEffort != tt.caps.ThinkingEffort || !slices.Equal(caps.ProviderOptions, tt.caps.ProviderOptions) {
 				t.Fatalf("caps = %+v, %v", caps, ok)
@@ -224,7 +335,7 @@ func TestLiteLLMAdapterCapabilities(t *testing.T) {
 
 // A provider that declares nothing leaves every level to the vendor.
 func TestLiteLLMAdapterCapabilitiesUnknown(t *testing.T) {
-	model := NewLiteLLMAdapter("m", mustClient(t, &captureProvider{}))
+	model := mustModel(t, "m", &captureProvider{})
 	if _, ok := model.Capabilities(); ok {
 		t.Fatal("undeclared capabilities reported as known")
 	}
@@ -233,13 +344,17 @@ func TestLiteLLMAdapterCapabilitiesUnknown(t *testing.T) {
 	}
 }
 
-func mustClient(t *testing.T, provider litellm.Provider) *litellm.Client {
+func mustModel(t *testing.T, name string, provider litellm.Provider, opts ...ModelOption) *LiteLLMAdapter {
 	t.Helper()
 	client, err := litellm.New(provider)
 	if err != nil {
 		t.Fatalf("litellm.New: %v", err)
 	}
-	return client
+	model, err := NewLiteLLMAdapter(name, client, opts...)
+	if err != nil {
+		t.Fatalf("NewLiteLLMAdapter: %v", err)
+	}
+	return model
 }
 
 type roundTripFunc func(*http.Request) (*http.Response, error)
@@ -273,7 +388,7 @@ func TestGenerateStreamFinalizesArglessToolCall(t *testing.T) {
 	if err != nil {
 		t.Fatalf("mimo.New: %v", err)
 	}
-	model := NewLiteLLMAdapter("mimo-v2.5", mustClient(t, provider))
+	model := mustModel(t, "mimo-v2.5", provider)
 	ch, err := model.GenerateStream(context.Background(), []agentcore.Message{agentcore.UserMsg("hi")}, nil)
 	if err != nil {
 		t.Fatalf("GenerateStream: %v", err)
@@ -325,7 +440,7 @@ func TestGenerateStreamMarksMalformedToolArgumentsInvalid(t *testing.T) {
 	if err != nil {
 		t.Fatalf("deepseek.New: %v", err)
 	}
-	model := NewLiteLLMAdapter("deepseek-v4-flash-free", mustClient(t, provider))
+	model := mustModel(t, "deepseek-v4-flash-free", provider)
 	ch, err := model.GenerateStream(context.Background(), []agentcore.Message{agentcore.UserMsg("hi")}, nil)
 	if err != nil {
 		t.Fatalf("GenerateStream: %v", err)
@@ -361,7 +476,7 @@ func TestGenerateStreamMarksMalformedToolArgumentsInvalid(t *testing.T) {
 
 func TestGenerateStreamNormalizesMalformedHistoricalToolArguments(t *testing.T) {
 	provider := &captureStreamProvider{}
-	model := NewLiteLLMAdapter("m", mustClient(t, provider))
+	model := mustModel(t, "m", provider)
 	msgs := []agentcore.Message{
 		agentcore.UserMsg("hi"),
 		{
@@ -410,7 +525,7 @@ func TestGenerateStreamFinalMessageNormalizesToolArgumentsWithoutDoneEvent(t *te
 			litellm.DoneEvent{FinishReason: litellm.FinishReasonToolCall, Provider: "capture", Model: "m"},
 		},
 	}
-	model := NewLiteLLMAdapter("m", mustClient(t, provider))
+	model := mustModel(t, "m", provider)
 	ch, err := model.GenerateStream(context.Background(), []agentcore.Message{agentcore.UserMsg("hi")}, nil)
 	if err != nil {
 		t.Fatalf("GenerateStream: %v", err)
@@ -448,7 +563,7 @@ func TestGenerateStreamReportsRefusalAsSafety(t *testing.T) {
 		litellm.BlockEnd{},
 		litellm.DoneEvent{FinishReason: litellm.FinishReasonSafety, FinishReasonRaw: "completed", Provider: "capture", Model: "m"},
 	}}
-	model := NewLiteLLMAdapter("m", mustClient(t, provider))
+	model := mustModel(t, "m", provider)
 	ch, err := model.GenerateStream(context.Background(), []agentcore.Message{agentcore.UserMsg("hi")}, nil)
 	if err != nil {
 		t.Fatalf("GenerateStream: %v", err)
@@ -496,7 +611,7 @@ func TestGenerateStreamAttributesInterleavedToolCallDeltas(t *testing.T) {
 	if err != nil {
 		t.Fatalf("mimo.New: %v", err)
 	}
-	model := NewLiteLLMAdapter("mimo-v2.5", mustClient(t, provider))
+	model := mustModel(t, "mimo-v2.5", provider)
 	ch, err := model.GenerateStream(context.Background(), []agentcore.Message{agentcore.UserMsg("hi")}, nil)
 	if err != nil {
 		t.Fatalf("GenerateStream: %v", err)
@@ -546,7 +661,7 @@ func TestGenerateStreamMatchesResponseContent(t *testing.T) {
 		litellm.BlockEnd{Index: 3},
 		litellm.DoneEvent{FinishReason: litellm.FinishReasonToolCall, Provider: "capture", Model: "m"},
 	}
-	model := NewLiteLLMAdapter("m", mustClient(t, &captureStreamProvider{events: events}))
+	model := mustModel(t, "m", &captureStreamProvider{events: events})
 	ch, err := model.GenerateStream(context.Background(), []agentcore.Message{agentcore.UserMsg("hi")}, nil)
 	if err != nil {
 		t.Fatal(err)
@@ -563,12 +678,12 @@ func TestGenerateStreamMatchesResponseContent(t *testing.T) {
 			final = ev.Message
 		}
 	}
-	want := convertResponseContent(&litellm.Response{Blocks: []litellm.Block{
+	want := convertBlocks([]litellm.Block{
 		litellm.ReasoningBlock{State: redacted},
 		litellm.ReasoningBlock{Text: "plan"},
 		litellm.TextBlock{Text: "ab"},
 		litellm.ToolUseBlock{ID: "call_1", Name: "f", Arguments: json.RawMessage(`{"q":1}`), State: signed},
-	}})
+	})
 	got, _ := json.Marshal(final.Content)
 	wantJSON, _ := json.Marshal(want)
 	if string(got) != string(wantJSON) || final.StopReason != agentcore.StopReasonToolUse {
@@ -576,16 +691,6 @@ func TestGenerateStreamMatchesResponseContent(t *testing.T) {
 	}
 	if !slices.Equal(ends, []agentcore.StreamEventType{agentcore.StreamEventThinkingEnd, agentcore.StreamEventThinkingEnd, agentcore.StreamEventTextEnd, agentcore.StreamEventToolCallEnd}) {
 		t.Fatalf("end events = %v", ends)
-	}
-}
-
-func TestWithDefaultHeaderKeepsExplicitHeader(t *testing.T) {
-	if got := withDefaultHeader(nil, "anthropic-beta", "b"); got["anthropic-beta"] != "b" {
-		t.Fatalf("headers = %v", got)
-	}
-	explicit := map[string]string{"Anthropic-Beta": "user"}
-	if got := withDefaultHeader(explicit, "anthropic-beta", "b"); len(got) != 1 || got["Anthropic-Beta"] != "user" {
-		t.Fatalf("headers = %v", got)
 	}
 }
 
@@ -599,7 +704,7 @@ func TestProviderStateRoundTrip(t *testing.T) {
 		litellm.TextBlock{Text: "a", State: state(`{"id":"msg_1"}`)},
 		litellm.ToolUseBlock{ID: "call_1", Name: "f", Arguments: json.RawMessage(`{}`), State: state(`{"thoughtSignature":"s"}`)},
 	}
-	data, err := json.Marshal(convertResponse(&litellm.Response{Blocks: blocks}))
+	data, err := json.Marshal(agentcore.Message{Role: agentcore.RoleAssistant, Content: convertBlocks(blocks)})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -609,5 +714,24 @@ func TestProviderStateRoundTrip(t *testing.T) {
 	}
 	if got := convertMessages([]agentcore.Message{restored}); len(got) != 1 || !reflect.DeepEqual(got[0].Blocks, blocks) {
 		t.Fatalf("replayed %#v\nwant %#v", got, blocks)
+	}
+}
+
+// Qwen takes a thinking budget but no effort, so a budget at the auto level
+// is how its thinking is sized.
+func TestQwenThinkingBudget(t *testing.T) {
+	var body string
+	httpClient := roundTripFunc(func(req *http.Request) (*http.Response, error) {
+		data, err := io.ReadAll(req.Body)
+		body = string(data)
+		return &http.Response{StatusCode: http.StatusBadRequest, Header: make(http.Header), Body: io.NopCloser(strings.NewReader(`{}`))}, err
+	})
+	model, err := NewModel("qwen", "qwen3-max", providers.Config{APIKey: "k", HTTPClient: httpClient})
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, _ = model.Generate(context.Background(), []agentcore.Message{agentcore.UserMsg("hi")}, nil, agentcore.WithThinkingBudget(1024))
+	if !strings.Contains(body, `"enable_thinking":true`) || !strings.Contains(body, `"thinking_budget":1024`) {
+		t.Fatalf("body = %s", body)
 	}
 }
