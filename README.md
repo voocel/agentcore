@@ -53,11 +53,11 @@ import (
     "github.com/voocel/agentcore"
     "github.com/voocel/agentcore/llm"
     "github.com/voocel/agentcore/tools"
-    "github.com/voocel/litellm/providers"
+    "github.com/voocel/litellm/provider"
 )
 
 func main() {
-    model, err := llm.NewModel("openai", "gpt-5-mini", providers.Config{APIKey: os.Getenv("OPENAI_API_KEY")})
+    model, err := llm.NewModel("openai", "gpt-5-mini", provider.Config{APIKey: os.Getenv("OPENAI_API_KEY")})
     if err != nil {
         panic(err)
     }
@@ -108,10 +108,10 @@ The optional `agentcore/permission` subpackage offers a richer decision engine (
 
 ### Model Config
 
-`llm.NewModel` builds the provider named by `providers.Names()` from a litellm `providers.Config` holding the connection settings. Request defaults such as `llm.WithMaxTokens` and `llm.WithTemperature` are sent only when set, leaving the vendor's defaults otherwise; Anthropic requires `llm.WithMaxTokens`. `llm.WithExtra` sets provider options, top-level fields of every request body. The litellm `catalog` package holds the context window, output limit and prices of listed models, for `llm.WithMaxTokens` and `llm.WithPricing`:
+`llm.NewModel` builds the provider named by `provider.Names()` from a litellm `provider.Config` holding the connection settings. Request defaults such as `llm.WithMaxTokens` and `llm.WithTemperature` are sent only when set, leaving the vendor's defaults otherwise; Providers that require a cap, such as Anthropic, get the one `llm.WithMaxTokensIfRequired` sets when no other applies. `llm.WithExtra` sets provider options, top-level fields of every request body. The litellm `catalog` package holds the context window, output limit and prices of listed models, for `llm.WithMaxTokens` and `llm.WithPricing`:
 
 ```go
-model, err := llm.NewModel("anthropic", "claude-sonnet-4", providers.Config{
+model, err := llm.NewModel("anthropic", "claude-sonnet-4", provider.Config{
     APIKey:    apiKey,
     BaseURL:   baseURL,
     UserAgent: "my-client/1.0",
@@ -130,10 +130,10 @@ import (
     "github.com/voocel/agentcore/llm"
     "github.com/voocel/agentcore/subagent"
     "github.com/voocel/agentcore/tools"
-    "github.com/voocel/litellm/providers"
+    "github.com/voocel/litellm/provider"
 )
 
-model, _ := llm.NewModel("openai", "gpt-5-mini", providers.Config{APIKey: apiKey})
+model, _ := llm.NewModel("openai", "gpt-5-mini", provider.Config{APIKey: apiKey})
 
 // Each sub-agent gets its own FileReadState — independent read history.
 scoutState := tools.NewFileReadState()
@@ -267,12 +267,12 @@ agent.Subscribe(func(ev agentcore.Event) {
 When a model needs to change at runtime, wrap it with `SwappableModel`. The swap takes effect on the next call. `subagent.Config.Model` is resolved at the start of each sub-agent run, so the same wrapper also works for sub-agents.
 
 ```go
-defaultModel, _ := llm.NewModel("openai", "gpt-5-mini", providers.Config{APIKey: apiKey})
+defaultModel, _ := llm.NewModel("openai", "gpt-5-mini", provider.Config{APIKey: apiKey})
 sw := agentcore.NewSwappableModel(defaultModel)
 
 agent := agentcore.NewAgent(agentcore.WithModel(sw))
 
-nextModel, _ := llm.NewModel("openai", "gpt-5", providers.Config{APIKey: apiKey})
+nextModel, _ := llm.NewModel("openai", "gpt-5", provider.Config{APIKey: apiKey})
 sw.Swap(nextModel) // next turn uses the new model
 ```
 

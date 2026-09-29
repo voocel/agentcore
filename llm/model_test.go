@@ -14,9 +14,9 @@ import (
 	"github.com/voocel/agentcore"
 	"github.com/voocel/litellm"
 	"github.com/voocel/litellm/catalog"
+	"github.com/voocel/litellm/provider"
 	"github.com/voocel/litellm/provider/deepseek"
 	"github.com/voocel/litellm/provider/mimo"
-	"github.com/voocel/litellm/providers"
 )
 
 type captureProvider struct {
@@ -148,10 +148,10 @@ func TestNewLiteLLMAdapterRejectsClientOptions(t *testing.T) {
 }
 
 func TestNewModel(t *testing.T) {
-	if _, err := NewModel("nope", "m", providers.Config{}); err == nil {
+	if _, err := NewModel("nope", "m", provider.Config{}); err == nil {
 		t.Fatal("unknown provider accepted")
 	}
-	model, err := NewModel("anthropic", "claude", providers.Config{APIKey: "k"}, WithMaxTokens(8))
+	model, err := NewModel("anthropic", "claude", provider.Config{APIKey: "k"}, WithMaxTokens(8))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -167,7 +167,7 @@ func TestNewModelPerCallAPIKey(t *testing.T) {
 		auth = append(auth, req.Header.Get("Authorization"))
 		return &http.Response{StatusCode: http.StatusUnauthorized, Header: make(http.Header), Body: io.NopCloser(strings.NewReader(`{}`))}, nil
 	})
-	model, err := NewModel("compat", "m", providers.Config{APIKey: "default", BaseURL: "https://compat.test/v1", HTTPClient: httpClient})
+	model, err := NewModel("compat", "m", provider.Config{APIKey: "default", BaseURL: "https://compat.test/v1", HTTPClient: httpClient})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -726,12 +726,50 @@ func TestQwenThinkingBudget(t *testing.T) {
 		body = string(data)
 		return &http.Response{StatusCode: http.StatusBadRequest, Header: make(http.Header), Body: io.NopCloser(strings.NewReader(`{}`))}, err
 	})
-	model, err := NewModel("qwen", "qwen3-max", providers.Config{APIKey: "k", HTTPClient: httpClient})
+	model, err := NewModel("qwen", "qwen3-max", provider.Config{APIKey: "k", HTTPClient: httpClient})
 	if err != nil {
 		t.Fatal(err)
 	}
 	_, _ = model.Generate(context.Background(), []agentcore.Message{agentcore.UserMsg("hi")}, nil, agentcore.WithThinkingBudget(1024))
 	if !strings.Contains(body, `"enable_thinking":true`) || !strings.Contains(body, `"thinking_budget":1024`) {
 		t.Fatalf("body = %s", body)
+	}
+}
+
+type capRequiredProvider struct{ *captureProvider }
+
+func (capRequiredProvider) Capabilities() litellm.Capabilities {
+	return litellm.Capabilities{MaxTokensRequired: true}
+}
+
+func TestMaxTokensIfRequired(t *testing.T) {
+	msgs := []agentcore.Message{agentcore.UserMsg("hi")}
+	for _, tt := range []struct {
+		name     string
+		required bool
+		opts     []ModelOption
+		call     []agentcore.CallOption
+		want     int // 0: no cap sent
+	}{
+		{"required", true, []ModelOption{WithMaxTokensIfRequired(100)}, nil, 100},
+		{"not required", false, []ModelOption{WithMaxTokensIfRequired(100)}, nil, 0},
+		{"model cap wins", true, []ModelOption{WithMaxTokens(50), WithMaxTokensIfRequired(100)}, nil, 50},
+		{"call cap wins", true, []ModelOption{WithMaxTokensIfRequired(100)}, []agentcore.CallOption{agentcore.WithMaxTokens(30)}, 30},
+	} {
+		capture := &captureProvider{}
+		var provider litellm.Provider = capture
+		if tt.required {
+			provider = capRequiredProvider{capture}
+		}
+		if _, err := mustModel(t, "m", provider, tt.opts...).Generate(context.Background(), msgs, nil, tt.call...); err != nil {
+			t.Fatal(err)
+		}
+		got := 0
+		if capture.lastReq.MaxTokens != nil {
+			got = *capture.lastReq.MaxTokens
+		}
+		if got != tt.want {
+			t.Errorf("%s: max tokens = %d, want %d", tt.name, got, tt.want)
+		}
 	}
 }

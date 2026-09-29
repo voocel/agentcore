@@ -15,35 +15,38 @@ import (
 	"github.com/voocel/agentcore"
 	"github.com/voocel/litellm"
 	"github.com/voocel/litellm/catalog"
-	"github.com/voocel/litellm/providers"
+	"github.com/voocel/litellm/provider"
 )
 
 // LiteLLMAdapter adapts a litellm.Client to agentcore.ChatModel. Unset
 // request defaults are omitted from the wire, leaving the vendor default.
 type LiteLLMAdapter struct {
-	client      *litellm.Client
-	model       string
-	maxTokens   *int
-	temperature *float64
-	topP        *float64
-	stop        []string
-	options     litellm.ProviderOptions
-	timeout     time.Duration
-	pricing     *catalog.Pricing
+	client    *litellm.Client
+	model     string
+	maxTokens *int
+	// requiredMaxTokens caps providers that require a cap when no other does.
+	requiredMaxTokens *int
+	temperature       *float64
+	topP              *float64
+	stop              []string
+	options           litellm.ProviderOptions
+	timeout           time.Duration
+	pricing           *catalog.Pricing
 }
 
 // ModelOption configures NewModel and NewLiteLLMAdapter.
 type ModelOption func(*modelConfig)
 
 type modelConfig struct {
-	clientOpts  []litellm.ClientOption
-	maxTokens   *int
-	temperature *float64
-	topP        *float64
-	stop        []string
-	extra       map[string]any
-	timeout     time.Duration
-	pricing     *catalog.Pricing
+	clientOpts        []litellm.ClientOption
+	maxTokens         *int
+	requiredMaxTokens *int
+	temperature       *float64
+	topP              *float64
+	stop              []string
+	extra             map[string]any
+	timeout           time.Duration
+	pricing           *catalog.Pricing
 }
 
 // WithClientOptions forwards litellm ClientOptions, such as
@@ -54,10 +57,17 @@ func WithClientOptions(opts ...litellm.ClientOption) ModelOption {
 }
 
 // WithMaxTokens caps output tokens; agentcore.WithMaxTokens overrides it per
-// call. Unset, no cap is sent and the vendor default applies, but Anthropic
-// requires one: its calls fail until a cap is set here or per call. The
-// catalog's Model.MaxOutputTokens holds the limit of listed models.
+// call. Unset, no cap is sent and the vendor default applies, except as
+// WithMaxTokensIfRequired sets.
 func WithMaxTokens(n int) ModelOption { return func(c *modelConfig) { c.maxTokens = &n } }
+
+// WithMaxTokensIfRequired caps output tokens for providers that reject
+// requests without a cap, such as Anthropic, when neither WithMaxTokens nor
+// the call sets one; the others keep the vendor default. The catalog's
+// Model.MaxOutputTokens holds the limit of listed models.
+func WithMaxTokensIfRequired(n int) ModelOption {
+	return func(c *modelConfig) { c.requiredMaxTokens = &n }
+}
 
 func WithTemperature(t float64) ModelOption { return func(c *modelConfig) { c.temperature = &t } }
 func WithTopP(p float64) ModelOption        { return func(c *modelConfig) { c.topP = &p } }
@@ -83,12 +93,12 @@ func WithPricing(p catalog.Pricing) ModelOption {
 	return func(c *modelConfig) { c.pricing = &p }
 }
 
-// NewModel builds the provider called name, one of providers.Names, and
+// NewModel builds the provider called name, one of provider.Names, and
 // adapts it as a ChatModel. agentcore.WithAPIKey overrides conn's key for one
-// call. Anthropic models need an output cap; see WithMaxTokens.
-func NewModel(name, model string, conn providers.Config, opts ...ModelOption) (*LiteLLMAdapter, error) {
+// call. Anthropic models need an output cap; see WithMaxTokensIfRequired.
+func NewModel(name, model string, conn provider.Config, opts ...ModelOption) (*LiteLLMAdapter, error) {
 	cfg := resolveModelConfig(opts)
-	p, err := providers.New(name, withCallKey(conn))
+	p, err := provider.New(name, withCallKey(conn))
 	if err != nil {
 		return nil, fmt.Errorf("llm: %s: %w", name, err)
 	}
@@ -121,7 +131,7 @@ func contextWithAPIKey(ctx context.Context, key string) context.Context {
 
 // withCallKey resolves the key per request, so a per-call key set by
 // agentcore.WithAPIKey takes precedence over conn's.
-func withCallKey(conn providers.Config) providers.Config {
+func withCallKey(conn provider.Config) provider.Config {
 	resolve := conn.APIKeyFunc
 	if resolve == nil {
 		key := conn.APIKey
@@ -150,15 +160,16 @@ func newAdapter(client *litellm.Client, model string, cfg modelConfig) (*LiteLLM
 		return nil, fmt.Errorf("llm: extra: %w", err)
 	}
 	return &LiteLLMAdapter{
-		client:      client,
-		model:       model,
-		maxTokens:   cfg.maxTokens,
-		temperature: cfg.temperature,
-		topP:        cfg.topP,
-		stop:        cfg.stop,
-		options:     options,
-		timeout:     cfg.timeout,
-		pricing:     cfg.pricing,
+		client:            client,
+		model:             model,
+		maxTokens:         cfg.maxTokens,
+		requiredMaxTokens: cfg.requiredMaxTokens,
+		temperature:       cfg.temperature,
+		topP:              cfg.topP,
+		stop:              cfg.stop,
+		options:           options,
+		timeout:           cfg.timeout,
+		pricing:           cfg.pricing,
 	}, nil
 }
 
@@ -238,11 +249,13 @@ func (l *LiteLLMAdapter) newRequest(ctx context.Context, messages []agentcore.Me
 		Thinking:        convertThinking(call.ThinkingLevel, call.ThinkingBudget),
 		ProviderOptions: maps.Clone(l.options),
 	}
+	caps, _ := l.client.Capabilities()
 	if call.MaxTokens > 0 {
 		req.MaxTokens = &call.MaxTokens
+	} else if req.MaxTokens == nil && caps.MaxTokensRequired {
+		req.MaxTokens = l.requiredMaxTokens
 	}
 
-	caps, _ := l.client.Capabilities()
 	if err := setHint(req, caps, "session_id", call.SessionID); err != nil {
 		return ctx, nil, err
 	}
