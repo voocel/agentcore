@@ -3,8 +3,10 @@ package tools
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
+	"strconv"
 	"strings"
 	"unicode"
 
@@ -12,34 +14,39 @@ import (
 	"github.com/voocel/agentcore/schema"
 )
 
-// EditTool performs exact string replacement in a file.
-// Supports line ending normalization, fuzzy matching, and returns unified diff.
-//
-// Validate enforces read-before-edit and detects stale writes when state is
-// non-nil.
-type EditTool struct {
-	WorkDir   string
-	readState *FileReadState
-	fs        WorkspaceFS
+// Edit returns the edit tool: it replaces exact strings in a file,
+// normalizing line endings and matching fuzzily. Its result is a line naming
+// the file over the diff of the edit; its Check returns the diff as the
+// call's preview and, with Files, refuses a file the model has not read, or
+// that changed since.
+func (w Workspace) Edit() agentcore.Tool {
+	t := &editTool{w: w, fs: w.fs()}
+	return agentcore.Tool{
+		Name:        "edit",
+		Label:       "Edit File",
+		Description: editDescription,
+		Schema: schema.Object(
+			schema.Property("file_path", schema.String("The path to the file to modify (relative or absolute)")).Required(),
+			schema.Property("old_string", schema.String("The text to replace (must be unique unless replace_all is true)")).Required(),
+			schema.Property("new_string", schema.String("The text to replace it with (must be different from old_string)")).Required(),
+			schema.Property("replace_all", schema.Bool("Replace all occurrences of old_string (default: false)")),
+		),
+		Check: func(ctx context.Context, args json.RawMessage) (string, error) {
+			if err := t.validate(ctx, args); err != nil {
+				return "", err
+			}
+			return t.preview(ctx, args)
+		},
+		Run: t.execute,
+	}
 }
 
-// NewEdit creates an edit tool rooted at workDir.
-//
-// Pass the same non-nil FileReadState to NewRead, NewWrite, and NewEdit to
-// enable read-before-write/edit validation. Pass nil to disable this tracking.
-// By default the tool operates on the local filesystem; pass WithFS to inject
-// a different WorkspaceFS backend.
-func NewEdit(workDir string, state *FileReadState, opts ...Option) *EditTool {
-	return &EditTool{WorkDir: workDir, readState: state, fs: resolveFS(opts)}
+type editTool struct {
+	w  Workspace
+	fs FS
 }
 
-func (t *EditTool) Name() string                                 { return "edit" }
-func (t *EditTool) Label() string                                { return "Edit File" }
-func (t *EditTool) ReadOnly(_ json.RawMessage) bool              { return false }
-func (t *EditTool) ConcurrencySafe(_ json.RawMessage) bool       { return false }
-func (t *EditTool) ActivityDescription(_ json.RawMessage) string { return "Editing file" }
-func (t *EditTool) Description() string {
-	return `Performs exact string replacements in files.
+const editDescription = `Performs exact string replacements in files.
 
 Usage:
 - You must use the read tool at least once in the conversation before editing. This tool will error if you attempt an edit without reading the file.
@@ -47,15 +54,6 @@ Usage:
 - ALWAYS prefer editing existing files in the codebase. NEVER write new files unless explicitly required.
 - The edit will FAIL if ` + "`old_string`" + ` is not unique in the file. Either provide a larger string with more surrounding context to make it unique or use ` + "`replace_all`" + ` to change every instance of ` + "`old_string`" + `.
 - Use ` + "`replace_all`" + ` for replacing and renaming strings across the file. This parameter is useful if you want to rename a variable for instance.`
-}
-func (t *EditTool) Schema() map[string]any {
-	return schema.Object(
-		schema.Property("file_path", schema.String("The path to the file to modify (relative or absolute)")).Required(),
-		schema.Property("old_string", schema.String("The text to replace (must be unique unless replace_all is true)")).Required(),
-		schema.Property("new_string", schema.String("The text to replace it with (must be different from old_string)")).Required(),
-		schema.Property("replace_all", schema.Bool("Replace all occurrences of old_string (default: false)")),
-	)
-}
 
 type editArgs struct {
 	FilePath   string `json:"file_path"`
@@ -64,7 +62,7 @@ type editArgs struct {
 	ReplaceAll bool   `json:"replace_all"`
 }
 
-// editResult holds the parsed and computed edit state, shared by Preview and Execute.
+// editResult is an edit worked out, before it is written.
 type editResult struct {
 	path       string
 	bom        string
@@ -73,59 +71,54 @@ type editResult struct {
 	newContent string
 }
 
-// Validate enforces read-before-edit and detects stale writes. Unlike Write,
-// edit always requires an existing file — a non-existent path fails.
-// Error codes match WriteTool.Validate.
-func (t *EditTool) Validate(ctx context.Context, args json.RawMessage) agentcore.ValidationResult {
-	if t.readState == nil {
-		return agentcore.ValidationResult{OK: true}
+// validate enforces read-before-edit and detects stale writes. Unlike write,
+// edit always requires an existing file — a non-existent path fails — and a
+// partial read is enough.
+func (t *editTool) validate(ctx context.Context, args json.RawMessage) error {
+	if t.w.Files == nil {
+		return nil
 	}
 
 	var a editArgs
 	if err := json.Unmarshal(args, &a); err != nil {
-		return agentcore.ValidationResult{OK: false, Message: "invalid args: " + err.Error()}
+		return errors.New("invalid args: " + err.Error())
 	}
-	path := ResolvePath(effectiveWorkDir(ctx, t.WorkDir), a.FilePath)
+	path := ResolvePath(t.w.dir(ctx), a.FilePath)
 
 	info, err := t.fs.Stat(ctx, path)
 	if err != nil {
 		if os.IsNotExist(err) {
-			return agentcore.ValidationResult{OK: false, Message: "file not found: " + path}
+			return errors.New("file not found: " + path)
 		}
-		return agentcore.ValidationResult{OK: false, Message: "stat " + path + ": " + err.Error()}
+		return errors.New("stat " + path + ": " + err.Error())
 	}
 	if info.IsDir {
-		return agentcore.ValidationResult{OK: false, Message: "path is a directory: " + path}
+		return errors.New("path is a directory: " + path)
 	}
 
-	stamp, ok := t.readState.Get(path)
-	if !ok || stamp.Partial {
-		return agentcore.ValidationResult{
-			OK:        false,
-			ErrorCode: 2,
-			Message:   "File has not been read yet. Read it first before editing.",
-		}
+	stamp, ok := t.w.Files.Get(path)
+	if !ok {
+		return errors.New("File has not been read yet. Read it first before editing.")
 	}
 	// Compare against the content token / mtime recorded at read time, not just
 	// "after ReadAt". Catches mtime regressions too (e.g. git checkout of an
 	// older version), and unsaved-buffer changes when the backend sets Version.
 	if !stampMatches(stamp, info) {
-		return agentcore.ValidationResult{
-			OK:        false,
-			ErrorCode: 3,
-			Message:   "File has been modified since read, either by the user or by a linter. Read it again before attempting to edit it.",
-		}
+		return errors.New("File has been modified since read, either by the user or by a linter. Read it again before attempting to edit it.")
 	}
-	return agentcore.ValidationResult{OK: true}
+	return nil
 }
 
-func (t *EditTool) parseAndMatch(ctx context.Context, args json.RawMessage) (*editResult, error) {
+func (t *editTool) parseAndMatch(ctx context.Context, args json.RawMessage) (*editResult, error) {
 	var a editArgs
 	if err := json.Unmarshal(args, &a); err != nil {
 		return nil, fmt.Errorf("invalid args: %w", err)
 	}
 
-	a.FilePath = ResolvePath(effectiveWorkDir(ctx, t.WorkDir), a.FilePath)
+	a.FilePath = ResolvePath(t.w.dir(ctx), a.FilePath)
+	if a.OldString == "" {
+		return nil, errors.New("old_string is empty. Quote the text to replace; use write to create a file")
+	}
 
 	data, err := t.fs.ReadFile(ctx, a.FilePath)
 	if err != nil {
@@ -141,19 +134,9 @@ func (t *EditTool) parseAndMatch(ctx context.Context, args json.RawMessage) (*ed
 	newText := normalizeToLF(a.NewString)
 	multiline := strings.Contains(oldText, "\n")
 
-	// Matching chain: exact/fuzzy → escape → blockAnchor → indentAware
+	// Matching chain: exact/fuzzy → indentAware
 	idx, matchLen := fuzzyFind(content, oldText)
 	needsReindent := false
-
-	if idx < 0 {
-		idx, matchLen = escapeFind(content, oldText)
-	}
-	if idx < 0 && multiline {
-		idx, matchLen = blockAnchorFind(content, oldText)
-		if idx >= 0 {
-			needsReindent = true
-		}
-	}
 	if idx < 0 && multiline {
 		var count int
 		idx, matchLen, count = indentAwareFind(content, oldText)
@@ -206,46 +189,29 @@ func (t *EditTool) parseAndMatch(ctx context.Context, args json.RawMessage) (*ed
 	}, nil
 }
 
-// Preview computes the diff without writing the file.
-func (t *EditTool) Preview(ctx context.Context, args json.RawMessage) (json.RawMessage, error) {
-	if err := ctx.Err(); err != nil {
-		return nil, err
-	}
+// preview returns the diff of the edit, without writing it.
+func (t *editTool) preview(ctx context.Context, args json.RawMessage) (string, error) {
 	r, err := t.parseAndMatch(ctx, args)
 	if err != nil {
-		return nil, err
+		return "", err
 	}
-	diff, firstLine := generateDiff(r.oldContent, r.newContent)
-	return json.Marshal(map[string]any{
-		"diff":               diff,
-		"first_changed_line": firstLine,
-	})
+	return generateDiff(r.oldContent, r.newContent), nil
 }
 
-func (t *EditTool) Execute(ctx context.Context, args json.RawMessage) (json.RawMessage, error) {
-	if err := ctx.Err(); err != nil {
-		return nil, err
-	}
+func (t *editTool) execute(ctx context.Context, args json.RawMessage) (agentcore.Result, error) {
 	r, err := t.parseAndMatch(ctx, args)
 	if err != nil {
-		return nil, err
+		return agentcore.Result{}, err
 	}
-
 	if err := ctx.Err(); err != nil {
-		return nil, err
+		return agentcore.Result{}, err
 	}
-
 	finalContent := r.bom + restoreLineEndings(r.newContent, r.ending)
 	if err := t.fs.WriteFile(ctx, r.path, []byte(finalContent), 0o644); err != nil {
-		return nil, fmt.Errorf("write %s: %w", r.path, err)
+		return agentcore.Result{}, fmt.Errorf("write %s: %w", r.path, err)
 	}
-
-	diff, firstLine := generateDiff(r.oldContent, r.newContent)
-	return json.Marshal(map[string]any{
-		"message":            fmt.Sprintf("Successfully replaced text in %s.", r.path),
-		"diff":               diff,
-		"first_changed_line": firstLine,
-	})
+	t.w.Files.recordWrite(ctx, t.fs, r.path, false)
+	return agentcore.TextResult(fmt.Sprintf("Edited %s.\n%s", r.path, generateDiff(r.oldContent, r.newContent))), nil
 }
 
 // --- Line ending utilities ---
@@ -393,157 +359,6 @@ func fuzzyFind(content, oldText string) (idx, matchLen int) {
 		return -1, 0
 	}
 	return startByte, endByte - startByte
-}
-
-// --- Escape normalization ---
-
-// escapeFind handles LLM sending literal escape sequences (\n, \t, etc.)
-// instead of actual characters. Tries unescaping oldText and matching.
-func escapeFind(content, oldText string) (idx, matchLen int) {
-	unescaped := unescapeText(oldText)
-	if unescaped == oldText {
-		return -1, 0
-	}
-	if i := strings.Index(content, unescaped); i >= 0 {
-		return i, len(unescaped)
-	}
-	return -1, 0
-}
-
-var escapeMap = map[byte]byte{
-	'n': '\n', 't': '\t', 'r': '\r',
-	'\\': '\\', '\'': '\'', '"': '"',
-}
-
-func unescapeText(s string) string {
-	var sb strings.Builder
-	sb.Grow(len(s))
-	for i := 0; i < len(s); i++ {
-		if i+1 < len(s) && s[i] == '\\' {
-			if replacement, ok := escapeMap[s[i+1]]; ok {
-				sb.WriteByte(replacement)
-				i++
-				continue
-			}
-		}
-		sb.WriteByte(s[i])
-	}
-	return sb.String()
-}
-
-// --- Block anchor matching ---
-
-// blockAnchorFind uses the first and last lines of oldText as anchors,
-// then checks middle content similarity via line-level Levenshtein distance.
-// Returns the range in content that matches, or (-1, 0) if no match.
-func blockAnchorFind(content, oldText string) (idx, matchLen int) {
-	oldLines := strings.Split(oldText, "\n")
-	if len(oldLines) < 3 {
-		return -1, 0
-	}
-	if oldLines[len(oldLines)-1] == "" {
-		oldLines = oldLines[:len(oldLines)-1]
-	}
-	if len(oldLines) < 3 {
-		return -1, 0
-	}
-
-	contentLines := strings.Split(content, "\n")
-	firstAnchor := strings.TrimSpace(oldLines[0])
-	lastAnchor := strings.TrimSpace(oldLines[len(oldLines)-1])
-
-	type candidate struct {
-		startLine, endLine int
-		similarity         float64
-	}
-	var candidates []candidate
-
-	for i, line := range contentLines {
-		if strings.TrimSpace(line) != firstAnchor {
-			continue
-		}
-		for j := i + 2; j < len(contentLines); j++ {
-			if strings.TrimSpace(contentLines[j]) != lastAnchor {
-				continue
-			}
-			sim := blockSimilarity(contentLines[i:j+1], oldLines)
-			candidates = append(candidates, candidate{i, j, sim})
-			break
-		}
-	}
-
-	if len(candidates) == 0 {
-		return -1, 0
-	}
-
-	// Pick the highest-similarity candidate.
-	// Multiple candidates require > 0.3 similarity to avoid false positives.
-	best := candidates[0]
-	for _, c := range candidates[1:] {
-		if c.similarity > best.similarity {
-			best = c
-		}
-	}
-	if len(candidates) > 1 && best.similarity < 0.3 {
-		return -1, 0
-	}
-
-	offsets := lineStartOffsets(content)
-	start := offsets[best.startLine]
-	end := offsets[best.endLine+1]
-	// Trim trailing newline from the matched range
-	if end > start && content[end-1] == '\n' {
-		end--
-	}
-	return start, end - start
-}
-
-// blockSimilarity computes average line similarity for middle lines (0.0 - 1.0).
-func blockSimilarity(block, search []string) float64 {
-	middleCount := min(len(block)-2, len(search)-2)
-	if middleCount <= 0 {
-		return 1.0
-	}
-	var total float64
-	for i := 1; i <= middleCount; i++ {
-		a := strings.TrimSpace(block[i])
-		b := strings.TrimSpace(search[i])
-		maxLen := max(len(a), len(b))
-		if maxLen == 0 {
-			continue
-		}
-		dist := levenshteinDistance(a, b)
-		total += 1.0 - float64(dist)/float64(maxLen)
-	}
-	return total / float64(middleCount)
-}
-
-// levenshteinDistance computes the edit distance between two strings.
-func levenshteinDistance(a, b string) int {
-	if a == "" {
-		return len(b)
-	}
-	if b == "" {
-		return len(a)
-	}
-	ra, rb := []rune(a), []rune(b)
-	prev := make([]int, len(rb)+1)
-	curr := make([]int, len(rb)+1)
-	for j := range prev {
-		prev[j] = j
-	}
-	for i := 1; i <= len(ra); i++ {
-		curr[0] = i
-		for j := 1; j <= len(rb); j++ {
-			cost := 1
-			if ra[i-1] == rb[j-1] {
-				cost = 0
-			}
-			curr[j] = min(prev[j]+1, min(curr[j-1]+1, prev[j-1]+cost))
-		}
-		prev, curr = curr, prev
-	}
-	return prev[len(rb)]
 }
 
 func indentAwareFind(content, oldText string) (idx, matchLen, count int) {
@@ -919,73 +734,63 @@ func lineStartOffsets(text string) []int {
 
 // --- Diff generation ---
 
-// generateDiff produces a unified diff with line numbers and context.
-func generateDiff(oldContent, newContent string) (string, int) {
+// generateDiff returns the changed lines of newContent over oldContent, each
+// marked "-" or "+" and numbered, with a few lines of context.
+func generateDiff(oldContent, newContent string) string {
 	const contextLines = 4
 
-	oldLines := strings.Split(oldContent, "\n")
-	newLines := strings.Split(newContent, "\n")
+	oldLines, newLines := diffLines(oldContent), diffLines(newContent)
+	maxOld, maxNew := len(oldLines), len(newLines)
 
-	// Find the first and last differing lines
-	maxOld := len(oldLines)
-	maxNew := len(newLines)
-
-	// Find common prefix
 	prefix := 0
 	for prefix < maxOld && prefix < maxNew && oldLines[prefix] == newLines[prefix] {
 		prefix++
 	}
-
-	// Find common suffix (from the end, not overlapping prefix)
-	suffixOld := maxOld - 1
-	suffixNew := maxNew - 1
-	for suffixOld > prefix && suffixNew > prefix && oldLines[suffixOld] == newLines[suffixNew] {
+	// The common suffix, not overlapping the prefix.
+	suffixOld, suffixNew := maxOld-1, maxNew-1
+	for suffixOld >= prefix && suffixNew >= prefix && oldLines[suffixOld] == newLines[suffixNew] {
 		suffixOld--
 		suffixNew--
 	}
-
-	firstChangedLine := prefix + 1 // 1-based
-
-	if prefix > suffixOld+1 && prefix > suffixNew+1 {
-		return "(no changes)", firstChangedLine
+	if suffixOld < prefix && suffixNew < prefix {
+		return "(no changes)"
 	}
 
-	// Build diff output with context
-	maxLineNum := max(maxOld, maxNew)
-	lineNumWidth := len(fmt.Sprintf("%d", maxLineNum))
-
+	width := len(strconv.Itoa(max(maxOld, maxNew)))
 	var sb strings.Builder
+	row := func(mark byte, n int, line string) {
+		fmt.Fprintf(&sb, "%c%*d %s\n", mark, width, n, strings.TrimSuffix(line, "\n"))
+	}
 
-	// Leading context
 	ctxStart := max(prefix-contextLines, 0)
-	if ctxStart < prefix {
-		if ctxStart > 0 {
-			fmt.Fprintf(&sb, " %*s ...\n", lineNumWidth, "")
-		}
-		for i := ctxStart; i < prefix; i++ {
-			fmt.Fprintf(&sb, " %*d %s\n", lineNumWidth, i+1, oldLines[i])
-		}
+	if ctxStart > 0 {
+		fmt.Fprintf(&sb, " %*s ...\n", width, "")
 	}
-
-	// Removed lines
+	for i := ctxStart; i < prefix; i++ {
+		row(' ', i+1, oldLines[i])
+	}
 	for i := prefix; i <= suffixOld; i++ {
-		fmt.Fprintf(&sb, "-%*d %s\n", lineNumWidth, i+1, oldLines[i])
+		row('-', i+1, oldLines[i])
 	}
-
-	// Added lines
 	for i := prefix; i <= suffixNew; i++ {
-		fmt.Fprintf(&sb, "+%*d %s\n", lineNumWidth, i+1, newLines[i])
+		row('+', i+1, newLines[i])
 	}
-
-	// Trailing context
-	trailStart := suffixOld + 1
-	trailEnd := min(trailStart+contextLines, maxOld)
-	for i := trailStart; i < trailEnd; i++ {
-		fmt.Fprintf(&sb, " %*d %s\n", lineNumWidth, i+1, oldLines[i])
+	trailEnd := min(suffixOld+1+contextLines, maxOld)
+	for i := suffixOld + 1; i < trailEnd; i++ {
+		row(' ', i+1, oldLines[i])
 	}
 	if trailEnd < maxOld {
-		fmt.Fprintf(&sb, " %*s ...\n", lineNumWidth, "")
+		fmt.Fprintf(&sb, " %*s ...\n", width, "")
 	}
+	return sb.String()
+}
 
-	return sb.String(), firstChangedLine
+// diffLines splits s into lines that keep their newlines, so that a change
+// to the last newline alone is a change of a line.
+func diffLines(s string) []string {
+	lines := strings.SplitAfter(s, "\n")
+	if lines[len(lines)-1] == "" {
+		lines = lines[:len(lines)-1]
+	}
+	return lines
 }

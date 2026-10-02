@@ -9,6 +9,7 @@ import (
 	"io"
 	"os"
 	"os/exec"
+	"strings"
 	"time"
 
 	"github.com/voocel/agentcore"
@@ -16,79 +17,42 @@ import (
 	"github.com/voocel/agentcore/task"
 )
 
-// BashTool executes shell commands.
-// Streams stdout+stderr via ReportToolProgress for real-time display.
-// Final result applies tail truncation (2000 lines / 50KB).
-// Supports run_in_background mode for long-running commands.
-type BashTool struct {
-	WorkDir         string
-	Timeout         time.Duration // default: 2 minutes
-	notifyFn        func(agentcore.AgentMessage)
-	bgOutputFactory func(shellID string) (io.WriteCloser, string, error) // creates output writer for background shells
-	taskRT          *task.Runtime                                        // shared background task registry
-}
+// bashTimeout is how long a command runs in the foreground by default.
+const bashTimeout = 2 * time.Minute
 
-func NewBash(workDir string) *BashTool {
-	return &BashTool{
-		WorkDir: workDir,
-		Timeout: 2 * time.Minute,
-	}
-}
-
-// SetNotifyFn sets the callback invoked when a background shell completes.
-// Typically bound to Agent.FollowUp so the main agent receives the result.
-func (t *BashTool) SetNotifyFn(fn func(agentcore.AgentMessage)) {
-	t.notifyFn = fn
-}
-
-// SetBgOutputFactory sets the factory that creates output writers for background shells.
-// The factory receives the shell ID and returns a writer, file path, and error.
-// If not set, background output is discarded.
-func (t *BashTool) SetBgOutputFactory(fn func(shellID string) (io.WriteCloser, string, error)) {
-	t.bgOutputFactory = fn
-}
-
-// SetTaskRuntime sets the shared task runtime for background task registration.
-func (t *BashTool) SetTaskRuntime(rt *task.Runtime) {
-	t.taskRT = rt
-}
-
-func (t *BashTool) Name() string  { return "bash" }
-func (t *BashTool) Label() string { return "Execute Command" }
-
-// ReadOnly reports false — bash commands may have side effects.
-func (t *BashTool) ReadOnly(_ json.RawMessage) bool { return false }
-
-// ConcurrencySafe reports false — bash commands are not safe for concurrent execution.
-func (t *BashTool) ConcurrencySafe(_ json.RawMessage) bool { return false }
-
-// ActivityDescription returns a short description including the command.
-func (t *BashTool) ActivityDescription(args json.RawMessage) string {
-	var a struct {
-		Command string `json:"command"`
-	}
-	if json.Unmarshal(args, &a) == nil && a.Command != "" {
-		return "Running: " + bashTruncate(a.Command, 40)
-	}
-	return "Running command"
-}
-func (t *BashTool) Description() string {
-	return fmt.Sprintf(
-		"Execute a shell command in the workspace. Prefer read, edit, write, find, grep, and ls for file operations. "+
-			"Use workdir instead of 'cd && ...' when a command must run in another directory. "+
-			"Output is truncated to the last %d lines or %s (whichever is hit first). "+
-			"Set run_in_background=true for long-running commands; it returns immediately and notifies on completion.",
-		defaultMaxLines, formatSize(defaultMaxBytes),
-	)
-}
-func (t *BashTool) Schema() map[string]any {
-	return schema.Object(
+// Bash returns the bash tool, which runs shell commands. It reports each
+// line of their output as a string progress, and returns the tail of it, at
+// most 2000 lines or 50KB, with a line for each of a non-zero exit code, a
+// timeout and a cut. A command that fails is not a failed call: its output
+// is what the model needs. With Tasks, the model may run a command in the
+// background, as a task.
+func (w Workspace) Bash() agentcore.Tool {
+	t := &bashTool{w: w}
+	props := []schema.Prop{
 		schema.Property("command", schema.String("Shell command to execute. Quote paths with spaces.")).Required(),
-		schema.Property("timeout", schema.Int("Timeout in seconds (default: 120)")),
+		schema.Property("timeout", schema.Int(fmt.Sprintf("Timeout in seconds (default: %d; none in the background)", int(bashTimeout.Seconds())))),
 		schema.Property("workdir", schema.String("Optional working directory for this command. Use this instead of 'cd && ...'.")),
-		schema.Property("description", schema.String("Short 5-10 word description shown in the task list")),
-		schema.Property("run_in_background", schema.Bool("Run command in background. Returns immediately; a notification is sent when the command completes.")),
-	)
+		schema.Property("description", schema.String("Short 5-10 word description of what the command does")),
+	}
+	description := fmt.Sprintf("Execute a shell command in the workspace. Prefer read, edit, write, glob, grep, and ls for file operations. "+
+		"Use workdir instead of 'cd && ...' when a command must run in another directory. "+
+		"Output is truncated to the last %d lines or %s (whichever is hit first).",
+		defaultMaxLines, formatSize(defaultMaxBytes))
+	if w.Tasks != nil {
+		props = append(props, schema.Property("run_in_background", schema.Bool("Run the command in the background as a task. Returns at once; a notification follows when it ends.")))
+		description += " Set run_in_background for long-running commands, such as servers or watchers."
+	}
+	return agentcore.Tool{
+		Name:        "bash",
+		Label:       "Execute Command",
+		Description: description,
+		Schema:      schema.Object(props...),
+		Run:         textRun(t.execute),
+	}
+}
+
+type bashTool struct {
+	w Workspace
 }
 
 type bashArgs struct {
@@ -99,254 +63,107 @@ type bashArgs struct {
 	RunInBackground bool   `json:"run_in_background"`
 }
 
-// backgroundOutputWriter keeps os/exec on its managed copy path even when the
-// underlying destination is an *os.File. It records write errors separately
-// because Cmd.Wait prefers a non-zero process exit over copier errors.
-type backgroundOutputWriter struct {
-	io.Writer
-	err error
-}
-
-func (w *backgroundOutputWriter) Write(p []byte) (int, error) {
-	n, err := w.Writer.Write(p)
-	if err != nil && w.err == nil {
-		w.err = err
-	}
-	return n, err
-}
-
-func (w *backgroundOutputWriter) Err() error { return w.err }
-
-type bashForegroundResult struct {
-	Output     string `json:"output"`
-	ExitCode   int    `json:"exit_code"`
-	TimedOut   bool   `json:"timed_out,omitempty"`
-	Aborted    bool   `json:"aborted,omitempty"`
-	OutputFile string `json:"output_file,omitempty"`
-}
-
-func (t *BashTool) Execute(ctx context.Context, args json.RawMessage) (json.RawMessage, error) {
+func (t *bashTool) execute(ctx context.Context, args json.RawMessage) (string, error) {
 	var a bashArgs
 	if err := json.Unmarshal(args, &a); err != nil {
-		return nil, fmt.Errorf("invalid args: %w", err)
+		return "", fmt.Errorf("invalid args: %w", err)
 	}
-
+	dir, err := t.resolveWorkDir(ctx, a)
+	if err != nil {
+		return "", err
+	}
+	shell, shellArgs, err := resolveShell()
+	if err != nil {
+		return "", err
+	}
+	argv := append(shellArgs, a.Command)
+	timeout := time.Duration(a.Timeout) * time.Second
 	if a.RunInBackground {
-		return t.executeBackground(ctx, a)
+		if t.w.Tasks == nil {
+			return "", errors.New("background mode is not available")
+		}
+		return t.background(ctx, a, shell, argv, dir, timeout)
 	}
-
-	return t.executeForeground(ctx, a)
+	if timeout <= 0 {
+		timeout = bashTimeout
+	}
+	return foreground(ctx, shell, argv, dir, timeout)
 }
 
-func (t *BashTool) resolveWorkDir(ctx context.Context, a bashArgs) (string, error) {
-	base := effectiveWorkDir(ctx, t.WorkDir)
-	workDir := base
-	if a.WorkDir != "" {
-		workDir = ResolvePath(base, a.WorkDir)
-	}
-	if workDir == "" {
+func (t *bashTool) resolveWorkDir(ctx context.Context, a bashArgs) (string, error) {
+	dir := ResolvePath(t.w.dir(ctx), a.WorkDir)
+	if dir == "" {
 		return "", nil
 	}
-	info, err := os.Stat(workDir)
+	info, err := os.Stat(dir)
 	if err != nil {
 		if os.IsNotExist(err) {
-			return "", fmt.Errorf("working directory does not exist: %s", workDir)
+			return "", fmt.Errorf("working directory does not exist: %s", dir)
 		}
-		return "", fmt.Errorf("check working directory %s: %w", workDir, err)
+		return "", fmt.Errorf("check working directory %s: %w", dir, err)
 	}
 	if !info.IsDir() {
-		return "", fmt.Errorf("working directory is not a directory: %s", workDir)
+		return "", fmt.Errorf("working directory is not a directory: %s", dir)
 	}
-	return workDir, nil
+	return dir, nil
 }
 
-// executeBackground starts a shell command in a detached goroutine and returns immediately.
-// Output is written to a file on disk for on-demand reading.
-func (t *BashTool) executeBackground(ctx context.Context, a bashArgs) (json.RawMessage, error) {
-	timeout := 10 * time.Minute // generous default for background
-	if a.Timeout > 0 {
-		timeout = time.Duration(a.Timeout) * time.Second
+// background starts the command as a task, its output going to the task's
+// output file, and returns at once. A timeout of 0 lets it run until it
+// ends or is stopped.
+func (t *bashTool) background(ctx context.Context, a bashArgs, shell string, argv []string, dir string, timeout time.Duration) (string, error) {
+	description := a.Description
+	if description == "" {
+		description = truncate(a.Command, 60)
 	}
-
-	workDir, err := t.resolveWorkDir(ctx, a)
-	if err != nil {
-		return nil, err
-	}
-
-	shellPath, shellArgs, err := resolveShell()
-	if err != nil {
-		return nil, err
-	}
-
-	rt := t.taskRT
-	if rt == nil {
-		return nil, fmt.Errorf("background mode requires a TaskRuntime; call SetTaskRuntime before use")
-	}
-
-	bgCtx, cancel := context.WithTimeout(context.Background(), timeout)
-	shellID := rt.NextID("shell")
-
-	var outFile io.WriteCloser
-	var outPath string
-	if t.bgOutputFactory != nil {
-		outFile, outPath, err = t.bgOutputFactory(shellID)
-		if err != nil {
-			cancel()
-			return nil, fmt.Errorf("create output: %w", err)
-		}
-	}
-	closeOutput := func() error {
-		if outFile == nil {
-			return nil
-		}
-		err := outFile.Close()
-		outFile = nil
-		if err != nil {
-			return fmt.Errorf("close command output: %w", err)
-		}
-		return nil
-	}
-
-	cmdArgs := append(append([]string{}, shellArgs...), a.Command)
-	cmd := exec.CommandContext(bgCtx, shellPath, cmdArgs...)
-	if workDir != "" {
-		cmd.Dir = workDir
-	}
-	configureProcGroup(cmd)
-	output := io.Writer(io.Discard)
-	if outFile != nil {
-		output = outFile
-	}
-	managedOutput := &backgroundOutputWriter{Writer: output}
-	cmd.Stdout = managedOutput
-	cmd.Stderr = managedOutput
-
-	if err := cmd.Start(); err != nil {
-		cancel()
-		return nil, errors.Join(fmt.Errorf("start command: %w", err), closeOutput())
-	}
-
-	desc := a.Description
-	if desc == "" {
-		desc = bashTruncate(a.Command, 60)
-	}
-
-	entry := &task.Entry{
-		ID:          shellID,
-		Type:        task.TypeShell,
-		Command:     a.Command,
-		Description: desc,
-		Status:      task.Running,
-		StartedAt:   time.Now(),
-		OutputFile:  outPath,
-		PID:         cmd.Process.Pid,
-	}
-	entry.SetCancel(cancel)
-	rt.Register(entry)
-
-	// Background goroutine: stream output to file, wait for exit, notify.
-	go func() {
-		defer func() {
-			cancel()
-			rt.Done(shellID)
-		}()
-
-		waitErr := cmd.Wait()
-		outputCloseErr := closeOutput()
-
-		// When the process exits zero but output copying failed, Wait returns
-		// the copy error itself; report it once as a copy failure below.
-		outputErr := managedOutput.Err()
-		copyOnly := waitErr != nil && outputErr != nil && errors.Is(waitErr, outputErr)
-
-		exitCode := 0
-		var taskErr error
-		if waitErr != nil && !copyOnly {
-			exitCode = -1
-			if exitErr, ok := waitErr.(*exec.ExitError); ok {
-				exitCode = exitErr.ExitCode()
+	e, err := t.w.Tasks.Start(ctx, task.Entry{Type: task.TypeShell, Command: a.Command, Description: description},
+		func(ctx context.Context, tk *task.Task) error {
+			if timeout > 0 {
+				var cancel context.CancelFunc
+				ctx, cancel = context.WithTimeout(ctx, timeout)
+				defer cancel()
 			}
-			taskErr = fmt.Errorf("wait command: %w", waitErr)
-		}
-		if outputErr != nil {
-			taskErr = errors.Join(taskErr, fmt.Errorf("copy command output: %w", outputErr))
-		}
-		if outputCloseErr != nil {
-			taskErr = errors.Join(taskErr, outputCloseErr)
-		}
-
-		rt.Update(shellID, func(e *task.Entry) {
-			if taskErr != nil {
-				e.Status = task.Failed
-				e.Error = taskErr.Error()
-			} else {
-				e.Status = task.Completed
+			cmd := command(ctx, shell, argv, dir)
+			// The output file, handed to the command as it is, so that a
+			// process the command leaves running cannot hold up Wait.
+			cmd.Stdout, cmd.Stderr = tk.Output, tk.Output
+			if err := cmd.Start(); err != nil {
+				return fmt.Errorf("start command: %w", err)
 			}
-			e.ExitCode = exitCode
-			e.EndedAt = time.Now()
+			tk.Update(func(e *task.Entry) { e.PID = cmd.Process.Pid })
+			err := cmd.Wait()
+			if exitErr, ok := errors.AsType[*exec.ExitError](err); ok {
+				tk.Update(func(e *task.Entry) { e.ExitCode = exitErr.ExitCode() })
+			}
+			switch {
+			case errors.Is(ctx.Err(), context.DeadlineExceeded):
+				return fmt.Errorf("timed out after %s", timeout)
+			case err != nil && cmd.ProcessState != nil:
+				return fmt.Errorf("exit code %d", cmd.ProcessState.ExitCode())
+			}
+			return err
 		})
-
-		t.notifyCompletion(rt, shellID)
-	}()
-
-	return json.Marshal(map[string]any{
-		"shell_id":    shellID,
-		"pid":         cmd.Process.Pid,
-		"description": desc,
-		"status":      "running",
-		"message":     fmt.Sprintf("Background command %s started (PID %d). You will receive a notification when it completes.", shellID, cmd.Process.Pid),
-	})
+	if err != nil {
+		return "", err
+	}
+	return fmt.Sprintf("Started task %s: the command runs in the background, its output going to %s. A notification follows when it ends.", e.ID, e.OutputFile), nil
 }
 
-func (t *BashTool) notifyCompletion(rt *task.Runtime, shellID string) {
-	if t.notifyFn == nil {
-		return
-	}
-	e := rt.Get(shellID)
-	if e == nil {
-		return
-	}
-	t.notifyFn(task.NotificationFromEntry(e).ToAgentMessage())
-}
-
-// executeForeground runs the command synchronously (original behavior).
-func (t *BashTool) executeForeground(ctx context.Context, a bashArgs) (json.RawMessage, error) {
-	timeout := t.Timeout
-	if a.Timeout > 0 {
-		timeout = time.Duration(a.Timeout) * time.Second
-	}
-
-	workDir, err := t.resolveWorkDir(ctx, a)
-	if err != nil {
-		return nil, err
-	}
-
-	shellPath, shellArgs, err := resolveShell()
-	if err != nil {
-		return nil, err
-	}
-
-	ctx, cancel := context.WithTimeout(ctx, timeout)
+// foreground runs the command and returns its output, reporting each line
+// as the call's progress.
+func foreground(ctx context.Context, shell string, argv []string, dir string, timeout time.Duration) (string, error) {
+	runCtx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
-
-	cmdArgs := append(append([]string{}, shellArgs...), a.Command)
-	cmd := exec.CommandContext(ctx, shellPath, cmdArgs...)
-	if workDir != "" {
-		cmd.Dir = workDir
+	cmd := command(runCtx, shell, argv, dir)
+	pr, pw, err := os.Pipe()
+	if err != nil {
+		return "", fmt.Errorf("create pipe: %w", err)
 	}
-	configureProcGroup(cmd)
-
-	pr, pw, pipeErr := os.Pipe()
-	if pipeErr != nil {
-		return nil, fmt.Errorf("create pipe: %w", pipeErr)
-	}
-	cmd.Stdout = pw
-	cmd.Stderr = pw
-
+	cmd.Stdout, cmd.Stderr = pw, pw
 	if err := cmd.Start(); err != nil {
 		pr.Close()
 		pw.Close()
-		return nil, fmt.Errorf("start command: %w", err)
+		return "", fmt.Errorf("start command: %w", err)
 	}
 	pw.Close()
 
@@ -355,37 +172,11 @@ func (t *BashTool) executeForeground(ctx context.Context, a bashArgs) (json.RawM
 	done := make(chan struct{})
 	go func() {
 		defer close(done)
-		buf := make([]byte, 32*1024)
-		pending := make([]byte, 0, 4096)
-		for {
-			n, readE := pr.Read(buf)
-			if n > 0 {
-				chunk := buf[:n]
-				output = append(output, chunk...)
-
-				pending = append(pending, chunk...)
-				for {
-					idx := bytes.IndexByte(pending, '\n')
-					if idx < 0 {
-						break
-					}
-					agentcore.ReportToolProgress(ctx, agentcore.ProgressPayload{Kind: agentcore.ProgressSummary, Summary: string(append([]byte(nil), pending[:idx]...))})
-					pending = pending[idx+1:]
-				}
-			}
-			if readE != nil {
-				if !(errors.Is(readE, io.EOF) || errors.Is(readE, os.ErrClosed)) {
-					readErr = readE
-				} else if len(pending) > 0 {
-					agentcore.ReportToolProgress(ctx, agentcore.ProgressPayload{Kind: agentcore.ProgressSummary, Summary: string(append([]byte(nil), pending...))})
-				}
-				return
-			}
-		}
+		output, readErr = readLines(pr, func(line string) { agentcore.ReportProgress(ctx, line) })
 	}()
-
-	err = cmd.Wait()
-
+	waitErr := cmd.Wait()
+	// A process the command left running may hold the pipe open: its output
+	// after the command ended is not waited for long.
 	select {
 	case <-done:
 	case <-time.After(500 * time.Millisecond):
@@ -393,58 +184,92 @@ func (t *BashTool) executeForeground(ctx context.Context, a bashArgs) (json.RawM
 	pr.Close()
 	<-done
 
+	if err := ctx.Err(); err != nil {
+		return "", err
+	}
 	if readErr != nil {
-		return nil, fmt.Errorf("read command output: %w", readErr)
+		return "", fmt.Errorf("read command output: %w", readErr)
+	}
+	timedOut := errors.Is(runCtx.Err(), context.DeadlineExceeded)
+	if _, exited := errors.AsType[*exec.ExitError](waitErr); waitErr != nil && !exited && !timedOut {
+		return "", fmt.Errorf("command failed: %w", waitErr)
 	}
 
-	outStr := string(output)
-	if outStr == "" {
-		outStr = "(no output)"
+	text, cut := tailOutput(string(output))
+	var notes []string
+	if cut != "" {
+		notes = append(notes, cut)
 	}
+	if code := cmd.ProcessState.ExitCode(); code != 0 && !timedOut {
+		notes = append(notes, fmt.Sprintf("[exit code %d]", code))
+	}
+	if timedOut {
+		notes = append(notes, fmt.Sprintf("[timed out after %s]", timeout))
+	}
+	if len(notes) > 0 {
+		text += "\n\n" + strings.Join(notes, "\n")
+	}
+	return text, nil
+}
 
-	var tempPath string
-	if len(outStr) > defaultMaxBytes {
-		if f, ferr := os.CreateTemp("", "agentcore-bash-*.log"); ferr == nil {
-			f.WriteString(outStr)
-			tempPath = f.Name()
-			f.Close()
+// readLines reads r to its end, calling line with each line as it comes,
+// and returns all it read.
+func readLines(r io.Reader, line func(string)) ([]byte, error) {
+	var all, pending []byte
+	buf := make([]byte, 32*1024)
+	for {
+		n, err := r.Read(buf)
+		all = append(all, buf[:n]...)
+		pending = append(pending, buf[:n]...)
+		for {
+			i := bytes.IndexByte(pending, '\n')
+			if i < 0 {
+				break
+			}
+			line(string(pending[:i]))
+			pending = pending[i+1:]
+		}
+		if err != nil {
+			if len(pending) > 0 {
+				line(string(pending))
+			}
+			if errors.Is(err, io.EOF) || errors.Is(err, os.ErrClosed) {
+				return all, nil
+			}
+			return all, err
 		}
 	}
+}
 
-	tr := truncateTail(outStr, defaultMaxLines, defaultMaxBytes)
-	result := tr.Content
-
-	if tr.Truncated {
-		startLine := tr.TotalLines - tr.OutputLines + 1
-		if startLine < 1 {
-			startLine = 1
-		}
-		result += fmt.Sprintf("\n\n[Showing lines %d-%d of %d.]", startLine, tr.TotalLines, tr.TotalLines)
-		if tempPath != "" {
-			result += fmt.Sprintf("\n[Full output saved to: %s]", tempPath)
+// tailOutput returns the tail of a command's output the model reads and,
+// when that is cut, a line saying so; the whole output then goes to a file
+// the model can read.
+func tailOutput(output string) (text, cut string) {
+	output = strings.TrimSuffix(output, "\n")
+	if output == "" {
+		return "(no output)", ""
+	}
+	tr := truncateTail(output, defaultMaxLines, defaultMaxBytes)
+	if !tr.Truncated {
+		return output, ""
+	}
+	cut = fmt.Sprintf("[Showing the last %d of %d lines.]", tr.OutputLines, tr.TotalLines)
+	if f, err := os.CreateTemp("", "agentcore-bash-*.log"); err == nil {
+		_, werr := f.WriteString(output)
+		if cerr := f.Close(); werr == nil && cerr == nil {
+			cut = fmt.Sprintf("[Showing the last %d of %d lines. Full output: %s]", tr.OutputLines, tr.TotalLines, f.Name())
 		}
 	}
+	return tr.Content, cut
+}
 
-	exitCode := 0
-	timedOut := errors.Is(ctx.Err(), context.DeadlineExceeded)
-	aborted := !timedOut && errors.Is(ctx.Err(), context.Canceled)
-	if err != nil {
-		if exitErr, ok := err.(*exec.ExitError); ok {
-			exitCode = exitErr.ExitCode()
-		} else if timedOut || aborted {
-			exitCode = -1
-		} else {
-			return nil, fmt.Errorf("command failed: %w", err)
-		}
-	}
-
-	return json.Marshal(bashForegroundResult{
-		Output:     result,
-		ExitCode:   exitCode,
-		TimedOut:   timedOut,
-		Aborted:    aborted,
-		OutputFile: tempPath,
-	})
+// command is the shell running argv in dir, killed with its process group
+// once ctx ends.
+func command(ctx context.Context, shell string, argv []string, dir string) *exec.Cmd {
+	cmd := exec.CommandContext(ctx, shell, argv...)
+	cmd.Dir = dir
+	configureProcGroup(cmd)
+	return cmd
 }
 
 func resolveShell() (string, []string, error) {
@@ -457,10 +282,11 @@ func resolveShell() (string, []string, error) {
 	return "", nil, fmt.Errorf("no shell found: tried bash and sh")
 }
 
-func bashTruncate(s string, maxRunes int) string {
+// truncate shortens s to n runes, marking the cut with "...".
+func truncate(s string, n int) string {
 	runes := []rune(s)
-	if len(runes) <= maxRunes {
+	if len(runes) <= n {
 		return s
 	}
-	return string(runes[:maxRunes]) + "..."
+	return string(runes[:n]) + "..."
 }

@@ -1,12 +1,16 @@
 package tools
 
 import (
+	"context"
+	"encoding/json"
 	"fmt"
 	"os"
 	"path"
 	"path/filepath"
 	"strings"
 	"unicode/utf8"
+
+	"github.com/voocel/agentcore"
 )
 
 // unicodeSpaces are Unicode space characters normalized to ASCII space.
@@ -24,6 +28,20 @@ var unicodeSpaces = []rune{
 	'\u202F', // NARROW NO-BREAK SPACE
 	'\u205F', // MEDIUM MATHEMATICAL SPACE
 	'\u3000', // IDEOGRAPHIC SPACE
+}
+
+// always is the Parallel of tools whose calls may always run in parallel.
+func always(json.RawMessage) bool { return true }
+
+// textRun returns a Tool.Run of execute, which returns text.
+func textRun(execute func(context.Context, json.RawMessage) (string, error)) func(context.Context, json.RawMessage) (agentcore.Result, error) {
+	return func(ctx context.Context, args json.RawMessage) (agentcore.Result, error) {
+		text, err := execute(ctx, args)
+		if err != nil {
+			return agentcore.Result{}, err
+		}
+		return agentcore.TextResult(text), nil
+	}
 }
 
 // Truncation limit defaults.
@@ -79,7 +97,7 @@ func ExpandPath(p string) string {
 // If userPath is empty, returns workDir. If absolute, returns as-is.
 // Otherwise joins with workDir.
 //
-// Path semantics follow the workspace root. WorkspaceFS backends key files
+// Path semantics follow the workspace root. FS backends key files
 // with slash-separated absolute paths (editor buffers, remote hosts), so a
 // leading "/" counts as absolute even on Windows — where filepath.IsAbs would
 // demand a drive letter and the fallthrough join would corrupt the virtual
@@ -104,7 +122,7 @@ func ResolvePath(workDir, userPath string) string {
 // dirOf and joinOf are filepath.Dir / filepath.Join with the same
 // virtual-path awareness as ResolvePath: slash-rooted paths stay
 // slash-separated instead of being rewritten with the OS separator, so a
-// resolved WorkspaceFS path survives parent-dir and sibling derivation on
+// resolved FS path survives parent-dir and sibling derivation on
 // Windows.
 
 func dirOf(p string) string {

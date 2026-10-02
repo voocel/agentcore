@@ -1,6 +1,7 @@
 package tools
 
 import (
+	"context"
 	"sync"
 	"time"
 )
@@ -12,12 +13,16 @@ import (
 //   - no-stale-write: the file must not have been modified externally
 //     between the last read and the write attempt.
 //
-// Partial is true when the read used offset/limit. A partial read does not
-// satisfy read-before-write — the LLM may not know about content outside
-// the slice it read.
+// Partial is true when the model did not see all of the file: it read from
+// an offset, or the read stopped at its limit. A partial read is enough to
+// edit, which changes only text the model quotes, but not to overwrite the
+// file, whose rest the model has not seen.
+//
+// A successful write or edit refreshes the stamp, so the LLM can keep
+// changing a file it just changed without reading it again.
 //
 // Version is the backend-defined content token recorded at read time (see
-// WorkspaceFS.FileInfo.Version). It is empty for the OS backend; Write/Edit
+// FileInfo.Version). It is empty for the OS backend; Write/Edit
 // fall back to comparing Mtime when either side's Version is empty.
 type FileReadStamp struct {
 	ReadAt  time.Time
@@ -26,9 +31,8 @@ type FileReadStamp struct {
 	Partial bool
 }
 
-// FileReadState is the session-scoped store of FileReadStamp keyed by
-// absolute path. Read, Write, and Edit tools share one instance per session,
-// passed at construction time.
+// FileReadState records what the model read, by absolute path: see
+// Workspace.Files.
 type FileReadState struct {
 	mu sync.RWMutex
 	m  map[string]FileReadStamp
@@ -51,13 +55,21 @@ func (s *FileReadState) Set(path string, stamp FileReadStamp) {
 	s.m[path] = stamp
 }
 
-// Reset drops all recorded stamps. Called by Session on /clear, Reset, and
-// session switch so the LLM never writes based on stamps from a read it no
-// longer has in its conversation history.
-func (s *FileReadState) Reset() {
+// recordWrite refreshes the stamp of path after the LLM wrote it: all of it
+// when whole, otherwise (an edit) only the text it quoted, so whether it has
+// seen the whole file carries over. A file that cannot be stated keeps its
+// old stamp, and the next write or edit asks for a fresh read.
+func (s *FileReadState) recordWrite(ctx context.Context, fs FS, path string, whole bool) {
+	if s == nil {
+		return
+	}
+	info, err := fs.Stat(ctx, path)
+	if err != nil {
+		return
+	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	s.m = make(map[string]FileReadStamp)
+	s.m[path] = FileReadStamp{ReadAt: time.Now(), Mtime: info.ModTime, Version: info.Version, Partial: !whole && s.m[path].Partial}
 }
 
 // stampMatches reports whether the file described by info is unchanged since

@@ -1,5 +1,5 @@
-// Package schema provides a fluent builder for JSON Schema objects.
-// It outputs map[string]any compatible with agentcore's Tool.Schema() interface.
+// Package schema builds the JSON Schema of a tool's arguments, as the
+// map[string]any agentcore's Tool.Schema holds.
 package schema
 
 // Prop is a named property with optional required flag.

@@ -2,924 +2,208 @@ package agentcore
 
 import (
 	"context"
-	"errors"
-	"fmt"
-	"strings"
+	"slices"
 	"sync"
-	"sync/atomic"
-	"time"
 )
 
-// AgentState is a snapshot of the agent's current state.
-type AgentState struct {
-	SystemPrompt     string
-	Messages         []AgentMessage
-	Tools            []Tool
-	IsRunning        bool
-	StreamMessage    AgentMessage        // partial message being streamed, nil when idle
-	PendingToolCalls map[string]struct{} // tool call IDs currently executing
-	TotalUsage       Usage               // cumulative token usage across all turns
-	Error            string
-}
-
-// Agent is a stateful wrapper around the agent loop.
-// It consumes loop events to update internal state, just like any external listener.
+// Agent is a conversation an application drives: it keeps the history and
+// runs it, one run at a time, taking the messages that arrive meanwhile. It
+// replaces the Emit, Steering and FollowUp of its Config: events go to its
+// subscribers. A run ends when the context it was started with is
+// cancelled. An Agent is safe for concurrent use.
 type Agent struct {
-	// Configuration (set via options)
-	model                ChatModel
-	systemPrompt         string
-	systemBlocks         []SystemBlock
-	tools                []Tool
-	maxTurns             int
-	maxRetries           int
-	maxToolErrors        int
-	thinkingLevel        ThinkingLevel
-	contextManager       ContextManager
-	convertToLLM         func([]AgentMessage) []Message
-	contextWindow        int
-	contextEstimateFn    ContextEstimateFn
-	toolGate             ToolGate
-	middlewares          []ToolMiddleware
-	maxToolConcurrency   int
-	lengthRecoveryPrompt string
-	abortMarkerText      string
-	abortMarkerToolText  string
-	messageCommitter     func(AgentMessage) error
-	onMessage            func(AgentMessage)
-	stopGuard            StopGuard
-	cacheLastMessage     string
-	promptCacheKey       string
-
-	// State
-	messages         []AgentMessage
-	isRunning        bool
-	lastError        string
-	streamMessage    AgentMessage        // partial message during streaming
-	pendingToolCalls map[string]struct{} // tool call IDs in flight
-	totalUsage       Usage               // cumulative token usage
-
-	// Queues
-	steeringQ                   []AgentMessage
-	followUpQ                   []AgentMessage
-	skipNextInitialSteeringPoll bool
-
-	// Lifecycle
-	listeners       []func(Event)
-	cancel          context.CancelFunc
-	done            chan struct{} // closed when loop finishes
-	held            int           // active HoldRuns count; >0 rejects new run starts
-	wantAbortMarker atomic.Bool   // set by Abort(), read by runLoop
-	mu              sync.Mutex
+	mu       sync.Mutex
+	cfg      Config
+	history  []Message
+	steering []Message
+	followUp []Message
+	subs     []*subscriber
+	running  bool
 }
 
-// NewAgent creates a new Agent with the given options.
-//
-// When a ContextManager is set, the agent auto-wires ConvertToLLM, the
-// context-token estimator, and the context window from the manager when it
-// implements the optional ContextLLMConverter / ContextEstimator /
-// ContextWindowProvider interfaces.
-func NewAgent(opts ...AgentOption) *Agent {
-	a := &Agent{
-		maxTurns:         defaultMaxTurns,
-		maxRetries:       defaultMaxRetries,
-		pendingToolCalls: make(map[string]struct{}),
-	}
-	for _, opt := range opts {
-		opt(a)
-	}
-	if a.contextManager != nil {
-		if c, ok := a.contextManager.(ContextLLMConverter); ok {
-			a.convertToLLM = c.ConvertToLLM
-		}
-		if e, ok := a.contextManager.(ContextEstimator); ok {
-			a.contextEstimateFn = e.EstimateContext
-		}
-		if w, ok := a.contextManager.(ContextWindowProvider); ok {
-			a.contextWindow = w.ContextWindow()
-		}
-	}
-	return a
+type subscriber struct{ fn func(Event) error }
+
+// NewAgent returns an Agent that runs history with cfg. Its runs replace
+// cfg's Emit, Steering and FollowUp with the Agent's: subscribers, Steer and
+// FollowUp.
+func NewAgent(cfg Config, history []Message) *Agent {
+	return &Agent{cfg: cfg, history: slices.Clone(history)}
 }
 
-// Subscribe registers a listener for agent events. Returns an unsubscribe function.
-//
-// Dispatch contract (stable API guarantee): listeners are invoked
-// synchronously, in registration order, on the agent's event-consumption
-// goroutine. A listener registered before another always observes each event
-// first — ordering-sensitive consumers (e.g. a budget sentinel that must veto
-// before a dispatcher reacts) may rely on this. The flip side: a slow listener
-// delays event delivery to all later listeners and backpressures the loop's
-// event channel; offload heavy work to your own goroutine.
-//
-// Lifecycle contract (stable API guarantee):
-//   - When EventAgentEnd listeners run, isRunning is already false — a
-//     listener may start the next run (Continue / InjectContext) directly.
-//   - The run's done channel — what WaitForIdle and HoldRuns wait on —
-//     closes only after all listeners for the final event have returned.
-//   - Therefore a listener must never call HoldRuns or Reset, and must never
-//     block on a lock that may be held by a goroutine waiting on
-//     WaitForIdle/HoldRuns: both are self-deadlocks.
-func (a *Agent) Subscribe(fn func(Event)) func() {
+// Config returns the Agent's Config.
+func (a *Agent) Config() Config {
 	a.mu.Lock()
 	defer a.mu.Unlock()
-	a.listeners = append(a.listeners, fn)
-	idx := len(a.listeners) - 1
-	return func() {
-		a.mu.Lock()
-		defer a.mu.Unlock()
-		a.listeners[idx] = nil
-	}
+	return a.cfg
 }
 
-// Prompt starts a new conversation turn with the given input. The ctx scopes
-// the run: its deadline, trace values, and cancellation propagate into the
-// loop, and cancelling it aborts the run just like Abort.
-func (a *Agent) Prompt(ctx context.Context, input string) error {
-	return a.PromptMessages(ctx, UserMsg(input))
-}
-
-// PromptMessages starts a new conversation turn with arbitrary AgentMessages.
-// See Prompt for ctx semantics.
-func (a *Agent) PromptMessages(ctx context.Context, msgs ...AgentMessage) error {
+// SetConfig replaces the Agent's Config, from the next run on.
+func (a *Agent) SetConfig(cfg Config) {
 	a.mu.Lock()
-	// Checked before isRunning: during a hold's wind-down isRunning is still
-	// true, and the caller must see the stable ErrRunsHeld, not a
-	// timing-dependent ErrAlreadyRunning.
-	if a.held > 0 {
-		a.mu.Unlock()
-		return ErrRunsHeld
+	defer a.mu.Unlock()
+	a.cfg = cfg
+}
+
+// Messages returns the history, up to the last message recorded.
+func (a *Agent) Messages() []Message {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	return slices.Clone(a.history)
+}
+
+// SetMessages replaces the history, such as to start over; it fails with
+// ErrBusy while a run is under way.
+func (a *Agent) SetMessages(history []Message) error {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	if a.running {
+		return ErrBusy
 	}
-	if a.isRunning {
-		a.mu.Unlock()
-		return fmt.Errorf("%w; use Steer() or FollowUp() to queue messages", ErrAlreadyRunning)
-	}
-	a.startPromptRunLocked(ctx, msgs)
+	a.history = slices.Clone(history)
 	return nil
 }
 
-// Continue resumes from the current context without adding new messages.
-// If the last message is from assistant, it dequeues steering/follow-up
-// messages (steering first) and replays them as the new prompt.
-//
-// Queue retention caveat: messages queued via Steer/FollowUp survive an
-// aborted run — Abort cancels execution but never consumes or clears the
-// queues, so the next Continue (including any automatic resume the harness
-// performs) replays them. If a queued directive must not outlive the run it
-// was meant for, clear it on your abort path via ClearSteeringQueue /
-// ClearFollowUpQueue / ClearAllQueues; agentcore cannot decide this — some
-// harnesses queue droppable steering text, others queue task-completion
-// notifications that must never be lost.
+// Subscribe has fn receive the events of the Agent's runs, after those of
+// earlier subscribers, until unsubscribe is called. An error fn returns
+// stops the run, as one Emit returns does, and later subscribers do not
+// receive the event: storing messages on MessageEnd keeps them out of the
+// history when that fails. Every subscriber receives the RunEnd.
+func (a *Agent) Subscribe(fn func(Event) error) (unsubscribe func()) {
+	s := &subscriber{fn}
+	a.mu.Lock()
+	a.subs = append(a.subs, s)
+	a.mu.Unlock()
+	return func() {
+		a.mu.Lock()
+		a.subs = slices.DeleteFunc(a.subs, func(x *subscriber) bool { return x == s })
+		a.mu.Unlock()
+	}
+}
+
+// Prompt runs the history with prompts added, and returns when the run
+// ends, with its error. It fails with ErrBusy while a run is under way; use
+// Steer or FollowUp then.
+func (a *Agent) Prompt(ctx context.Context, prompts ...Message) error {
+	return a.run(ctx, prompts)
+}
+
+// Continue runs the history as it is, such as after a run failed; see Run
+// for when there is nothing to continue.
 func (a *Agent) Continue(ctx context.Context) error {
+	return a.run(ctx, nil)
+}
+
+// Steer delivers msgs before the next model call of the run under way, or
+// of the next run.
+func (a *Agent) Steer(msgs ...Message) {
 	a.mu.Lock()
-	// Before isRunning (stable error during wind-down) and before any dequeue
-	// (a held Continue must not consume queued messages just to drop them).
-	if a.held > 0 {
-		a.mu.Unlock()
-		return ErrRunsHeld
-	}
-	if a.isRunning {
-		a.mu.Unlock()
-		return ErrAlreadyRunning
-	}
-	if len(a.messages) == 0 {
-		a.mu.Unlock()
-		return ErrNoMessages
-	}
+	defer a.mu.Unlock()
+	a.steering = append(a.steering, msgs...)
+}
 
-	// If last message is assistant, try to dequeue pending messages as new prompt
-	lastMsg := a.messages[len(a.messages)-1]
-	if lastMsg.GetRole() == RoleAssistant {
-		if a.resumeQueuedLocked(ctx) {
-			return nil
+// FollowUp delivers msgs once the run under way, or else the next, would
+// stop.
+func (a *Agent) FollowUp(msgs ...Message) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	a.followUp = append(a.followUp, msgs...)
+}
+
+// ClearQueues takes back the messages queued by Steer and FollowUp that no
+// run delivered yet, such as to drop them when the user aborts, or to start
+// a run for those that arrived as one ended.
+func (a *Agent) ClearQueues() (steering, followUp []Message) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	steering, followUp = a.steering, a.followUp
+	a.steering, a.followUp = nil, nil
+	return steering, followUp
+}
+
+// Compact has the Config's Compactor rewrite the history now, as a run
+// does when the history outgrows its CompactAt. Subscribers receive its
+// CompactionStart and CompactionEnd. It fails with ErrBusy while a run is
+// under way.
+func (a *Agent) Compact(ctx context.Context) error {
+	cfg, history, err := a.start()
+	if err != nil {
+		return err
+	}
+	defer a.finish(nil)
+	ctx, cancel := context.WithCancelCause(ctx)
+	defer cancel(nil)
+	r := &run{ctx: ctx, cancel: cancel, cfg: cfg, history: history}
+	_, err = r.compact()
+	return err
+}
+
+func (a *Agent) run(ctx context.Context, prompts []Message) error {
+	cfg, history, err := a.start()
+	if err != nil {
+		return err
+	}
+	cfg.Steering = func() []Message { return a.take(&a.steering) }
+	cfg.FollowUp = func() []Message { return a.take(&a.followUp) }
+	history, err = Run(ctx, cfg, history, prompts...)
+	a.finish(history)
+	return err
+}
+
+// start claims the Agent for a run, with the Config and history the run
+// starts from. Events the run emits update the history as subscribers take
+// them.
+func (a *Agent) start() (Config, []Message, error) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	if a.running {
+		return Config{}, nil, ErrBusy
+	}
+	a.running = true
+	cfg := a.cfg
+	cfg.Emit = a.dispatch
+	return cfg, slices.Clone(a.history), nil
+}
+
+// finish releases the Agent, its history the one the run ended with, if
+// given.
+func (a *Agent) finish(history []Message) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	if history != nil {
+		a.history = history
+	}
+	a.running = false
+}
+
+// dispatch hands ev to the subscribers and, once they all took it, applies
+// it to the history.
+func (a *Agent) dispatch(ev Event) error {
+	a.mu.Lock()
+	subs := slices.Clone(a.subs)
+	a.mu.Unlock()
+	_, end := ev.(RunEnd)
+	for _, s := range subs {
+		if err := s.fn(ev); err != nil && !end {
+			return err
 		}
-		a.mu.Unlock()
-		return ErrBadContinuation
 	}
-
-	a.startContinueRunLocked(ctx)
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	switch e := ev.(type) {
+	case MessageEnd:
+		a.history = append(a.history, e.Message)
+	case CompactionEnd:
+		if e.Compaction != nil {
+			a.history = slices.Clone(e.Compaction.Messages)
+		}
+	}
 	return nil
 }
 
-// resumeQueuedLocked dequeues pending messages (steering first, then
-// follow-up) and starts a prompt run with them. Caller must hold a.mu with an
-// assistant-tail idle agent; on true the run has started and the lock has been
-// released (by startPromptRunLocked), on false nothing was dequeued and the
-// lock is still held.
-func (a *Agent) resumeQueuedLocked(ctx context.Context) bool {
-	queued := dequeue(&a.steeringQ)
-	if len(queued) == 0 {
-		queued = dequeue(&a.followUpQ)
-	}
-	if len(queued) == 0 {
-		return false
-	}
-	a.skipNextInitialSteeringPoll = true
-	a.startPromptRunLocked(ctx, queued)
-	return true
-}
-
-// Steer queues a steering message to interrupt the agent mid-run.
-// Delivered after the current tool execution; remaining tools are skipped.
-func (a *Agent) Steer(msg AgentMessage) {
+func (a *Agent) take(queue *[]Message) []Message {
 	a.mu.Lock()
 	defer a.mu.Unlock()
-	a.steeringQ = append(a.steeringQ, msg)
-}
-
-// FollowUp queues a message for the next natural continuation point. An
-// active run consumes follow-ups when it reaches that point; an idle Agent
-// retains them until the harness calls Continue.
-func (a *Agent) FollowUp(msg AgentMessage) {
-	a.mu.Lock()
-	defer a.mu.Unlock()
-	a.followUpQ = append(a.followUpQ, msg)
-}
-
-// Abort cancels the current execution and emits an abort marker message
-// so the LLM knows the user interrupted.
-//
-// Abort does not touch the steering/follow-up queues: messages queued before
-// the cancellation stay queued and are replayed by the next run (see
-// Continue). Harnesses that treat queued input as stale after an abort must
-// clear it explicitly.
-func (a *Agent) Abort() {
-	a.mu.Lock()
-	defer a.mu.Unlock()
-	if a.cancel == nil {
-		// Idle: nothing to interrupt, and no run will consume the marker flag —
-		// arming it here would leak onto the next cancellation (e.g. a later
-		// HoldRuns drain, which must stay silent).
-		return
-	}
-	a.wantAbortMarker.Store(true)
-	a.cancel()
-}
-
-// AbortSilent cancels the current execution without emitting an abort marker.
-// Use for programmatic cancellation (e.g. plan mode transitions) where the
-// cancellation is not a user interruption.
-func (a *Agent) AbortSilent() {
-	a.mu.Lock()
-	defer a.mu.Unlock()
-	if a.cancel != nil {
-		a.cancel()
-	}
-}
-
-// HoldRuns stops the world for state surgery: it silently cancels any
-// in-flight run, waits for it to drain, and rejects new run starts
-// (PromptMessages / Continue / InjectContext return ErrRunsHeld) until the
-// returned release is called. Use it to make multi-step mutations — swap the
-// conversation, clear history, retarget stores — atomic with respect to the
-// run lifecycle, including auto-continues a listener may attempt mid-surgery.
-//
-//	release := agent.HoldRuns()
-//	defer release()
-//	// no run is in flight and none can start
-//
-// Semantics:
-//   - Counting: concurrent holders each get their own release (idempotent);
-//     runs stay rejected until every release has been called. The hold only
-//     freezes the run lifecycle — it does NOT mutually exclude two holders'
-//     state mutations; serialize holders on the host side.
-//   - The cancel is silent: HoldRuns itself never requests an abort marker.
-//     (A concurrent Abort can still mark the dying run — the hold does not
-//     suppress user interruptions.)
-//   - Queues are untouched: like Abort, a hold never consumes or clears
-//     Steer/FollowUp messages — clear them explicitly if they must not
-//     outlive the held run (see Continue's queue-retention caveat).
-//   - WaitForIdle after HoldRuns returns immediately: "no run in flight" is
-//     guaranteed, but that does not mean starts are allowed again.
-//   - MUST NOT be called from an event listener: the drained run's done
-//     channel closes only after its listeners return, so a listener waiting
-//     on HoldRuns deadlocks itself. (The same restriction applies to Reset.)
-func (a *Agent) HoldRuns() (release func()) {
-	a.mu.Lock()
-	a.held++
-	// Snapshotted in the same critical section as held++: a takeover run
-	// cannot start after this point (its Continue fails ErrRunsHeld), so the
-	// snapshot cannot go stale.
-	cancel, done := a.cancel, a.done
-	a.mu.Unlock()
-
-	if cancel != nil {
-		cancel()
-	}
-	if done != nil {
-		// done closes after the dying run's listeners return; listeners never
-		// block on a hold (their run starts fail fast), so this cannot hang.
-		<-done
-	}
-
-	var once sync.Once
-	return func() {
-		once.Do(func() {
-			a.mu.Lock()
-			a.held--
-			a.mu.Unlock()
-		})
-	}
-}
-
-// WaitForIdle blocks until the agent finishes the current run.
-func (a *Agent) WaitForIdle() {
-	a.mu.Lock()
-	done := a.done
-	a.mu.Unlock()
-	if done != nil {
-		<-done
-	}
-}
-
-// State returns a snapshot of the agent's current state.
-func (a *Agent) State() AgentState {
-	a.mu.Lock()
-	defer a.mu.Unlock()
-	pending := make(map[string]struct{}, len(a.pendingToolCalls))
-	for k, v := range a.pendingToolCalls {
-		pending[k] = v
-	}
-	sp := a.systemPrompt
-	if len(a.systemBlocks) > 0 && sp == "" {
-		var sb strings.Builder
-		for i, b := range a.systemBlocks {
-			if i > 0 {
-				sb.WriteString("\n\n")
-			}
-			sb.WriteString(b.Text)
-		}
-		sp = sb.String()
-	}
-	return AgentState{
-		SystemPrompt:     sp,
-		Messages:         copyMessages(a.messages),
-		Tools:            a.tools,
-		IsRunning:        a.isRunning,
-		StreamMessage:    a.streamMessage,
-		PendingToolCalls: pending,
-		TotalUsage:       a.totalUsage,
-		Error:            a.lastError,
-	}
-}
-
-// Messages returns the current message history.
-func (a *Agent) Messages() []AgentMessage {
-	a.mu.Lock()
-	defer a.mu.Unlock()
-	return copyMessages(a.messages)
-}
-
-// SetMessageCommitter replaces the durable message callback used by subsequent
-// runs. Returning an error stops the run before the message enters context.
-func (a *Agent) SetMessageCommitter(fn func(AgentMessage) error) {
-	a.mu.Lock()
-	defer a.mu.Unlock()
-	a.messageCommitter = fn
-}
-
-// SetMessages replaces the message history — restore a previous conversation,
-// or clear it with nil. Refused while a run is in flight (ErrAlreadyRunning):
-// the loop's context commit would resurrect the replaced history as silent
-// corruption. Hold the lifecycle first (HoldRuns) when mutating around live
-// runs.
-func (a *Agent) SetMessages(msgs []AgentMessage) error {
-	a.mu.Lock()
-	defer a.mu.Unlock()
-	if a.isRunning {
-		return fmt.Errorf("cannot set messages: %w", ErrAlreadyRunning)
-	}
-	a.messages = copyMessages(msgs)
-	a.syncContextManagerLocked()
-	return nil
-}
-
-// ExportMessages returns concrete Messages for serialization.
-func (a *Agent) ExportMessages() []Message {
-	a.mu.Lock()
-	defer a.mu.Unlock()
-	return CollectMessages(a.messages)
-}
-
-// ImportMessages replaces message history from deserialized Messages.
-func (a *Agent) ImportMessages(msgs []Message) error {
-	return a.SetMessages(ToAgentMessages(msgs))
-}
-
-// startPromptRunLocked starts a prompt-based run. Caller must hold a.mu.
-// The run ctx derives from the caller's ctx, so an external cancel and Abort
-// share standard OR semantics.
-func (a *Agent) startPromptRunLocked(ctx context.Context, msgs []AgentMessage) {
-	a.isRunning = true
-	a.lastError = ""
-
-	runCtx, cancel := context.WithCancel(ctx)
-	a.cancel = cancel
-	a.done = make(chan struct{})
-
-	agentCtx := AgentContext{
-		SystemPrompt: a.systemPrompt,
-		SystemBlocks: a.systemBlocks,
-		Messages:     copyMessages(a.messages),
-		Tools:        a.tools,
-	}
-	config := a.buildConfig()
-	a.mu.Unlock()
-
-	go a.consumeLoop(AgentLoop(runCtx, msgs, agentCtx, config))
-}
-
-// startContinueRunLocked starts a continue run from the current context. Caller must hold a.mu.
-// See startPromptRunLocked for run-ctx semantics.
-func (a *Agent) startContinueRunLocked(ctx context.Context) {
-	a.isRunning = true
-	a.lastError = ""
-
-	runCtx, cancel := context.WithCancel(ctx)
-	a.cancel = cancel
-	a.done = make(chan struct{})
-
-	agentCtx := AgentContext{
-		SystemPrompt: a.systemPrompt,
-		SystemBlocks: a.systemBlocks,
-		Messages:     copyMessages(a.messages),
-		Tools:        a.tools,
-	}
-	config := a.buildConfig()
-	a.mu.Unlock()
-
-	go a.consumeLoop(AgentLoopContinue(runCtx, agentCtx, config))
-}
-
-// ContextUsage returns an estimate of the current context window occupancy.
-// Returns nil if contextWindow or contextEstimateFn is not configured.
-func (a *Agent) ContextUsage() *ContextUsage {
-	a.mu.Lock()
-	defer a.mu.Unlock()
-
-	if a.contextManager != nil {
-		if usage := a.contextManager.Usage(); usage != nil {
-			cp := *usage
-			return &cp
-		}
-	}
-
-	if a.contextWindow <= 0 || a.contextEstimateFn == nil {
-		return nil
-	}
-
-	tokens, usageTokens, trailingTokens := a.contextEstimateFn(a.messages)
-	pct := float64(tokens) / float64(a.contextWindow) * 100
-
-	return &ContextUsage{
-		Tokens:         tokens,
-		ContextWindow:  a.contextWindow,
-		Percent:        pct,
-		UsageTokens:    usageTokens,
-		TrailingTokens: trailingTokens,
-	}
-}
-
-// BaselineContextUsage returns the current runtime baseline occupancy.
-// Unlike ContextUsage, this never reports a transient projected view.
-func (a *Agent) BaselineContextUsage() *ContextUsage {
-	a.mu.Lock()
-	defer a.mu.Unlock()
-
-	if a.contextManager != nil {
-		if snap := a.contextManager.Snapshot(); snap != nil && snap.BaselineUsage != nil {
-			cp := *snap.BaselineUsage
-			return &cp
-		}
-	}
-
-	if a.contextWindow <= 0 || a.contextEstimateFn == nil {
-		return nil
-	}
-
-	tokens, usageTokens, trailingTokens := a.contextEstimateFn(a.messages)
-	pct := float64(tokens) / float64(a.contextWindow) * 100
-
-	return &ContextUsage{
-		Tokens:         tokens,
-		ContextWindow:  a.contextWindow,
-		Percent:        pct,
-		UsageTokens:    usageTokens,
-		TrailingTokens: trailingTokens,
-	}
-}
-
-// ContextSnapshot returns the latest context-manager snapshot for observability.
-// Returns nil when no ContextManager is configured or no snapshot is available.
-func (a *Agent) ContextSnapshot() *ContextSnapshot {
-	a.mu.Lock()
-	defer a.mu.Unlock()
-
-	if a.contextManager == nil {
-		return nil
-	}
-	snap := a.contextManager.Snapshot()
-	if snap == nil {
-		return nil
-	}
-
-	out := *snap
-	if snap.BaselineUsage != nil {
-		usage := *snap.BaselineUsage
-		out.BaselineUsage = &usage
-	}
-	if snap.Usage != nil {
-		usage := *snap.Usage
-		out.Usage = &usage
-	}
-	return &out
-}
-
-// TotalUsage returns the cumulative token usage across all turns.
-func (a *Agent) TotalUsage() Usage {
-	a.mu.Lock()
-	defer a.mu.Unlock()
-	return a.totalUsage
-}
-
-// SetModel changes the LLM provider. Takes effect on the next turn.
-//
-// Purity contract (stable API guarantee, shared by SetThinkingLevel, SetTools,
-// SetSystemPrompt and SetSystemBlocks): a pure field assignment under the
-// agent's internal mutex — no events emitted, no callbacks invoked — so it is
-// safe to call from event listeners and while holding host locks.
-// SetContextWindow is NOT part of this contract: it calls back into the
-// ContextManager outside the lock.
-func (a *Agent) SetModel(m ChatModel) {
-	a.mu.Lock()
-	defer a.mu.Unlock()
-	a.model = m
-}
-
-// SetContextWindow updates the context window size (in tokens). The new value
-// is also pushed to the ContextManager when it implements ContextWindowSetter,
-// so a model hot-switch needs exactly one call to keep agent-side usage
-// reporting and engine-side compaction thresholds in agreement.
-func (a *Agent) SetContextWindow(n int) {
-	a.mu.Lock()
-	a.contextWindow = n
-	cm := a.contextManager
-	a.mu.Unlock()
-	// Propagate outside the agent lock: the manager has its own mutex and
-	// may be queried concurrently by a running loop.
-	if s, ok := cm.(ContextWindowSetter); ok {
-		s.SetContextWindow(n)
-	}
-}
-
-// SetSystemPrompt changes the system prompt (single-string mode).
-// Clears any multi-block system prompt set via SetSystemBlocks.
-// Purity contract: see SetModel.
-func (a *Agent) SetSystemPrompt(s string) {
-	a.mu.Lock()
-	defer a.mu.Unlock()
-	a.systemPrompt = s
-	a.systemBlocks = nil
-}
-
-// SetSystemBlocks sets a multi-block system prompt with per-block cache control.
-// Takes precedence over SetSystemPrompt. Clears the single-string prompt.
-// Purity contract: see SetModel.
-func (a *Agent) SetSystemBlocks(blocks []SystemBlock) {
-	a.mu.Lock()
-	defer a.mu.Unlock()
-	a.systemBlocks = blocks
-	a.systemPrompt = ""
-}
-
-// BuildLLMMessages constructs the message list with the same system-blocks /
-// converted-history layout the agent loop uses for its primary LLM call.
-//
-// Loop-scoped concerns are deliberately omitted: per-turn reminders are not
-// appended, and no last-user cache_control marker is added. External callers
-// (e.g., prompt suggestion) use this to share a stable prefix with the main
-// conversation for prompt cache reads without writing new breakpoints of
-// their own — the main loop's marker remains the sole writer.
-//
-// Malformed tool-call / result transcripts are repaired via RepairMessageSequence.
-func (a *Agent) BuildLLMMessages() ([]Message, error) {
-	a.mu.Lock()
-	msgs := copyMessages(a.messages)
-	blocks := a.systemBlocks
-	sp := a.systemPrompt
-	mgr := a.contextManager
-	convertFn := a.convertToLLM
-	cacheFloor := a.cacheLastMessage
-	a.mu.Unlock()
-
-	if mgr != nil {
-		proj, err := mgr.Project(context.Background(), msgs)
-		if err != nil {
-			return nil, err
-		}
-		if proj.Messages != nil {
-			msgs = proj.Messages
-		}
-	}
-
-	if convertFn == nil {
-		convertFn = DefaultConvertToLLM
-	}
-	llmMessages := RepairMessageSequence(convertFn(msgs))
-
-	if prefix := systemPrefixMessages(blocks, sp, cacheFloor); len(prefix) > 0 {
-		llmMessages = append(prefix, llmMessages...)
-	}
-	return llmMessages, nil
-}
-
-// BuildLLMTools returns the ToolSpec list this agent would send to the LLM on
-// its next turn — the exact same conversion buildToolSpecs runs inside the
-// agent loop, including DeferFilter handling.
-//
-// Side-channel callers (the /btw side-question path, prompt suggestion) need
-// this to keep their request's `tools` field byte-identical to the main
-// agent's last request — Anthropic's prompt cache rejects any prefix
-// difference, and `tools` precedes the system-block cache breakpoint. Without
-// this method, those callers send `tools: nil` and miss the system cache.
-func (a *Agent) BuildLLMTools() []ToolSpec {
-	a.mu.Lock()
-	tools := a.tools
-	a.mu.Unlock()
-	return buildToolSpecs(tools)
-}
-
-// SetTools replaces the tool set. Takes effect on the next turn.
-// Purity contract: see SetModel.
-func (a *Agent) SetTools(tools ...Tool) {
-	a.mu.Lock()
-	defer a.mu.Unlock()
-	a.tools = tools
-}
-
-// SetThinkingLevel changes the reasoning depth. Takes effect on the next turn.
-// Purity contract: see SetModel.
-func (a *Agent) SetThinkingLevel(level ThinkingLevel) {
-	a.mu.Lock()
-	defer a.mu.Unlock()
-	a.thinkingLevel = NormalizeThinkingLevel(level)
-}
-
-// SetPromptCacheKey changes the prompt-cache routing identity at runtime.
-// Takes effect on the next turn. Hosts that reuse one Agent across logical
-// conversations (session switch / reset) must update the key so a new
-// conversation doesn't inherit the previous one's cache lineage. See
-// WithPromptCacheKey for semantics.
-func (a *Agent) SetPromptCacheKey(key string) {
-	a.mu.Lock()
-	defer a.mu.Unlock()
-	a.promptCacheKey = key
-}
-
-// ClearSteeringQueue removes all queued steering messages.
-func (a *Agent) ClearSteeringQueue() {
-	a.mu.Lock()
-	defer a.mu.Unlock()
-	a.steeringQ = nil
-}
-
-// ClearFollowUpQueue removes all queued follow-up messages.
-func (a *Agent) ClearFollowUpQueue() {
-	a.mu.Lock()
-	defer a.mu.Unlock()
-	a.followUpQ = nil
-}
-
-// ClearAllQueues removes all queued steering and follow-up messages.
-func (a *Agent) ClearAllQueues() {
-	a.mu.Lock()
-	defer a.mu.Unlock()
-	a.steeringQ = nil
-	a.followUpQ = nil
-}
-
-// HasQueuedMessages reports whether any steering or follow-up messages are queued.
-func (a *Agent) HasQueuedMessages() bool {
-	a.mu.Lock()
-	defer a.mu.Unlock()
-	return len(a.steeringQ) > 0 || len(a.followUpQ) > 0
-}
-
-// HasFollowUps reports whether follow-up messages are waiting to be consumed.
-func (a *Agent) HasFollowUps() bool {
-	a.mu.Lock()
-	defer a.mu.Unlock()
-	return len(a.followUpQ) > 0
-}
-
-// Reset clears all state and queues. A run already in flight is silently
-// cancelled, drained, and wiped with the rest of the state; a run start
-// attempted after the drain begins fails with ErrRunsHeld instead of being
-// silently clobbered. Must not be called from an event listener (see HoldRuns).
-func (a *Agent) Reset() {
-	release := a.HoldRuns()
-	defer release()
-
-	a.mu.Lock()
-	defer a.mu.Unlock()
-	a.messages = nil
-	a.steeringQ = nil
-	a.followUpQ = nil
-	a.isRunning = false
-	a.lastError = ""
-	a.streamMessage = nil
-	a.pendingToolCalls = make(map[string]struct{})
-	a.totalUsage = Usage{}
-	a.done = nil
-	a.cancel = nil
-	a.syncContextManagerLocked()
-}
-
-// buildConfig constructs a LoopConfig from the agent's settings. Must be called with lock held.
-func (a *Agent) buildConfig() LoopConfig {
-	skipInitialSteering := a.skipNextInitialSteeringPoll
-	a.skipNextInitialSteeringPoll = false
-
-	return LoopConfig{
-		Model:          a.model,
-		MaxTurns:       a.maxTurns,
-		MaxRetries:     a.maxRetries,
-		MaxToolErrors:  a.maxToolErrors,
-		ThinkingLevel:  a.thinkingLevel,
-		ContextManager: a.contextManager,
-		ConvertToLLM:   a.convertToLLM,
-		CommitContext: func(msgs []AgentMessage, usage *ContextUsage) error {
-			a.mu.Lock()
-			defer a.mu.Unlock()
-			a.messages = copyMessages(msgs)
-			a.syncContextManagerLocked()
-			return nil
-		},
-		CommitMessage: a.messageCommitter,
-		ToolGate:      a.toolGate,
-		GetSteeringMessages: func() []AgentMessage {
-			a.mu.Lock()
-			defer a.mu.Unlock()
-			if skipInitialSteering {
-				skipInitialSteering = false
-				return nil
-			}
-			return dequeue(&a.steeringQ)
-		},
-		GetFollowUpMessages: func() []AgentMessage {
-			a.mu.Lock()
-			defer a.mu.Unlock()
-			return dequeue(&a.followUpQ)
-		},
-		Middlewares:           a.middlewares,
-		MaxToolConcurrency:    a.maxToolConcurrency,
-		ShouldEmitAbortMarker: a.wantAbortMarker.Load,
-		OnMessage:             a.onMessage,
-		StopGuard:             a.stopGuard,
-		LengthRecoveryPrompt:  a.lengthRecoveryPrompt,
-		AbortMarkerText:       a.abortMarkerText,
-		AbortMarkerToolText:   a.abortMarkerToolText,
-		CacheLastMessage:      a.cacheLastMessage,
-		PromptCacheKey:        a.promptCacheKey,
-	}
-}
-
-// consumeLoop reads events from the loop channel and updates internal state.
-// handles partial message residue, and constructs error fallback messages.
-func (a *Agent) consumeLoop(events <-chan Event) {
-	// Capture this run's done channel and cancel up front. A new run can take
-	// over before this loop's defer runs — an auto-continue may start it from
-	// this run's EventAgentEnd listener — reassigning a.done/a.cancel to that
-	// run. Holding our own copies keeps the defer from touching the newer run.
-	a.mu.Lock()
-	myDone := a.done
-	myCancel := a.cancel
-	a.mu.Unlock()
-
-	var partial AgentMessage // tracks partial message during streaming
-
-	defer func() {
-		a.mu.Lock()
-
-		// Handle partial message residue
-		// If stream ended with an unfinished partial, append it to messages
-		if partial != nil {
-			if msg, ok := partial.(Message); ok {
-				if !msg.IsEmpty() {
-					a.messages = append(a.messages, partial)
-					a.syncContextManagerLocked()
-				}
-			}
-		}
-
-		// Release this run's derived ctx now that the loop has drained — chiefly
-		// the propagation goroutine context starts when the caller passes a
-		// cancellable parent. myCancel is this run's own, so this never touches a
-		// newer run's ctx.
-		if myCancel != nil {
-			myCancel()
-		}
-
-		// Reset shared run-state only if no newer run has taken over. An
-		// auto-continue can start the next run from this run's EventAgentEnd
-		// listener (which fires before this defer), reassigning a.done/a.cancel/
-		// isRunning to that run — stomping them here would abort it.
-		if a.done == myDone {
-			a.isRunning = false
-			a.streamMessage = nil
-			a.pendingToolCalls = make(map[string]struct{})
-			a.cancel = nil
-			a.wantAbortMarker.Store(false)
-		}
-		a.mu.Unlock()
-		close(myDone)
-	}()
-
-	for ev := range events {
-		a.mu.Lock()
-		switch ev.Type {
-		// Message lifecycle
-		case EventMessageStart:
-			partial = ev.Message
-			a.streamMessage = ev.Message
-
-		case EventMessageUpdate:
-			partial = ev.Message
-			a.streamMessage = ev.Message
-
-		case EventMessageEnd:
-			partial = nil
-			a.streamMessage = nil
-			if ev.Message != nil {
-				a.messages = append(a.messages, ev.Message)
-				a.syncContextManagerLocked()
-				// Accumulate usage from assistant messages
-				if msg, ok := ev.Message.(Message); ok && msg.Usage != nil {
-					a.totalUsage.Add(msg.Usage)
-				}
-			}
-
-		// Tool execution lifecycle
-		case EventToolExecStart:
-			if ev.ToolID != "" {
-				a.pendingToolCalls[ev.ToolID] = struct{}{}
-			}
-
-		case EventToolExecEnd:
-			delete(a.pendingToolCalls, ev.ToolID)
-
-		// Turn end
-		case EventModelResponse:
-			if msg, ok := ev.Message.(Message); ok {
-				if errStr, _ := msg.Metadata["error_message"].(string); errStr != "" {
-					a.lastError = errStr
-				}
-			}
-
-		// Error — construct fallback assistant message (skip for intentional abort)
-		case EventError:
-			partial = nil // discard incomplete streaming message to prevent defer from appending it
-			// Also clear the externally-visible streaming view: listeners may
-			// call State() from this EventError callback, and a stale
-			// streamMessage would surface a never-completing partial that the
-			// agent has already abandoned. Cleared here, before listeners run
-			// (notifications fire after the lock is released below).
-			a.streamMessage = nil
-			if ev.Err != nil && !errors.Is(ev.Err, context.Canceled) {
-				a.lastError = ev.Err.Error()
-				errMsg := Message{
-					Role:       RoleAssistant,
-					StopReason: StopReasonError,
-					Metadata: map[string]any{
-						"error_message": ev.Err.Error(),
-					},
-					Timestamp: time.Now(),
-				}
-				a.messages = append(a.messages, errMsg)
-				a.syncContextManagerLocked()
-			}
-
-		case EventAgentEnd:
-			a.isRunning = false
-			a.streamMessage = nil
-			a.pendingToolCalls = make(map[string]struct{})
-		}
-
-		// Copy listeners to avoid holding lock during callback
-		listeners := make([]func(Event), len(a.listeners))
-		copy(listeners, a.listeners)
-		a.mu.Unlock()
-
-		for _, fn := range listeners {
-			if fn != nil {
-				fn(ev)
-			}
-		}
-	}
-}
-
-func (a *Agent) syncContextManagerLocked() {
-	if a.contextManager == nil {
-		return
-	}
-	a.contextManager.Sync(copyMessages(a.messages))
+	msgs := *queue
+	*queue = nil
+	return msgs
 }

@@ -1,6 +1,6 @@
 # AgentCore
 
-**AgentCore** 是一个极简、可组合的 Go Agent 核心库，用于构建任意 AI Agent 应用。
+**AgentCore** 是一个用来构建 AI Agent 的小型 Go 库：模型逐轮调用工具，直到完成任务。
 
 [English](README.md) | [中文](README_CN.md)
 
@@ -10,336 +10,235 @@
 go get github.com/voocel/agentcore
 ```
 
-## 设计哲学
+需要 Go 1.26 或更高版本。
 
-克制的内核，开放的扩展，往往比面面俱到的一体化更可靠。越少的内置，越多的可能。
+## 设计
 
-## 稳定性
-
-- 优先稳定 `Agent`、`AgentLoop`、`Event`、`Tool`、`Message` 这些核心接口
-- `examples/` 与内部实现细节不视为稳定 API
-
-## 架构
+AgentCore 位于模型 SDK 和应用之间：
 
 ```
-agentcore/            Agent 核心（类型、循环、Agent、事件）
-agentcore/llm/        LLM 适配层（OpenAI, Anthropic, Gemini，基于 litellm）
-agentcore/tools/      内置工具：read, write, edit, bash
-agentcore/context/    上下文运行时 —— 投影、重写、溢出恢复
-agentcore/task/       后台任务注册中心（Runtime / Entry），bash + subagent 共用
-agentcore/subagent/   SubAgent 工具 —— 通过工具调用实现多 Agent
-agentcore/proxy/      ChatModel 适配器，把 LLM 调用转发到远程代理
-agentcore/permission/ 可选权限引擎，自行适配为 ToolGate
+litellm      模型：消息、块、流、错误、各家 provider
+agentcore    Agent：循环、工具、事件、压缩
+你的应用      策略：用哪个模型、哪些工具、审批、存储、界面
 ```
 
-核心设计：
+- **建立在 litellm 之上，而不是再包一层。** 消息就是带角色的 litellm 块；流式事件就是 litellm 事件；错误就是 litellm 错误。没有第二套模型层要学，也没有要保持同步的转换。
+- **无状态循环。** `Run` 接收一段历史，返回运行结束时的历史。历史归调用方所有；需要有人替它保管历史的应用用 `Agent`。
+- **事件是事实。** 所有生命周期信号按顺序到达同一个回调。流式响应先以增量到达，再以最终消息到达一次；事件里的内容之后不会再变。
+- **消息在发生时落盘。** 每条进入历史的消息都先以 `MessageEnd` 经过 `Emit`。`Emit` 返回错误时，这条消息不进入历史，运行停止，所以在这里存储就是持久的。
+- **策略留在外面。** 审批、权限、提示词、渲染属于应用；循环只提供钩子。
 
-- **无状态循环 + 有状态 Agent** —— `loop.go` 是 free function，所有输入通过参数注入；`agent.go` 作为循环事件的唯一消费者，更新内部状态后分发给外部监听者。双层循环：内层处理工具调用 + steering，外层处理 follow-up
-- **事件流** —— 单一 `<-chan Event` 输出，驱动任何 UI（TUI、Web、Slack、日志）
-- **上下文层** —— `ContextManager`（接口）+ `agentcore/context`（默认引擎）共同负责 prompt 投影、溢出恢复，并自动接入消息转换与 token 估算
-- **SubAgent 工具**（`subagent/`）—— 通过工具调用实现多 Agent，四种模式：single、parallel、chain、background
+## 包
+
+```
+agentcore/            循环（Run）、Agent、Tool、Event、Message、Compactor
+agentcore/compact/    Summarizer：用摘要替换较早的历史
+agentcore/tools/      编码工具：read、write、edit、bash、glob、grep、ls；tool_search
+agentcore/subagent/   subagent 工具：把任务委派给子 agent
+agentcore/task/       后台任务，以及查看、停止它们的工具
+agentcore/schema/     为工具参数构建 JSON Schema 的小工具
+```
 
 ## 快速开始
 
-### 单 Agent
-
 ```go
-package main
-
-import (
-    "fmt"
-    "os"
-
-    "github.com/voocel/agentcore"
-    "github.com/voocel/agentcore/llm"
-    "github.com/voocel/agentcore/tools"
-    "github.com/voocel/litellm/provider"
-)
-
-func main() {
-    model, err := llm.NewModel("openai", "gpt-5-mini", provider.Config{APIKey: os.Getenv("OPENAI_API_KEY")})
-    if err != nil {
-        panic(err)
-    }
-
-    // 共享的 FileReadState，让 Write/Edit 能够强制 read-before-write。
-    fileState := tools.NewFileReadState()
-    agent := agentcore.NewAgent(
-        agentcore.WithModel(model),
-        agentcore.WithSystemPrompt("你是一个编程助手。"),
-        agentcore.WithTools(
-            tools.NewRead(".", fileState),
-            tools.NewWrite(".", fileState),
-            tools.NewEdit(".", fileState),
-            tools.NewBash("."),
-        ),
-    )
-
-    agent.Subscribe(func(ev agentcore.Event) {
-        if ev.Type == agentcore.EventMessageEnd {
-            if msg, ok := ev.Message.(agentcore.Message); ok && msg.Role == agentcore.RoleAssistant {
-                fmt.Println(msg.Content)
-            }
-        }
-    })
-
-    agent.Prompt("列出当前目录下的文件。")
-    agent.WaitForIdle()
+provider, err := deepseek.New(deepseek.Config{APIKey: os.Getenv("DEEPSEEK_API_KEY")})
+if err != nil {
+	log.Fatal(err)
 }
-```
-
-如果需要工具调用拦截，注册一个 `ToolGate` ——参数校验后、工具执行前调用一次的钩子。核心本身不做任何权限判定，策略由用户提供。
-
-```go
-gate := func(ctx context.Context, req agentcore.GateRequest) (*agentcore.GateDecision, error) {
-    if req.Call.Name == "bash" {
-        return &agentcore.GateDecision{Allowed: false, Reason: "禁止执行 bash"}, nil
-    }
-    return &agentcore.GateDecision{Allowed: true}, nil
+client, err := litellm.New(provider)
+if err != nil {
+	log.Fatal(err)
 }
 
-agent := agentcore.NewAgent(
-    // ... model, tools 等
-    agentcore.WithToolGate(gate),
-)
-```
-
-可选的 `agentcore/permission` 子包提供更完整的决策引擎（模式、规则、文件系统根、审计）。几行 wrapper 即可适配为 `ToolGate`。
-
-### 模型配置
-
-`llm.NewModel` 按 `provider.Names()` 中的名字构造 provider，连接设置放在 litellm 的 `provider.Config`。`llm.WithMaxTokens`、`llm.WithTemperature` 等请求默认值只在设置时发送，否则沿用厂商默认；Anthropic 等必须带上限的 provider，在没有其他上限时使用 `llm.WithMaxTokensIfRequired` 设置的值。`llm.WithExtra` 设置 provider options，即每次请求 body 的顶层字段。litellm 的 `catalog` 包提供已收录模型的上下文窗口、输出上限和价格，可用于 `llm.WithMaxTokens` 和 `llm.WithPricing`：
-
-```go
-model, err := llm.NewModel("anthropic", "claude-sonnet-4", provider.Config{
-    APIKey:    apiKey,
-    BaseURL:   baseURL,
-    UserAgent: "my-client/1.0",
-    Headers:   map[string]string{"anthropic-beta": "beta-name"},
-}, llm.WithMaxTokens(8192))
-```
-
-### 多 Agent（SubAgent 工具）
-
-子 Agent 作为普通工具被调用，各自拥有隔离的上下文。需要 import `agentcore/subagent` 子包：
-
-```go
-import (
-    "github.com/voocel/agentcore"
-    "github.com/voocel/agentcore/llm"
-    "github.com/voocel/agentcore/subagent"
-    "github.com/voocel/agentcore/tools"
-    "github.com/voocel/litellm/provider"
-)
-
-model, _ := llm.NewModel("openai", "gpt-5-mini", provider.Config{APIKey: apiKey})
-
-// 每个子 Agent 独立的 FileReadState — 各自有独立的 read 历史。
-scoutState := tools.NewFileReadState()
-workerState := tools.NewFileReadState()
-
-scout := subagent.Config{
-    Name:         "scout",
-    Description:  "快速代码侦察",
-    Model:        model,
-    SystemPrompt: "快速探索代码库并汇报发现。简洁明了。",
-    Tools:        []agentcore.Tool{tools.NewRead(".", scoutState), tools.NewBash(".")},
-    MaxTurns:     5,
+workspace := tools.Workspace{Dir: ".", Files: tools.NewFileReadState()}
+cfg := agentcore.Config{
+	Model:  agentcore.Model{Client: client, Request: litellm.Request{Model: "deepseek-flash"}},
+	System: []litellm.Block{litellm.Text("You are a helpful coding assistant.")},
+	Tools:  workspace.Tools(),
+	Emit: func(ev agentcore.Event) error {
+		switch ev := ev.(type) {
+		case agentcore.MessageDelta:
+			if d, ok := ev.Event.(litellm.TextDelta); ok {
+				fmt.Print(d.Text)
+			}
+		case agentcore.ToolStart:
+			fmt.Printf("\n[%s] %s\n", ev.Call.Name, ev.Call.Args)
+		}
+		return nil
+	},
 }
-
-worker := subagent.Config{
-    Name:         "worker",
-    Description:  "通用执行者",
-    Model:        model,
-    SystemPrompt: "执行分配给你的任务。",
-    Tools:        []agentcore.Tool{tools.NewRead(".", workerState), tools.NewWrite(".", workerState), tools.NewEdit(".", workerState), tools.NewBash(".")},
-}
-
-runner := subagent.NewRunner(scout, worker)
-subagentTool := runner.AsTool()
-agent := agentcore.NewAgent(
-    agentcore.WithModel(model),
-    agentcore.WithTools(subagentTool),
-)
+history, err := agentcore.Run(ctx, cfg, nil, agentcore.UserText("What does this project do?"))
 ```
 
-如果流程由宿主代码调度，可以绕过 JSON 工具协议直接调用：
+`Model.Request` 是每次调用的模板：模型名以及 `MaxTokens`、`Thinking`、`ProviderOptions` 等设置。消息和工具由循环填入。设置 `Model.Pricing` 后每个响应的用量都会计价。
+
+可运行的示例：[`examples/single`](examples/single) 和 [`examples/multi`](examples/multi)。
+
+## Agent
+
+`Agent` 保管一段历史并运行它，同一时间只有一次运行：
 
 ```go
-result, err := runner.Run(ctx, "worker", "实现指定修改")
-```
-
-要启用 background 模式（异步 subagent + 完成后通知主 Agent），需要再接一个共享任务运行时：
-
-```go
-import "github.com/voocel/agentcore/task"
-
-rt := task.NewRuntime()
-subagentTool.SetTaskRuntime(rt)
-subagentTool.SetNotifyFn(agent.FollowUp) // 完成后把通知作为 follow-up 送回父 Agent
-```
-
-LLM 通过工具调用触发四种执行模式：
-
-```jsonc
-// Single：单个 agent 执行单个任务
-{"agent": "scout", "task": "找到所有 API 端点"}
-
-// Parallel：多个 agent 并发执行
-{"tasks": [{"agent": "scout", "task": "查找认证代码"}, {"agent": "scout", "task": "查找数据库 schema"}]}
-
-// Chain：顺序执行，{previous} 传递上一步输出
-{"chain": [{"agent": "scout", "task": "查找认证代码"}, {"agent": "worker", "task": "基于以下内容重构: {previous}"}]}
-
-// Background：后台异步执行，立即返回，完成后通知
-{"agent": "worker", "task": "运行完整测试套件", "background": true, "description": "正在执行测试"}
-```
-
-### Steering 与注入
-
-`Inject(ctx, msg)` 根据 Agent 当前状态自动派发消息——当调用方意图是「尽快送达」、不想自己判断 running / idle 时使用：
-
-```go
-result, _ := agent.Inject(ctx, agentcore.UserMsg("结束前先重新检查未完成任务。"))
-fmt.Println(result.Disposition)
-```
-
-三种结果：
-
-- `steered_current_run` —— 当前正在运行，消息进入本轮 steering 路径
-- `resumed_idle_run` —— 当前空闲且会话尾部是 assistant，消息入队后立即触发 `Continue()`
-- `queued` —— 消息已入队，但没有立即启动新 run
-
-需要更精确控制时直接使用低层 API：
-
-```go
-agent.Steer(agentcore.UserMsg("停下来，改为专注于测试。")) // 中断当前工具序列
-agent.FollowUp(agentcore.UserMsg("现在运行测试。"))       // 排到当前 run 结束之后
-agent.Abort()                                            // 立即取消
-```
-
-如果消息必须并入「下一次显式用户输入」（而不是 Agent 队列），应继续放在应用层处理。
-
-### 事件流
-
-所有生命周期事件通过单一通道输出 —— 订阅即可驱动任何 UI：
-
-```go
-agent.Subscribe(func(ev agentcore.Event) {
-    switch ev.Type {
-    case agentcore.EventMessageStart:    // assistant 开始流式输出
-    case agentcore.EventMessageUpdate:   // 流式 token 增量
-    case agentcore.EventMessageEnd:      // 消息完成
-    case agentcore.EventToolExecStart:   // 工具开始执行
-    case agentcore.EventToolExecEnd:     // 工具执行完毕
-    case agentcore.EventError:           // 发生错误
-    }
+agent := agentcore.NewAgent(cfg, history)
+unsubscribe := agent.Subscribe(func(ev agentcore.Event) error {
+	switch e := ev.(type) {
+	case agentcore.MessageEnd:
+		return store.Append(e.Message) // 失败会停止运行
+	case agentcore.CompactionEnd:
+		if e.Compaction != nil {
+			return store.Replace(e.Compaction.Messages) // 完整的新历史
+		}
+	}
+	return nil
 })
+defer unsubscribe()
+
+ctx, cancel := context.WithCancel(ctx)
+go agent.Prompt(ctx, agentcore.UserText("Fix the failing test"))
+
+agent.Steer(agentcore.UserText("Use the table-driven style")) // 送达下一次模型调用
+agent.FollowUp(agentcore.UserText("Then update the docs"))   // 在本该停止时继续
+cancel()                                                     // 结束运行
 ```
 
-### 结构化工具进度
+只追加 `MessageEnd` 的存储恢复出来的是压缩前的历史：`Compaction.Messages` 是完整的新历史，`Replaced` 是它替代了旧历史中的多少条。`NewAgent` 会用订阅者、`Steer` 和 `FollowUp` 替换 `Config.Emit`、`Steering` 和 `FollowUp`。
 
-长耗时工具现在可以发结构化进度，而不是依赖各项目自己约定 JSON：
+取消 ctx 即结束运行。运行进行中时 `Prompt` 返回 `ErrBusy`。`Continue` 就现有历史作答（如运行失败之后），历史以响应结尾时返回 `ErrNothingToContinue`。`Compact` 按需压缩，`Messages` 和 `SetMessages` 读取和替换历史。每个订阅者都会收到 `RunEnd`，即使前面有订阅者失败。
 
-```go
-agentcore.ReportToolProgress(ctx, agentcore.ProgressPayload{
-    Kind:    agentcore.ProgressSummary,
-    Agent:   "worker",
-    Tool:    "bash",
-    Summary: "worker → bash",
-})
-```
+## 事件
 
-订阅方应直接读取 `ev.Progress` 作为工具进度更新：
+`Config.Emit`（或 `Agent.Subscribe`）接收以下事件，按类型分支处理。
 
-```go
-agent.Subscribe(func(ev agentcore.Event) {
-    if ev.Type == agentcore.EventToolExecUpdate && ev.Progress != nil {
-        fmt.Printf("[%s] %s\n", ev.Progress.Kind, ev.Progress.Summary)
-    }
-})
-```
+| 事件 | 时机 |
+|------|------|
+| `MessageStart` / `MessageDelta` | 响应开始 / 收到它的一个 litellm 流事件 |
+| `MessageEnd` | 一条消息进入历史：提示、响应、工具结果 |
+| `ToolStart` / `ToolUpdate` / `ToolEnd` | 工具调用开始（在中间件即审批之前）/ 报告进度 / 带结果结束 |
+| `TurnEnd` | 一个响应及其工具调用的结果都已记录 |
+| `Retry` | 模型调用临时失败，将重试 |
+| `CompactionStart` / `CompactionEnd` | 历史被压缩 |
+| `RunEnd` | 运行结束，带原因、错误和计数；总是最后一个事件 |
 
-### 可热切换模型
+事件逐个投递，`Emit` 不应长时间阻塞。它返回错误会停止运行：进行中的工具调用被取消，此后只再投递 `RunEnd`，它总是最后一个事件。被拒的事件不生效：被拒的 `MessageEnd` 或 `CompactionEnd` 不让这条消息或这次压缩进入历史。
 
-如果需要运行时换模型，可以用 `SwappableModel` 包一层。切换会在下一次调用生效。`subagent.Config.Model` 会在每次子 Agent 运行开始时重新解引用，所以同一个包装器对主 Agent 和子 Agent 都生效。
+消息按取出的顺序进入历史，并在进入时打上时间；从 `Steering`、`FollowUp` 或 `OnStop` 取出的消息，即使运行随后在模型作答前结束，也会记录。失败的响应——厂商以错误结束、流中断或运行被取消——连同已流出的内容一起记录，`Stop` 为 `StopError` 或 `StopAborted`，其中的工具调用被丢弃，便于在记录中呈现；它不会再发给模型。
 
-```go
-defaultModel, _ := llm.NewModel("openai", "gpt-5-mini", provider.Config{APIKey: apiKey})
-sw := agentcore.NewSwappableModel(defaultModel)
+## 工具
 
-agent := agentcore.NewAgent(agentcore.WithModel(sw))
-
-nextModel, _ := llm.NewModel("openai", "gpt-5", provider.Config{APIKey: apiKey})
-sw.Swap(nextModel) // 下一轮开始使用新模型
-```
-
-### 自定义 LLM 适配器
-
-要替换 LLM 调用为代理、Mock 或自定义实现，实现 `ChatModel` 接口并通过
-`WithModel` 传入即可。`SwappableModel` 与 `agentcore/proxy` 子包都基于这一接口构建，可作参考。
-
-### 上下文压缩
-
-对话历史接近上下文窗口上限时自动摘要压缩。现在推荐直接使用内置 `ContextManager`：
+工具是一个结构体：
 
 ```go
-import (
-    "github.com/voocel/agentcore"
-    agentctx "github.com/voocel/agentcore/context"
-)
+type weatherArgs struct {
+	City string `json:"city"`
+}
 
-engine := agentctx.NewDefaultEngine(model, 128000)
-
-agent := agentcore.NewAgent(
-    agentcore.WithModel(model),
-    agentcore.WithContextManager(engine),
+weather := agentcore.NewTool("weather", "Current weather of a city",
+	schema.Object(schema.Property("city", schema.String("City name")).Required()),
+	func(ctx context.Context, args weatherArgs) (agentcore.Result, error) {
+		return agentcore.TextResult("Sunny in " + args.City), nil
+	},
 )
 ```
 
-当 `ContextManager` 实现了相关可选能力接口时，`NewAgent` 会自动接入消息转换、token 估算和 context window，无需再手动配置。
+- 调用前按 `Schema` 校验参数；不符合的地方会告诉模型。
+- `Check` 在审批和执行前检查调用，并可返回给人看的预览，如 `edit` 和 `write` 返回的 diff，见 `ToolCall.Preview`。
+- `Parallel` 允许调用与同一轮的其他并行调用一起运行，上限为 `MaxToolConcurrency`。
+- `Deferred` 工具只在历史中有工具引用点名之后才提供给模型，`tool_search` 返回的就是这种引用（见 `tools.Defer`）。
+- `Result` 装的是 litellm 块（文本、图片、工具引用），`Result.Text` 取其文本。`Terminate` 在本轮记录完成后结束运行。
+- 运行中的工具用 `agentcore.ReportProgress(ctx, v)` 报告进度，以 `ToolUpdate` 送达。`bash` 以字符串报告每行输出，`subagent` 报告 `subagent.Progress`。
 
-当使用量超出 `ContextWindow - ReserveTokens`（默认 16384）时，压缩会：
+`Config.Middleware` 包裹每个通过检查的调用，用于审批、审计或改写参数：
 
-1. 保留最近消息（默认 20000 tokens）
-2. 通过 LLM 将旧消息摘要为结构化检查点（Goal / Progress / Key Decisions / Next Steps）
-3. 跨压缩消息追踪文件操作（read/write/edit 路径）
-4. 支持增量更新 —— 后续压缩基于已有摘要更新，而非重新总结
+```go
+approve := func(ctx context.Context, call agentcore.ToolCall, next agentcore.ToolFunc) (agentcore.Result, error) {
+	if call.Name == "bash" && !askUser(call) {
+		return agentcore.ErrorResult("The user declined this command."), nil
+	}
+	return next(ctx, call)
+}
+```
 
 ## 内置工具
 
-| 工具 | 说明 |
+`tools.Workspace` 创建编码工具，并保管它们共享的东西：
+
+```go
+workspace := tools.Workspace{
+	Dir:   ".",                       // 相对路径按它解析；不是沙箱
+	FS:    nil,                       // read/write/edit 的文件后端；nil 为本地文件系统
+	Files: tools.NewFileReadState(), // 先读后写检查；nil 不检查
+	Tasks: tasks,                     // bash 的后台命令；nil 不提供后台模式
+}
+cfg.Tools = workspace.Tools() // 或 workspace.Read()、workspace.Bash() ……
+```
+
+| 工具 | 参数 | 结果 |
+|------|------|------|
+| `read` | `file_path`、`offset`、`limit` | 带行号的内容（最多 2000 行 / 50KB）、目录列表或图片 |
+| `write` | `file_path`、`content` | 一行说明写了什么；预览是 diff |
+| `edit` | `file_path`、`old_string`、`new_string`、`replace_all` | 文件名和 diff；先精确匹配，再容忍空白和缩进差异 |
+| `bash` | `command`、`timeout`、`workdir`、`description`、`run_in_background`（有 `Tasks` 时） | 输出尾部（2000 行 / 50KB），之后是 `[exit code N]`、`[timed out after …]` 或完整输出的去处 |
+| `glob` | `pattern`、`path` | 匹配的路径，最新的在前 |
+| `grep` | `pattern`、`path`、`glob`、`ignore_case`、`literal`、`context_lines`、`limit` | `路径:行号:内容` 形式的匹配 |
+| `ls` | `path`、`depth`、`ignore` | 目录树 |
+
+结果都是纯文本。命令失败不算 `bash` 调用失败：模型需要的正是它的输出和退出码。有 `Files` 时，`write` 拒绝覆盖模型没有完整读过的已有文件，`write` 和 `edit` 拒绝读过之后又被改动的文件。调用 ctx 携带的工作目录（`tools.WithCwd`）优先于 `Dir`，比如运行中途进入的 git worktree。`bash` 需要 PATH 上有 POSIX shell（`bash` 或 `sh`），Windows 上即 Git Bash。
+
+`tools.Defer(tools)` 把工具放到 `tool_search`（`query`、`max_results`）后面，它的描述列出这些工具的名字：模型搜索过之后才看到它们的 schema。
+
+## 后台任务
+
+```go
+tasks := task.NewRuntime(dir, func(m agentcore.Message) { agent.FollowUp(m) })
+cfg.Tools = append(cfg.Tools, tasks.Tools()...) // task_output（task_id、wait、timeout）、task_stop（task_id）
+```
+
+带 `run_in_background` 的 `bash` 和 `subagent` 工具的后台模式，都把工作作为 `task.Runtime` 的任务运行：每个任务有 ID、状态和 `dir` 下的输出文件，一直运行到结束或被停止，除非要求否则没有超时。任务结束时，Runtime 把宣告它的消息（`task.KindNotification`）交给通知函数，作为后续消息送达。`Runtime.Start` 可以把你自己的工作作为任务运行。
+
+## 压缩
+
+```go
+cfg.Compactor = compact.Summarizer{}
+cfg.CompactAt = 100_000
+```
+
+循环在估算历史超过 `CompactAt` 的调用之前压缩；provider 报告上下文溢出时压缩一次再重试该调用。前者失败不会结束运行，后者必须成功。估算以上一个响应报告的输入 token 为基准。`CompactAt` 应明显高于压缩后保留的量，否则每次调用都会再压缩。
+
+`compact.Summarizer` 原样保留最近的消息（历史的四分之一，在 2k 到 20k token 之间），其余换成对话自己的模型写的检查点：它延伸对话中被替换那部分的调用，因此命中提示缓存，并要求把检查点写在 `<summary>` 标签里；请求放不下或回答没有标签时，再用纯文本记录请求一次。检查点列出被替换部分读过和改过的文件，它加载过的工具仍然保持加载。需要别的策略就实现 `agentcore.Compactor`。
+
+## 子 agent
+
+```go
+delegate := subagent.New(tasks, // nil 不提供后台模式
+	subagent.Agent{
+		Name:        "scout",
+		Description: "Fast codebase reconnaissance",
+		Config: func(s subagent.Spawn) (agentcore.Config, error) {
+			return agentcore.Config{Model: model, System: scoutPrompt, Tools: readOnlyTools()}, nil
+		},
+	},
+)
+```
+
+模型调用 `subagent` 时，给 `agent` 和 `task` 运行一个 agent；给 `tasks`（`{agent, task}` 数组）并行运行多个，同时最多 8 个；给 `chain` 按顺序运行，任务里的 `{previous}` 代表上一步的输出；给 `background`（需要 `task.Runtime`）把一个 agent 作为任务在后台运行；`model` 换用别的模型。每次运行拿到自己的 `Config`，工具状态互不相干；它的事件发给该 `Config.Emit`，并作为 `subagent.Progress` 发给等待中的调用。失败的运行会报告错误和它最后说的话。嵌套深度最多为 `subagent.MaxDepth`。
+
+## Config
+
+| 字段 | 说明 |
 |------|------|
-| `read` | 读取文件内容，head 截断（2000 行 / 50KB） |
-| `write` | 写入文件，自动创建目录 |
-| `edit` | 精确文本替换，支持模糊匹配、BOM/行ending 归一化、unified diff 输出 |
-| `bash` | 执行 shell 命令，tail 截断（2000 行 / 50KB） |
-
-`bash` 工具要求 PATH 上有 POSIX shell（`bash` 或 `sh`）——Windows 上即 Git Bash。不提供 cmd.exe/PowerShell 回退：LLM 生成的命令假定 POSIX 语法。
-
-## API 参考
-
-### Agent
-
-| 方法 | 说明 |
-|------|------|
-| `NewAgent(opts...)` | 创建 Agent |
-| `Prompt(input)` | 发起新对话轮次 |
-| `PromptMessages(msgs...)` | 用任意 AgentMessage 发起对话 |
-| `Continue()` | 从当前上下文继续 |
-| `Inject(ctx, msg)` | 根据当前状态自动选择 steer / idle 续跑 / 排队 |
-| `Steer(msg)` | 中断注入 steering 消息 |
-| `FollowUp(msg)` | 排队 follow-up 消息 |
-| `Abort()` | 取消当前执行 |
-| `AbortSilent()` | 静默取消（不发 abort 标记） |
-| `HoldRuns()` | 静默排空当前 run 并拒绝新启动（`ErrRunsHeld`），直到 release——用于原子性的状态手术 |
-| `Reset()` | 经 HoldRuns 排空后清空全部状态与队列 |
-| `WaitForIdle()` | 阻塞等待完成 |
-| `Subscribe(fn)` | 注册事件监听 |
-| `State()` | 获取当前状态快照 |
-| `ExportMessages()` | 导出消息用于序列化 |
-| `ImportMessages(msgs)` | 导入反序列化的消息 |
-| `BuildLLMMessages()` | 物化下一次 LLM 调用的提示（system → 投影后的历史） |
+| `Model` | litellm 客户端、请求模板和定价 |
+| `System` / `Tools` | 系统提示块和提供的工具 |
+| `Emit` | 接收事件；返回错误会停止运行 |
+| `Steering` / `FollowUp` | 下次调用前送达的消息 / 本该停止时继续的消息 |
+| `OnStop` | 本该停止时咨询：继续、停止或失败 |
+| `Middleware` | 包裹每个工具调用，第一个在最外层 |
+| `MaxToolConcurrency` | 同时运行的并行调用数（小于 2 时逐个运行） |
+| `MaxToolErrors` | 工具连续失败这么多轮后禁用（0 表示不禁用） |
+| `Compactor` / `CompactAt` | 压缩，见上文 |
+| `Cache` | 在每次调用的最后一条消息后放置缓存断点 |
+| `MaxTurns` | 每次运行的响应数上限（0 表示 100） |
+| `MaxRetries` | 模型临时失败的重试次数，带退避 |
 
 ## 许可证
 

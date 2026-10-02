@@ -1,134 +1,98 @@
+// Multi runs an agent that delegates to sub-agents, a scout and a reviewer:
+//
+//	DEEPSEEK_API_KEY=... go run ./examples/multi
+//
+// Override the model with DEEPSEEK_MODEL.
 package main
 
 import (
 	"context"
 	"fmt"
+	"log"
 	"os"
 
 	"github.com/voocel/agentcore"
-	"github.com/voocel/agentcore/llm"
 	"github.com/voocel/agentcore/subagent"
 	"github.com/voocel/agentcore/tools"
-	"github.com/voocel/litellm/provider"
+	"github.com/voocel/litellm"
+	"github.com/voocel/litellm/provider/deepseek"
 )
 
 func main() {
-	apiKey := os.Getenv("OPENAI_API_KEY")
-	if apiKey == "" {
-		fmt.Fprintln(os.Stderr, "OPENAI_API_KEY not set")
-		os.Exit(1)
-	}
-
-	mainModel, err := llm.NewModel("openai", "gpt-5-mini", provider.Config{APIKey: apiKey})
+	provider, err := deepseek.New(deepseek.Config{APIKey: os.Getenv("DEEPSEEK_API_KEY"), BaseURL: os.Getenv("DEEPSEEK_BASE_URL")})
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "model error: %v\n", err)
-		os.Exit(1)
+		log.Fatal(err)
 	}
-	scoutModel, err := llm.NewModel("openai", "gpt-5-mini", provider.Config{APIKey: apiKey})
+	client, err := litellm.New(provider)
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "model error: %v\n", err)
-		os.Exit(1)
+		log.Fatal(err)
 	}
+	model := agentcore.Model{Client: client, Request: litellm.Request{Model: env("DEEPSEEK_MODEL", "deepseek-flash")}}
 
-	// One file read state per agent. Sub-agents get their own independent
-	// state since they have their own conversation history.
-	mainState := tools.NewFileReadState()
-	scoutState := tools.NewFileReadState()
-	reviewerState := tools.NewFileReadState()
-
-	// Define sub-agent configurations (like pi's .md agent files)
-	scout := subagent.Config{
-		Name:         "scout",
-		Description:  "Fast codebase reconnaissance",
-		Model:        scoutModel,
-		SystemPrompt: "You are a scout agent. Quickly explore the codebase and report what you find. Be concise.",
-		Tools: []agentcore.Tool{
-			tools.NewRead(".", scoutState),
-			tools.NewBash("."),
+	// A sub-agent gets its tools anew on each run, so that what one run read
+	// does not let another edit.
+	readOnly := func(system string) func(subagent.Spawn) (agentcore.Config, error) {
+		return func(subagent.Spawn) (agentcore.Config, error) {
+			w := tools.Workspace{Dir: ".", Files: tools.NewFileReadState()}
+			return agentcore.Config{
+				Model:    model,
+				System:   []litellm.Block{litellm.Text(system)},
+				Tools:    []agentcore.Tool{w.Read(), w.Glob(), w.Grep(), w.Ls()},
+				MaxTurns: 10,
+			}, nil
+		}
+	}
+	delegate := subagent.New(nil,
+		subagent.Agent{
+			Name:        "scout",
+			Description: "Fast codebase reconnaissance",
+			Config:      readOnly("You are a scout. Quickly explore the codebase and report what you find. Be concise."),
 		},
-		MaxTurns: 5,
-	}
-
-	reviewer := subagent.Config{
-		Name:         "reviewer",
-		Description:  "Code review specialist",
-		Model:        mainModel,
-		SystemPrompt: "You are a code reviewer. Review the code and provide constructive feedback on quality, style, and correctness.",
-		Tools: []agentcore.Tool{
-			tools.NewRead(".", reviewerState),
-			tools.NewBash("."),
+		subagent.Agent{
+			Name:        "reviewer",
+			Description: "Code review specialist",
+			Config:      readOnly("You are a code reviewer. Review the code and give constructive feedback on quality, style and correctness."),
 		},
-		MaxTurns: 5,
-	}
-
-	// Main agent has the subagent tool — it delegates to scout/reviewer
-	agent := agentcore.NewAgent(
-		agentcore.WithModel(mainModel),
-		agentcore.WithSystemPrompt(
-			"You are a coding assistant. Use the subagent tool to delegate tasks:\n"+
-				"- Use 'scout' for codebase exploration\n"+
-				"- Use 'reviewer' for code review\n"+
-				"You can use chain mode to scout first, then review based on findings.",
-		),
-		agentcore.WithTools(
-			tools.NewRead(".", mainState),
-			tools.NewWrite(".", mainState),
-			tools.NewEdit(".", mainState),
-			tools.NewBash("."),
-			subagent.NewRunner(scout, reviewer).AsTool(),
-		),
-		agentcore.WithMaxTurns(20),
 	)
 
-	agent.Subscribe(func(ev agentcore.Event) {
-		switch ev.Type {
-		case agentcore.EventMessageEnd:
-			if ev.Message != nil && ev.Message.GetRole() == agentcore.RoleAssistant {
-				fmt.Printf("\nAssistant: %s\n", ev.Message.TextContent())
-			}
-		case agentcore.EventToolExecStart:
-			fmt.Printf("  [tool] %s\n", ev.Tool)
-		case agentcore.EventToolExecUpdate:
-			if ev.Progress != nil {
-				fmt.Printf("  [progress:%s] %s\n", ev.Progress.Kind, formatProgress(ev.Progress))
-				break
-			}
-			switch ev.UpdateKind {
-			case agentcore.ToolExecUpdatePreview:
-				fmt.Printf("  [preview] %s\n", string(ev.Result))
-			case agentcore.ToolExecUpdateProgress:
-				fmt.Printf("  [progress] %s\n", string(ev.Result))
-			default:
-				fmt.Printf("  [update] %s\n", string(ev.Result))
-			}
-		case agentcore.EventError:
-			fmt.Fprintf(os.Stderr, "Error: %v\n", ev.Err)
-		}
-	})
-
-	if err := agent.Prompt(context.Background(), "Explore the current directory structure, then review any Go files you find. Use chain mode: scout first, then review."); err != nil {
-		fmt.Fprintf(os.Stderr, "prompt error: %v\n", err)
-		os.Exit(1)
+	w := tools.Workspace{Dir: ".", Files: tools.NewFileReadState()}
+	agent := agentcore.NewAgent(agentcore.Config{
+		Model: model,
+		System: []litellm.Block{litellm.Text("You are a coding assistant. Delegate with the subagent tool: " +
+			"'scout' explores the codebase, 'reviewer' reviews code. " +
+			"Chain them to scout first and review what the scout found.")},
+		Tools:    []agentcore.Tool{w.Read(), w.Edit(), delegate},
+		MaxTurns: 20,
+	}, nil)
+	agent.Subscribe(show)
+	if err := agent.Prompt(context.Background(), agentcore.UserText("Explore the current directory, then review the Go files you find.")); err != nil {
+		log.Fatal(err)
 	}
-
-	agent.WaitForIdle()
+	fmt.Println()
 }
 
-func formatProgress(progress *agentcore.ProgressPayload) string {
-	if progress == nil {
-		return ""
+// show prints the response as it streams, and the steps of the sub-agents.
+func show(ev agentcore.Event) error {
+	switch ev := ev.(type) {
+	case agentcore.MessageDelta:
+		if d, ok := ev.Event.(litellm.TextDelta); ok {
+			fmt.Print(d.Text)
+		}
+	case agentcore.ToolStart:
+		fmt.Printf("\n[%s] %s\n", ev.Call.Name, ev.Call.Args)
+	case agentcore.ToolUpdate:
+		if p, ok := ev.Progress.(subagent.Progress); ok {
+			if start, ok := p.Event.(agentcore.ToolStart); ok {
+				fmt.Printf("  %s: [%s] %s\n", p.Spawn.ID, start.Call.Name, start.Call.Args)
+			}
+		}
 	}
-	if progress.Summary != "" {
-		return progress.Summary
+	return nil
+}
+
+func env(key, fallback string) string {
+	if v := os.Getenv(key); v != "" {
+		return v
 	}
-	if progress.Tool != "" {
-		return progress.Tool
-	}
-	if progress.Message != "" {
-		return progress.Message
-	}
-	if progress.Delta != "" {
-		return progress.Delta
-	}
-	return string(progress.Kind)
+	return fallback
 }

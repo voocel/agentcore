@@ -2,523 +2,226 @@ package agentcore
 
 import (
 	"encoding/json"
-	"fmt"
 	"strings"
 	"time"
+
+	"github.com/voocel/litellm"
+	"github.com/voocel/litellm/catalog"
 )
 
-// ---------------------------------------------------------------------------
-// Roles
-// ---------------------------------------------------------------------------
-
-// Role defines message roles.
-type Role string
-
-const (
-	RoleUser      Role = "user"
-	RoleAssistant Role = "assistant"
-	RoleSystem    Role = "system"
-	RoleTool      Role = "tool"
-)
-
-// ---------------------------------------------------------------------------
-// Content Blocks
-// ---------------------------------------------------------------------------
-
-// ContentType identifies the kind of content in a ContentBlock.
-type ContentType string
-
-const (
-	ContentText     ContentType = "text"
-	ContentThinking ContentType = "thinking"
-	ContentToolCall ContentType = "toolCall"
-	ContentImage    ContentType = "image"
-	ContentToolRef  ContentType = "tool_reference"
-)
-
-// ContentBlock is a tagged union for message content.
-// Exactly one payload field is populated, matching the Type value.
-type ContentBlock struct {
-	Type     ContentType `json:"type"`
-	Text     string      `json:"text,omitempty"`
-	Thinking string      `json:"thinking,omitempty"`
-	ToolCall *ToolCall   `json:"tool_call,omitempty"`
-	Image    *ImageData  `json:"image,omitempty"`
-	ToolName string      `json:"tool_name,omitempty"` // tool_reference: referenced tool name
-	// State is provider replay data on text, thinking and tool call blocks.
-	State *ProviderState `json:"state,omitempty"`
+// Message is one entry of a conversation: a model message, in litellm's
+// roles and blocks, with what the loop knows of it. A tool result is a
+// message of role litellm.RoleTool holding one litellm.ToolResultBlock.
+// Messages encode as JSON, so a history is stored as it is.
+type Message struct {
+	Role   litellm.Role    `json:"role"`
+	Blocks []litellm.Block `json:"blocks"`
+	// Kind marks a message the loop or the application added for its own
+	// purposes, such as KindSummary. Models see it as any message of its
+	// role.
+	Kind string `json:"kind,omitempty"`
+	// Stop, Usage, Provider and Model describe an assistant message: why the
+	// response ended, what it used, and what produced it.
+	Stop     StopReason `json:"stop,omitempty"`
+	Usage    *Usage     `json:"usage,omitempty"`
+	Provider string     `json:"provider,omitempty"`
+	Model    string     `json:"model,omitempty"`
+	// Time is when the message entered the history.
+	Time time.Time `json:"time"`
 }
 
-// ProviderState is data a provider attached to a block it produced so the
-// block can be sent back to it: a reasoning signature, encrypted reasoning or
-// an item id. Persist it with the message and never interpret it; only the
-// provider that produced it reads it. Thinking whose text was changed must
-// drop it, as signatures cover the text.
-type ProviderState struct {
-	Provider string          `json:"provider"`
-	Model    string          `json:"model,omitempty"`
-	Data     json.RawMessage `json:"data"`
-}
+// KindSummary marks the summary a compaction put in place of the history it
+// replaced.
+const KindSummary = "summary"
 
-// ImageData holds image content as base64 data or a URL.
-// When URL is set, providers pass it directly (no download/encoding needed).
-// When Data is set, it is sent as a base64 data URL with MimeType.
-// MimeType is required for base64 mode, optional for URL mode (provider infers it).
-type ImageData struct {
-	Data     string `json:"data,omitempty"`
-	URL      string `json:"url,omitempty"`
-	MimeType string `json:"mime_type,omitempty"`
-}
+// KindResume marks the prompt the loop adds after a response was cut off at
+// the output token limit, to have the model resume it.
+const KindResume = "resume"
 
-// Block constructors
-
-func TextBlock(text string) ContentBlock {
-	return ContentBlock{Type: ContentText, Text: text}
-}
-
-func ThinkingBlock(thinking string) ContentBlock {
-	return ContentBlock{Type: ContentThinking, Thinking: thinking}
-}
-
-func ToolCallBlock(tc ToolCall) ContentBlock {
-	return ContentBlock{Type: ContentToolCall, ToolCall: &tc}
-}
-
-func ImageBlock(data, mimeType string) ContentBlock {
-	return ContentBlock{Type: ContentImage, Image: &ImageData{Data: data, MimeType: mimeType}}
-}
-
-func ImageURLBlock(url string) ContentBlock {
-	return ContentBlock{Type: ContentImage, Image: &ImageData{URL: url}}
-}
-
-func ToolRefBlock(toolName string) ContentBlock {
-	return ContentBlock{Type: ContentToolRef, ToolName: toolName}
-}
-
-// ---------------------------------------------------------------------------
-// Stop Reason
-// ---------------------------------------------------------------------------
-
-// StopReason indicates why the LLM stopped generating.
+// StopReason is why a response ended.
 type StopReason string
 
 const (
-	StopReasonStop    StopReason = "stop"
-	StopReasonLength  StopReason = "length"
-	StopReasonToolUse StopReason = "toolUse"
-	StopReasonError   StopReason = "error"
-	StopReasonSafety  StopReason = "safety"
-	StopReasonAborted StopReason = "aborted"
+	// StopEnd is a response the model ended.
+	StopEnd StopReason = "end"
+	// StopToolUse is a response that calls tools.
+	StopToolUse StopReason = "tool_use"
+	// StopLength is a response cut off at the output token limit.
+	StopLength StopReason = "length"
+	// StopSafety is a response the vendor's safety system ended or refused.
+	StopSafety StopReason = "safety"
+	// StopError is a response the vendor ended with an error.
+	StopError StopReason = "error"
+	// StopAborted is a response the run was cancelled during; it holds what
+	// streamed before.
+	StopAborted StopReason = "aborted"
+	// StopOther is a reason the vendor gave that has no equivalent here.
+	StopOther StopReason = "other"
 )
 
-// ---------------------------------------------------------------------------
-// Usage
-// ---------------------------------------------------------------------------
-
-// Cost tracks monetary cost for a single LLM call in USD.
-type Cost struct {
-	Input      float64 `json:"input"`
-	Output     float64 `json:"output"`
-	CacheRead  float64 `json:"cache_read"`
-	CacheWrite float64 `json:"cache_write"`
-	Total      float64 `json:"total"`
-}
-
-// Add accumulates another Cost into this one (nil-safe).
-func (c *Cost) Add(other *Cost) {
-	if other == nil {
-		return
+func stopReason(f litellm.FinishReason) StopReason {
+	switch f {
+	case litellm.FinishReasonStop, "":
+		return StopEnd
+	case litellm.FinishReasonToolCall:
+		return StopToolUse
+	case litellm.FinishReasonLength:
+		return StopLength
+	case litellm.FinishReasonSafety:
+		return StopSafety
+	case litellm.FinishReasonError:
+		return StopError
+	default:
+		return StopOther
 	}
-	c.Input += other.Input
-	c.Output += other.Output
-	c.CacheRead += other.CacheRead
-	c.CacheWrite += other.CacheWrite
-	c.Total += other.Total
 }
 
-// Usage tracks token consumption for a single LLM call.
-//
-// Field semantics:
-//   - Input: all prompt tokens sent to the model, cache reads and writes included
-//   - Output: completion tokens generated (includes reasoning tokens if applicable)
-//   - CacheRead: the part of Input served from prompt cache
-//   - CacheWrite: the part of Input written to prompt cache
-//   - TotalTokens: provider-reported total, typically Input + Output
-//   - Provider/Model: actual provider/model that produced this call, if reported
-//   - Cost: monetary cost computed from model pricing (nil if pricing unavailable)
+// Usage is what a response used. Input counts all prompt tokens, cache reads
+// and writes included; Output counts reasoning.
 type Usage struct {
-	Provider string `json:"provider,omitempty"`
-	Model    string `json:"model,omitempty"`
-
-	Input       int   `json:"input"`
-	Output      int   `json:"output"`
-	CacheRead   int   `json:"cache_read"`
-	CacheWrite  int   `json:"cache_write"`
-	TotalTokens int   `json:"total_tokens"`
-	Cost        *Cost `json:"cost,omitempty"`
+	Input      int `json:"input"`
+	Output     int `json:"output"`
+	CacheRead  int `json:"cache_read,omitempty"`
+	CacheWrite int `json:"cache_write,omitempty"`
+	// Cost is what it cost, when the model's pricing is known.
+	Cost *catalog.Cost `json:"cost,omitempty"`
 }
 
-// Add accumulates another Usage into this one (nil-safe).
-func (u *Usage) Add(other *Usage) {
-	if other == nil {
+// Add adds o, if any, to u: a running total, such as a session's. The total
+// costs what the priced usage cost.
+func (u *Usage) Add(o *Usage) {
+	if o == nil {
 		return
 	}
-	u.Input += other.Input
-	u.Output += other.Output
-	u.CacheRead += other.CacheRead
-	u.CacheWrite += other.CacheWrite
-	u.TotalTokens += other.TotalTokens
-	if other.Cost != nil {
-		if u.Cost == nil {
-			u.Cost = &Cost{}
+	u.Input += o.Input
+	u.Output += o.Output
+	u.CacheRead += o.CacheRead
+	u.CacheWrite += o.CacheWrite
+	if o.Cost == nil {
+		return
+	}
+	var c catalog.Cost
+	if u.Cost != nil {
+		c = *u.Cost
+	}
+	u.Cost = &catalog.Cost{
+		Input:      c.Input + o.Cost.Input,
+		Output:     c.Output + o.Cost.Output,
+		CacheRead:  c.CacheRead + o.Cost.CacheRead,
+		CacheWrite: c.CacheWrite + o.Cost.CacheWrite,
+		Total:      c.Total + o.Cost.Total,
+	}
+}
+
+// usage is the usage a response reported, priced; nil when it reported
+// none.
+func usage(u litellm.Usage, pricing *catalog.Pricing) *Usage {
+	if u == (litellm.Usage{}) {
+		return nil
+	}
+	out := &Usage{Input: u.InputTokens, Output: u.OutputTokens, CacheRead: u.CacheReadTokens, CacheWrite: u.CacheWriteTokens}
+	if pricing != nil {
+		// Inconsistent counts leave the cost unknown.
+		if cost, err := pricing.Cost(u); err == nil {
+			out.Cost = &cost
 		}
-		u.Cost.Add(other.Cost)
+	}
+	return out
+}
+
+// UserText returns a user message of text.
+func UserText(text string) Message {
+	return User(litellm.Text(text))
+}
+
+// User returns a user message of blocks.
+func User(blocks ...litellm.Block) Message {
+	return Message{Role: litellm.RoleUser, Blocks: blocks}
+}
+
+// ToolResult returns the message that answers the tool call id with result.
+func ToolResult(id string, result Result) Message {
+	return Message{
+		Role:   litellm.RoleTool,
+		Blocks: []litellm.Block{litellm.ToolResultBlock{ToolUseID: id, Content: result.Content, IsError: result.IsError}},
 	}
 }
 
-// ---------------------------------------------------------------------------
-// Thinking Level
-// ---------------------------------------------------------------------------
-
-// ThinkingLevel configures the reasoning depth for models that support it.
-type ThinkingLevel string
-
-const (
-	// ThinkingAuto leaves thinking/reasoning behavior to the provider/model default.
-	ThinkingAuto    ThinkingLevel = ""
-	ThinkingOff     ThinkingLevel = "off"
-	ThinkingMinimal ThinkingLevel = "minimal"
-	ThinkingLow     ThinkingLevel = "low"
-	ThinkingMedium  ThinkingLevel = "medium"
-	ThinkingHigh    ThinkingLevel = "high"
-	ThinkingXHigh   ThinkingLevel = "xhigh"
-	ThinkingMax     ThinkingLevel = "max"
-)
-
-// NormalizeThinkingLevel returns the canonical level used internally.
-// Empty and "auto" both mean "do not send a thinking override".
-func NormalizeThinkingLevel(level ThinkingLevel) ThinkingLevel {
-	level = ThinkingLevel(strings.ToLower(strings.TrimSpace(string(level))))
-	if level == "auto" {
-		return ThinkingAuto
-	}
-	return level
-}
-
-// ---------------------------------------------------------------------------
-// Messages
-// ---------------------------------------------------------------------------
-
-// AgentMessage is the app-layer message abstraction.
-// Message implements this interface. Users can define custom types
-// (e.g. status notifications, UI hints) that flow through the context
-// pipeline but get filtered out by ConvertToLLM.
-type AgentMessage interface {
-	GetRole() Role
-	GetTimestamp() time.Time
-	TextContent() string
-	ThinkingContent() string
-	HasToolCalls() bool
-}
-
-// Message is an LLM-level message with structured content blocks.
-type Message struct {
-	Role       Role           `json:"role"`
-	Content    []ContentBlock `json:"content"`
-	StopReason StopReason     `json:"stop_reason,omitempty"`
-	Usage      *Usage         `json:"usage,omitempty"`
-	Metadata   map[string]any `json:"metadata,omitempty"`
-	Timestamp  time.Time      `json:"timestamp"`
-}
-
-func (m Message) GetRole() Role           { return m.Role }
-func (m Message) GetTimestamp() time.Time { return m.Timestamp }
-
-// TextContent returns the concatenated text from all text blocks.
-func (m Message) TextContent() string {
+// Text returns the text of m's text blocks, or of the tool result it holds.
+func (m Message) Text() string {
 	var sb strings.Builder
-	for _, b := range m.Content {
-		if b.Type == ContentText {
+	for _, block := range m.Blocks {
+		switch b := block.(type) {
+		case litellm.TextBlock:
+			sb.WriteString(b.Text)
+		case litellm.ToolResultBlock:
+			for _, c := range b.Content {
+				if t, ok := c.(litellm.TextBlock); ok {
+					sb.WriteString(t.Text)
+				}
+			}
+		}
+	}
+	return sb.String()
+}
+
+// Reasoning returns the text of m's reasoning blocks.
+func (m Message) Reasoning() string {
+	var sb strings.Builder
+	for _, block := range m.Blocks {
+		if b, ok := block.(litellm.ReasoningBlock); ok {
 			sb.WriteString(b.Text)
 		}
 	}
 	return sb.String()
 }
 
-// ThinkingContent returns the concatenated thinking text.
-func (m Message) ThinkingContent() string {
-	var sb strings.Builder
-	for _, b := range m.Content {
-		if b.Type == ContentThinking {
-			sb.WriteString(b.Thinking)
+// LastResponse returns the last response in history, the zero Message when
+// there is none.
+func LastResponse(history []Message) Message {
+	for i := len(history) - 1; i >= 0; i-- {
+		if history[i].Role == litellm.RoleAssistant {
+			return history[i]
 		}
 	}
-	return sb.String()
+	return Message{}
 }
 
-// ToolCalls returns all tool call blocks.
-func (m Message) ToolCalls() []ToolCall {
-	var calls []ToolCall
-	for _, b := range m.Content {
-		if b.Type == ContentToolCall && b.ToolCall != nil {
-			calls = append(calls, *b.ToolCall)
+// ToolCalls returns the tool calls m makes.
+func (m Message) ToolCalls() []litellm.ToolUseBlock {
+	var calls []litellm.ToolUseBlock
+	for _, block := range m.Blocks {
+		if b, ok := block.(litellm.ToolUseBlock); ok {
+			calls = append(calls, b)
 		}
 	}
 	return calls
 }
 
-// HasToolCalls reports whether any tool call blocks exist.
-func (m Message) HasToolCalls() bool {
-	for _, b := range m.Content {
-		if b.Type == ContentToolCall {
-			return true
+// ToolResult returns the tool result m holds.
+func (m Message) ToolResult() (litellm.ToolResultBlock, bool) {
+	for _, block := range m.Blocks {
+		if b, ok := block.(litellm.ToolResultBlock); ok {
+			return b, true
 		}
 	}
-	return false
+	return litellm.ToolResultBlock{}, false
 }
 
-// IsEmpty reports whether the message has no meaningful content.
-func (m Message) IsEmpty() bool {
-	return len(m.Content) == 0
-}
-
-// ---------------------------------------------------------------------------
-// Message Sequence Validation
-// ---------------------------------------------------------------------------
-
-type MessageSequenceIssueKind string
-
-const (
-	MessageSequenceIssueMissingToolResult MessageSequenceIssueKind = "missing_tool_result"
-	MessageSequenceIssueOrphanToolResult  MessageSequenceIssueKind = "orphan_tool_result"
-)
-
-// MessageSequenceIssue describes a structural problem in a tool call / tool
-// result transcript. The current validator intentionally stays narrow and
-// focuses on the two invariants the loop already repairs today:
-//   - every tool call should have a following tool result
-//   - every tool result should reference a known tool call
-type MessageSequenceIssue struct {
-	Kind           MessageSequenceIssueKind
-	MessageIndex   int
-	AssistantIndex int
-	ToolCallID     string
-	ToolName       string
-}
-
-// ValidateMessageSequence reports message-sequence issues that could cause
-// provider rejections or inconsistent replay.
-func ValidateMessageSequence(msgs []Message) []MessageSequenceIssue {
-	issues := make([]MessageSequenceIssue, 0)
-	callIDs := make(map[string]bool)
-
-	for i, msg := range msgs {
-		if msg.Role != RoleAssistant {
-			continue
-		}
-		calls := msg.ToolCalls()
-		if len(calls) == 0 {
-			continue
-		}
-
-		answered := make(map[string]bool, len(calls))
-		for j := i + 1; j < len(msgs); j++ {
-			next := msgs[j]
-			if next.Role != RoleTool {
-				break
-			}
-			if id, ok := next.Metadata["tool_call_id"].(string); ok {
-				answered[id] = true
-			}
-		}
-
-		for _, call := range calls {
-			callIDs[call.ID] = true
-			if !answered[call.ID] {
-				issues = append(issues, MessageSequenceIssue{
-					Kind:           MessageSequenceIssueMissingToolResult,
-					MessageIndex:   i,
-					AssistantIndex: i,
-					ToolCallID:     call.ID,
-					ToolName:       call.Name,
-				})
-			}
-		}
+func (m *Message) UnmarshalJSON(data []byte) error {
+	type plain Message
+	var v struct {
+		plain
+		Blocks []json.RawMessage `json:"blocks"`
 	}
-
-	for i, msg := range msgs {
-		if msg.Role != RoleTool {
-			continue
-		}
-		id, _ := msg.Metadata["tool_call_id"].(string)
-		if id == "" || callIDs[id] {
-			continue
-		}
-		issues = append(issues, MessageSequenceIssue{
-			Kind:         MessageSequenceIssueOrphanToolResult,
-			MessageIndex: i,
-			ToolCallID:   id,
-		})
+	if err := json.Unmarshal(data, &v); err != nil {
+		return err
 	}
-
-	return issues
-}
-
-// AssertMessageSequence returns an error when the transcript would require
-// synthetic repair before being sent to an LLM provider.
-func AssertMessageSequence(msgs []Message) error {
-	issues := ValidateMessageSequence(msgs)
-	if len(issues) == 0 {
-		return nil
+	blocks, err := litellm.UnmarshalBlocks(v.Blocks)
+	if err != nil {
+		return err
 	}
-	return fmt.Errorf("invalid message sequence: %s", formatMessageSequenceIssues(issues))
-}
-
-func formatMessageSequenceIssues(issues []MessageSequenceIssue) string {
-	parts := make([]string, 0, len(issues))
-	for _, issue := range issues {
-		switch issue.Kind {
-		case MessageSequenceIssueMissingToolResult:
-			parts = append(parts, fmt.Sprintf("missing tool result for %q (%s) at message %d", issue.ToolCallID, issue.ToolName, issue.MessageIndex))
-		case MessageSequenceIssueOrphanToolResult:
-			parts = append(parts, fmt.Sprintf("orphan tool result for %q at message %d", issue.ToolCallID, issue.MessageIndex))
-		default:
-			parts = append(parts, fmt.Sprintf("%s at message %d", issue.Kind, issue.MessageIndex))
-		}
-	}
-	return strings.Join(parts, "; ")
-}
-
-// RepairMessageSequence ensures tool call / tool result pairs are complete.
-// Orphaned tool calls (no matching result) get a synthetic error result inserted.
-// Orphaned tool results (no matching call) are removed.
-// This prevents LLM providers from rejecting malformed message sequences.
-func RepairMessageSequence(msgs []Message) []Message {
-	out := make([]Message, 0, len(msgs))
-
-	for i, msg := range msgs {
-		out = append(out, msg)
-
-		if msg.Role != RoleAssistant {
-			continue
-		}
-		calls := msg.ToolCalls()
-		if len(calls) == 0 {
-			continue
-		}
-
-		// Collect tool result IDs that follow this assistant message.
-		answered := make(map[string]bool, len(calls))
-		for j := i + 1; j < len(msgs); j++ {
-			next := msgs[j]
-			if next.Role == RoleTool {
-				if id, ok := next.Metadata["tool_call_id"].(string); ok {
-					answered[id] = true
-				}
-				continue
-			}
-			break
-		}
-
-		// Insert synthetic results for unanswered tool calls.
-		for _, call := range calls {
-			if !answered[call.ID] {
-				out = append(out, ToolResultMsg(call.ID, []byte(`"Tool result missing (conversation was truncated or interrupted)."`), true))
-			}
-		}
-	}
-
-	// Remove orphaned tool results (no matching call).
-	callIDs := make(map[string]bool)
-	for _, msg := range out {
-		for _, call := range msg.ToolCalls() {
-			callIDs[call.ID] = true
-		}
-	}
-
-	cleaned := make([]Message, 0, len(out))
-	for _, msg := range out {
-		if msg.Role == RoleTool {
-			if id, ok := msg.Metadata["tool_call_id"].(string); ok && !callIDs[id] {
-				continue
-			}
-		}
-		cleaned = append(cleaned, msg)
-	}
-
-	return cleaned
-}
-
-// ---------------------------------------------------------------------------
-// Message Serialization Helpers
-// ---------------------------------------------------------------------------
-
-// CollectMessages extracts concrete Messages from an AgentMessage slice,
-// dropping custom types. Use this to serialize conversation history.
-func CollectMessages(msgs []AgentMessage) []Message {
-	out := make([]Message, 0, len(msgs))
-	for _, m := range msgs {
-		if msg, ok := m.(Message); ok {
-			out = append(out, msg)
-		}
-	}
-	return out
-}
-
-// ToAgentMessages converts a Message slice to AgentMessage slice.
-// Use this to restore conversation history from deserialized Messages.
-func ToAgentMessages(msgs []Message) []AgentMessage {
-	out := make([]AgentMessage, len(msgs))
-	for i, m := range msgs {
-		out[i] = m
-	}
-	return out
-}
-
-// ---------------------------------------------------------------------------
-// Message Constructors
-// ---------------------------------------------------------------------------
-
-// UserMsg creates a user message from plain text.
-func UserMsg(text string) Message {
-	return Message{
-		Role:      RoleUser,
-		Content:   []ContentBlock{TextBlock(text)},
-		Timestamp: time.Now(),
-	}
-}
-
-// SystemMsg creates a system message.
-func SystemMsg(text string) Message {
-	return Message{
-		Role:      RoleSystem,
-		Content:   []ContentBlock{TextBlock(text)},
-		Timestamp: time.Now(),
-	}
-}
-
-// ToolResultMsg creates a tool result message.
-func ToolResultMsg(toolCallID string, content json.RawMessage, isError bool) Message {
-	return Message{
-		Role:    RoleTool,
-		Content: []ContentBlock{TextBlock(string(content))},
-		Metadata: map[string]any{
-			"tool_call_id": toolCallID,
-			"is_error":     isError,
-		},
-		Timestamp: time.Now(),
-	}
-}
-
-// AbortMsg creates an assistant abort marker message.
-// phase is "inference" or "tool_execution".
-func AbortMsg(text, phase string) Message {
-	return Message{
-		Role:       RoleAssistant,
-		Content:    []ContentBlock{TextBlock(text)},
-		StopReason: StopReasonAborted,
-		Metadata:   map[string]any{"abort_phase": phase},
-		Timestamp:  time.Now(),
-	}
+	*m = Message(v.plain)
+	m.Blocks = blocks
+	return nil
 }

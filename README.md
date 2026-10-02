@@ -1,6 +1,6 @@
 # AgentCore
 
-**AgentCore** is a minimal, composable Go library for building AI agent applications.
+**AgentCore** is a small Go library for building AI agents: a model that calls tools, turn by turn, until its task is done.
 
 [English](README.md) | [中文](README_CN.md)
 
@@ -10,340 +10,235 @@
 go get github.com/voocel/agentcore
 ```
 
-## Design Philosophy
+Requires Go 1.26 or newer.
 
-A restrained core with open extensibility tends to be more reliable than a complex all-in-one solution. Fewer built-ins, more possibilities.
+## Design
 
-## Stability
-
-- Keep `Agent`, `AgentLoop`, `Event`, `Tool`, and `Message` stable first
-- `examples/` and internal implementation details are not stable API
-
-## Architecture
+AgentCore sits between a model SDK and an application:
 
 ```
-agentcore/            Agent core (types, loop, agent, events)
-agentcore/llm/        LLM adapters (OpenAI, Anthropic, Gemini via litellm)
-agentcore/tools/      Built-in tools: read, write, edit, bash
-agentcore/context/    Context runtime — projection, rewrite, overflow recovery
-agentcore/task/       Background task registry (Runtime / Entry) shared by bash + subagent
-agentcore/subagent/   SubAgent tool — multi-agent via tool invocation
-agentcore/proxy/      ChatModel adapter that forwards calls to a remote proxy
-agentcore/permission/ Optional permission engine — adapt to ToolGate yourself
+litellm      models: messages, blocks, streams, errors, providers
+agentcore    the agent: the loop, tools, events, compaction
+your app     policy: which model, which tools, approval, storage, UI
 ```
 
-Core design:
+- **Built on litellm, not wrapping it.** A message is litellm blocks with a role; streamed events are litellm events; errors are litellm errors. There is no second model layer to learn or to keep in sync.
+- **A stateless loop.** `Run` takes a history and returns the history it ended with. The caller owns the history; `Agent` keeps one for applications that want it kept.
+- **Events are facts.** Every lifecycle signal reaches one callback, in order. A streamed response arrives as deltas, then once as the final message; nothing in an event changes later.
+- **Messages are stored as they happen.** Every message entering the history passes `Emit` as a `MessageEnd` first. An error from `Emit` keeps it out and stops the run, so storing there is durable.
+- **Policy stays out.** Approval, permissions, prompts and rendering belong to the application; the loop offers the hooks.
 
-- **Standalone loop + stateful Agent** — `loop.go` is a free function with all dependencies injected; `agent.go` is the sole consumer of loop events, updating internal state and dispatching to listeners. Double loop: inner processes tool calls + steering, outer handles follow-up
-- **Event stream** — single `<-chan Event` output drives any UI (TUI, Web, Slack, logging)
-- **Context layer** — `ContextManager` (interface) + `agentcore/context` (default engine) drive prompt projection, overflow recovery, and—via auto-wiring—message conversion and token estimation
-- **SubAgent tool** (`subagent/`) — multi-agent via tool invocation, four modes: single, parallel, chain, background
+## Packages
+
+```
+agentcore/            the loop (Run), Agent, Tool, Event, Message, Compactor
+agentcore/compact/    Summarizer: replaces older history with a summary
+agentcore/tools/      coding tools: read, write, edit, bash, glob, grep, ls; tool_search
+agentcore/subagent/   the subagent tool: delegation to sub-agents
+agentcore/task/       background tasks, and the tools that follow them
+agentcore/schema/     a small JSON Schema builder for tool arguments
+```
 
 ## Quick Start
 
-### Single Agent
-
 ```go
-package main
-
-import (
-    "fmt"
-    "os"
-
-    "github.com/voocel/agentcore"
-    "github.com/voocel/agentcore/llm"
-    "github.com/voocel/agentcore/tools"
-    "github.com/voocel/litellm/provider"
-)
-
-func main() {
-    model, err := llm.NewModel("openai", "gpt-5-mini", provider.Config{APIKey: os.Getenv("OPENAI_API_KEY")})
-    if err != nil {
-        panic(err)
-    }
-
-    // Shared FileReadState so Write/Edit can enforce read-before-write.
-    fileState := tools.NewFileReadState()
-    agent := agentcore.NewAgent(
-        agentcore.WithModel(model),
-        agentcore.WithSystemPrompt("You are a helpful coding assistant."),
-        agentcore.WithTools(
-            tools.NewRead(".", fileState),
-            tools.NewWrite(".", fileState),
-            tools.NewEdit(".", fileState),
-            tools.NewBash("."),
-        ),
-    )
-
-    agent.Subscribe(func(ev agentcore.Event) {
-        if ev.Type == agentcore.EventMessageEnd {
-            if msg, ok := ev.Message.(agentcore.Message); ok && msg.Role == agentcore.RoleAssistant {
-                fmt.Println(msg.Content)
-            }
-        }
-    })
-
-    agent.Prompt("List the files in the current directory.")
-    agent.WaitForIdle()
+provider, err := deepseek.New(deepseek.Config{APIKey: os.Getenv("DEEPSEEK_API_KEY")})
+if err != nil {
+	log.Fatal(err)
 }
-```
-
-For tool-call gating, register a `ToolGate` — a single hook called once per tool call after argument validation. The kernel implements no permission policy of its own; gates are user-supplied.
-
-```go
-gate := func(ctx context.Context, req agentcore.GateRequest) (*agentcore.GateDecision, error) {
-    if req.Call.Name == "bash" {
-        return &agentcore.GateDecision{Allowed: false, Reason: "bash disabled"}, nil
-    }
-    return &agentcore.GateDecision{Allowed: true}, nil
+client, err := litellm.New(provider)
+if err != nil {
+	log.Fatal(err)
 }
 
-agent := agentcore.NewAgent(
-    // ... model, tools, etc.
-    agentcore.WithToolGate(gate),
-)
-```
-
-The optional `agentcore/permission` subpackage offers a richer decision engine (modes, rules, filesystem roots, audit). Adapt it to `ToolGate` with a small wrapper.
-
-### Model Config
-
-`llm.NewModel` builds the provider named by `provider.Names()` from a litellm `provider.Config` holding the connection settings. Request defaults such as `llm.WithMaxTokens` and `llm.WithTemperature` are sent only when set, leaving the vendor's defaults otherwise; Providers that require a cap, such as Anthropic, get the one `llm.WithMaxTokensIfRequired` sets when no other applies. `llm.WithExtra` sets provider options, top-level fields of every request body. The litellm `catalog` package holds the context window, output limit and prices of listed models, for `llm.WithMaxTokens` and `llm.WithPricing`:
-
-```go
-model, err := llm.NewModel("anthropic", "claude-sonnet-4", provider.Config{
-    APIKey:    apiKey,
-    BaseURL:   baseURL,
-    UserAgent: "my-client/1.0",
-    Headers:   map[string]string{"anthropic-beta": "beta-name"},
-}, llm.WithMaxTokens(8192))
-```
-
-### Multi-Agent (SubAgent Tool)
-
-Sub-agents are invoked as regular tools with isolated contexts. Import the
-`agentcore/subagent` subpackage:
-
-```go
-import (
-    "github.com/voocel/agentcore"
-    "github.com/voocel/agentcore/llm"
-    "github.com/voocel/agentcore/subagent"
-    "github.com/voocel/agentcore/tools"
-    "github.com/voocel/litellm/provider"
-)
-
-model, _ := llm.NewModel("openai", "gpt-5-mini", provider.Config{APIKey: apiKey})
-
-// Each sub-agent gets its own FileReadState — independent read history.
-scoutState := tools.NewFileReadState()
-workerState := tools.NewFileReadState()
-
-scout := subagent.Config{
-    Name:         "scout",
-    Description:  "Fast codebase reconnaissance",
-    Model:        model,
-    SystemPrompt: "Quickly explore and report findings. Be concise.",
-    Tools:        []agentcore.Tool{tools.NewRead(".", scoutState), tools.NewBash(".")},
-    MaxTurns:     5,
+workspace := tools.Workspace{Dir: ".", Files: tools.NewFileReadState()}
+cfg := agentcore.Config{
+	Model:  agentcore.Model{Client: client, Request: litellm.Request{Model: "deepseek-flash"}},
+	System: []litellm.Block{litellm.Text("You are a helpful coding assistant.")},
+	Tools:  workspace.Tools(),
+	Emit: func(ev agentcore.Event) error {
+		switch ev := ev.(type) {
+		case agentcore.MessageDelta:
+			if d, ok := ev.Event.(litellm.TextDelta); ok {
+				fmt.Print(d.Text)
+			}
+		case agentcore.ToolStart:
+			fmt.Printf("\n[%s] %s\n", ev.Call.Name, ev.Call.Args)
+		}
+		return nil
+	},
 }
-
-worker := subagent.Config{
-    Name:         "worker",
-    Description:  "General-purpose executor",
-    Model:        model,
-    SystemPrompt: "Implement tasks given to you.",
-    Tools:        []agentcore.Tool{tools.NewRead(".", workerState), tools.NewWrite(".", workerState), tools.NewEdit(".", workerState), tools.NewBash(".")},
-}
-
-runner := subagent.NewRunner(scout, worker)
-subagentTool := runner.AsTool()
-agent := agentcore.NewAgent(
-    agentcore.WithModel(model),
-    agentcore.WithTools(subagentTool),
-)
+history, err := agentcore.Run(ctx, cfg, nil, agentcore.UserText("What does this project do?"))
 ```
 
-Hosts that own scheduling can bypass the JSON tool protocol:
+`Model.Request` is the template of every call: the model's name and settings such as `MaxTokens`, `Thinking` and `ProviderOptions`. The loop sets its messages and tools. Set `Model.Pricing` to have each response's usage priced.
+
+Runnable examples: [`examples/single`](examples/single) and [`examples/multi`](examples/multi).
+
+## Agent
+
+`Agent` keeps a history and runs it, one run at a time:
 
 ```go
-result, err := runner.Run(ctx, "worker", "Implement the requested change")
-```
-
-For background mode (async sub-agent runs that notify on completion), wire a
-shared task runtime:
-
-```go
-import "github.com/voocel/agentcore/task"
-
-rt := task.NewRuntime()
-subagentTool.SetTaskRuntime(rt)
-subagentTool.SetNotifyFn(agent.FollowUp) // route completion notifications back to the parent
-```
-
-Four execution modes via tool call:
-
-```jsonc
-// Single: one agent, one task
-{"agent": "scout", "task": "Find all API endpoints"}
-
-// Parallel: concurrent execution
-{"tasks": [{"agent": "scout", "task": "Find auth code"}, {"agent": "scout", "task": "Find DB schema"}]}
-
-// Chain: sequential with {previous} context passing
-{"chain": [{"agent": "scout", "task": "Find auth code"}, {"agent": "worker", "task": "Refactor based on: {previous}"}]}
-
-// Background: async execution, returns immediately, notifies on completion
-{"agent": "worker", "task": "Run full test suite", "background": true, "description": "Running tests"}
-```
-
-### Steering & Injection
-
-`Inject(ctx, msg)` delivers a message according to the agent's current state — preferred when the caller's intent is "deliver this as soon as possible" without manually branching on running vs idle:
-
-```go
-result, _ := agent.Inject(ctx, agentcore.UserMsg("Re-check unfinished tasks before stopping."))
-fmt.Println(result.Disposition)
-```
-
-Outcomes:
-
-- `steered_current_run` — agent was running; message went into the current run's steering path
-- `resumed_idle_run` — agent was idle with an assistant-tail conversation; message queued and `Continue()` started
-- `queued` — message queued, no run started
-
-For finer control, use the lower-level APIs directly:
-
-```go
-agent.Steer(agentcore.UserMsg("Stop and focus on tests instead.")) // mid-run interrupt
-agent.FollowUp(agentcore.UserMsg("Now run the tests."))            // queue for after current run
-agent.Abort()                                                      // cancel immediately
-```
-
-If a message must be merged into the next explicit user prompt (rather than the agent's queues), keep that in the application layer.
-
-### Event Stream
-
-All lifecycle events flow through a single channel — subscribe to drive any UI:
-
-```go
-agent.Subscribe(func(ev agentcore.Event) {
-    switch ev.Type {
-    case agentcore.EventMessageStart:    // assistant starts streaming
-    case agentcore.EventMessageUpdate:   // streaming token delta
-    case agentcore.EventMessageEnd:      // message complete
-    case agentcore.EventToolExecStart:   // tool execution begins
-    case agentcore.EventToolExecEnd:     // tool execution ends
-    case agentcore.EventError:           // error occurred
-    }
+agent := agentcore.NewAgent(cfg, history)
+unsubscribe := agent.Subscribe(func(ev agentcore.Event) error {
+	switch e := ev.(type) {
+	case agentcore.MessageEnd:
+		return store.Append(e.Message) // a failure stops the run
+	case agentcore.CompactionEnd:
+		if e.Compaction != nil {
+			return store.Replace(e.Compaction.Messages) // the whole new history
+		}
+	}
+	return nil
 })
+defer unsubscribe()
+
+ctx, cancel := context.WithCancel(ctx)
+go agent.Prompt(ctx, agentcore.UserText("Fix the failing test"))
+
+agent.Steer(agentcore.UserText("Use the table-driven style")) // reaches the next model call
+agent.FollowUp(agentcore.UserText("Then update the docs"))   // runs when it would stop
+cancel()                                                     // ends the run
 ```
 
-### Structured Tool Progress
+A store that appends `MessageEnd` alone restores the history from before its compactions: `Compaction.Messages` is the whole new history, and `Replaced` how many messages of the old one it stands in for. `NewAgent` replaces `Config.Emit`, `Steering` and `FollowUp` with the subscribers, `Steer` and `FollowUp`.
 
-Long-running tools can emit structured progress updates instead of ad-hoc JSON:
+A run ends when its context is cancelled. `Prompt` fails with `ErrBusy` while a run is under way. `Continue` answers the history as it stands, such as after a failed run, and fails with `ErrNothingToContinue` when it ends with a response. `Compact` compacts it on demand, `Messages` and `SetMessages` read and replace it. Every subscriber receives the `RunEnd`, even after one failed.
 
-```go
-agentcore.ReportToolProgress(ctx, agentcore.ProgressPayload{
-    Kind:    agentcore.ProgressSummary,
-    Agent:   "worker",
-    Tool:    "bash",
-    Summary: "worker → bash",
-})
-```
+## Events
 
-Subscribers should read `ev.Progress` directly for tool progress updates:
+`Config.Emit` (or `Agent.Subscribe`) receives the events below. Switch on their type.
 
-```go
-agent.Subscribe(func(ev agentcore.Event) {
-    if ev.Type == agentcore.EventToolExecUpdate && ev.Progress != nil {
-        fmt.Printf("[%s] %s\n", ev.Progress.Kind, ev.Progress.Summary)
-    }
-})
-```
+| Event | When |
+|-------|------|
+| `MessageStart` / `MessageDelta` | a response starts / a litellm stream event of it arrives |
+| `MessageEnd` | a message enters the history: a prompt, a response, a tool result |
+| `ToolStart` / `ToolUpdate` / `ToolEnd` | a tool call starts, before the middleware (approval) / reports progress / ends with its result |
+| `TurnEnd` | a response and the results of its tool calls are recorded |
+| `Retry` | a model call failed transiently and will be made again |
+| `CompactionStart` / `CompactionEnd` | the history is compacted |
+| `RunEnd` | the run ends, with its reason, error and counts; always the last event |
 
-### Swappable Models
+Events are delivered one at a time; `Emit` must not block for long. Returning an error from it stops the run: the tool calls under way are cancelled and no further event is delivered but the `RunEnd`, which is always the last. The event refused takes no effect: a refused `MessageEnd` or `CompactionEnd` keeps the message or compaction out of the history.
 
-When a model needs to change at runtime, wrap it with `SwappableModel`. The swap takes effect on the next call. `subagent.Config.Model` is resolved at the start of each sub-agent run, so the same wrapper also works for sub-agents.
+Messages enter the history in the order they were taken, timed as they do; those taken from `Steering`, `FollowUp` or `OnStop` are recorded even when the run then ends before the model answers them. A response that fails, whether the vendor ended it with an error, the stream broke off or the run was cancelled, is recorded with what streamed of it, `Stop` set to `StopError` or `StopAborted` and its tool calls dropped, so a transcript shows it; it is never sent to the model again.
 
-```go
-defaultModel, _ := llm.NewModel("openai", "gpt-5-mini", provider.Config{APIKey: apiKey})
-sw := agentcore.NewSwappableModel(defaultModel)
+## Tools
 
-agent := agentcore.NewAgent(agentcore.WithModel(sw))
-
-nextModel, _ := llm.NewModel("openai", "gpt-5", provider.Config{APIKey: apiKey})
-sw.Swap(nextModel) // next turn uses the new model
-```
-
-### Custom LLM Adapter
-
-To swap the LLM call with a proxy, mock, or custom implementation, implement
-the `ChatModel` interface and pass it via `WithModel`. `SwappableModel` and
-the `agentcore/proxy` subpackage are built on this same interface and can
-serve as references.
-
-### Context Compaction
-
-Auto-summarize conversation history when approaching the context window limit. Use the built-in context manager:
+A tool is a struct:
 
 ```go
-import (
-    "github.com/voocel/agentcore"
-    agentctx "github.com/voocel/agentcore/context"
-)
+type weatherArgs struct {
+	City string `json:"city"`
+}
 
-engine := agentctx.NewDefaultEngine(model, 128000)
-
-agent := agentcore.NewAgent(
-    agentcore.WithModel(model),
-    agentcore.WithContextManager(engine),
+weather := agentcore.NewTool("weather", "Current weather of a city",
+	schema.Object(schema.Property("city", schema.String("City name")).Required()),
+	func(ctx context.Context, args weatherArgs) (agentcore.Result, error) {
+		return agentcore.TextResult("Sunny in " + args.City), nil
+	},
 )
 ```
 
-`NewAgent` auto-wires `ConvertToLLM`, token estimation, and context window from the context manager when available.
+- Arguments are validated against `Schema` before a call runs; the model reads what does not fit.
+- `Check` vets a call before it is approved and may return a preview for people, such as the diff `edit` and `write` return, found on `ToolCall.Preview`.
+- `Parallel` lets calls run alongside the other parallel calls of their turn, up to `MaxToolConcurrency`.
+- `Deferred` tools are offered only once a tool reference in the history names them, as `tool_search` returns (see `tools.Defer`).
+- A `Result` holds litellm blocks (text, images, tool references); `Result.Text` is its text. `Terminate` ends the run once the turn is recorded.
+- A running tool reports progress with `agentcore.ReportProgress(ctx, v)`; it arrives as `ToolUpdate`. `bash` reports lines of output as strings, `subagent` reports `subagent.Progress`.
 
-When usage exceeds `ContextWindow - ReserveTokens` (default 16384), compaction:
+`Config.Middleware` wraps every call that passed its checks, for approval, auditing or rewriting arguments:
 
-1. Keeps recent messages (default 20000 tokens)
-2. Summarizes older messages via LLM into a structured checkpoint (Goal / Progress / Key Decisions / Next Steps)
-3. Tracks file operations (read/write/edit paths) across compacted messages
-4. Supports incremental updates — subsequent compactions update the existing summary rather than re-summarizing
+```go
+approve := func(ctx context.Context, call agentcore.ToolCall, next agentcore.ToolFunc) (agentcore.Result, error) {
+	if call.Name == "bash" && !askUser(call) {
+		return agentcore.ErrorResult("The user declined this command."), nil
+	}
+	return next(ctx, call)
+}
+```
 
 ## Built-in Tools
 
-| Tool | Description |
-|------|-------------|
-| `read` | Read file contents with head truncation (2000 lines / 50KB) |
-| `write` | Write file with auto-mkdir |
-| `edit` | Exact text replacement with fuzzy match, BOM/line-ending normalization, unified diff output |
-| `bash` | Execute shell commands with tail truncation (2000 lines / 50KB) |
+A `tools.Workspace` makes the coding tools and holds what they share:
 
-The `bash` tool requires a POSIX shell (`bash` or `sh`) on PATH — on Windows that means Git Bash. There is no cmd.exe/PowerShell fallback: LLM-generated commands assume POSIX syntax.
+```go
+workspace := tools.Workspace{
+	Dir:   ".",                       // relative paths resolve here; not a sandbox
+	FS:    nil,                       // read/write/edit backend; nil is the local filesystem
+	Files: tools.NewFileReadState(), // read-before-write checks; nil checks nothing
+	Tasks: tasks,                     // bash's background commands; nil offers none
+}
+cfg.Tools = workspace.Tools() // or workspace.Read(), workspace.Bash(), ...
+```
 
-## API Reference
+| Tool | Arguments | Result |
+|------|-----------|--------|
+| `read` | `file_path`, `offset`, `limit` | numbered lines (2000 lines / 50KB at most), a directory listing, or an image |
+| `write` | `file_path`, `content` | a line saying what it wrote; its preview is the diff |
+| `edit` | `file_path`, `old_string`, `new_string`, `replace_all` | the file and the diff; exact, then whitespace- and indentation-tolerant matching |
+| `bash` | `command`, `timeout`, `workdir`, `description`, `run_in_background` (with `Tasks`) | the tail of the output (2000 lines / 50KB), then `[exit code N]`, `[timed out after …]` or where the full output went |
+| `glob` | `pattern`, `path` | matching paths, newest first |
+| `grep` | `pattern`, `path`, `glob`, `ignore_case`, `literal`, `context_lines`, `limit` | `path:line:text` matches |
+| `ls` | `path`, `depth`, `ignore` | a tree |
 
-### Agent
+Results are plain text. A failing command is not a failed `bash` call: its output and exit code are what the model needs. With `Files`, `write` refuses an existing file the model has not read whole, and `write` and `edit` one that changed since it was read. The working directory of a call's context (`tools.WithCwd`) overrides `Dir`, as for a git worktree entered mid-run. `bash` needs a POSIX shell (`bash` or `sh`) on PATH; on Windows that means Git Bash.
 
-| Method | Description |
-|--------|-------------|
-| `NewAgent(opts...)` | Create agent with options |
-| `Prompt(input)` | Start new conversation turn |
-| `PromptMessages(msgs...)` | Start turn with arbitrary AgentMessages |
-| `Continue()` | Resume from current context |
-| `Inject(ctx, msg)` | Deliver message via steer / idle resume / queue, depending on current state |
-| `Steer(msg)` | Inject steering message mid-run |
-| `FollowUp(msg)` | Queue message for after completion |
-| `Abort()` | Cancel current execution |
-| `AbortSilent()` | Cancel without emitting abort marker |
-| `HoldRuns()` | Silently drain the current run and reject new starts (`ErrRunsHeld`) until released — for atomic state surgery |
-| `Reset()` | Drain via HoldRuns, then clear all state and queues |
-| `WaitForIdle()` | Block until agent finishes |
-| `Subscribe(fn)` | Register event listener |
-| `State()` | Snapshot of current state |
-| `ExportMessages()` | Export messages for serialization |
-| `ImportMessages(msgs)` | Import deserialized messages |
-| `BuildLLMMessages()` | Materialize the next-call prompt (system → projected history) |
+`tools.Defer(tools)` puts tools behind `tool_search` (`query`, `max_results`), whose description lists their names: the model sees their schemas only once it searched for them.
+
+## Background Tasks
+
+```go
+tasks := task.NewRuntime(dir, func(m agentcore.Message) { agent.FollowUp(m) })
+cfg.Tools = append(cfg.Tools, tasks.Tools()...) // task_output (task_id, wait, timeout), task_stop (task_id)
+```
+
+`bash` with `run_in_background` and the `subagent` tool's background mode run work as tasks of a `task.Runtime`: each has an ID, a status and an output file in `dir`, and runs until it ends or is stopped, with no timeout unless asked. When one ends, the Runtime hands the notify function a message announcing it, of `task.KindNotification`, to deliver as a follow-up. `Runtime.Start` runs work of your own as a task.
+
+## Compaction
+
+```go
+cfg.Compactor = compact.Summarizer{}
+cfg.CompactAt = 100_000
+```
+
+The loop compacts before a call whose history is estimated above `CompactAt`, and once when the provider reports a context overflow, then makes the call again; the first may fail without ending the run, the second may not. The estimate counts from the last response's reported input tokens. `CompactAt` should sit well above what a compaction keeps, or every call compacts again.
+
+`compact.Summarizer` keeps the recent messages verbatim, a quarter of the history between 2k and 20k tokens, and replaces the rest with a checkpoint the conversation's own model writes: it extends the conversation's call for the part it replaces, which is served from the prompt cache, and asks for the checkpoint in `<summary>` tags; when that does not fit, or the answer has no tags, it asks a second time with a plain-text transcript. The checkpoint lists the files the replaced part read and changed, and the tools it loaded stay loaded. Implement `agentcore.Compactor` for another strategy.
+
+## Sub-agents
+
+```go
+delegate := subagent.New(tasks, // nil offers no background mode
+	subagent.Agent{
+		Name:        "scout",
+		Description: "Fast codebase reconnaissance",
+		Config: func(s subagent.Spawn) (agentcore.Config, error) {
+			return agentcore.Config{Model: model, System: scoutPrompt, Tools: readOnlyTools()}, nil
+		},
+	},
+)
+```
+
+The model calls `subagent` with `agent` and `task` to run one agent; with `tasks`, an array of `{agent, task}`, to run several in parallel, 8 at a time; with `chain` to run them in order, `{previous}` in a task standing for the output of the step before; with `background` (given a `task.Runtime`) to run one as a task; `model` picks another model. Each run gets its own `Config`, so its tools keep their own state; its events go to that `Config.Emit`, and to the waiting call as `subagent.Progress`. A run that fails reports its error with what it said last. Runs nest at most `subagent.MaxDepth` deep.
+
+## Config
+
+| Field | Description |
+|-------|-------------|
+| `Model` | The litellm client, the request template and the pricing |
+| `System` / `Tools` | The system prompt blocks and the tools on offer |
+| `Emit` | Receives the events; an error stops the run |
+| `Steering` / `FollowUp` | Messages to deliver before the next call / when the run would stop |
+| `OnStop` | Consulted when the run would stop: go on, stop, or fail |
+| `Middleware` | Wraps every tool call, the first outermost |
+| `MaxToolConcurrency` | Parallel calls running at once (below 2, one by one) |
+| `MaxToolErrors` | Disables a tool failing that many turns in a row (0 never) |
+| `Compactor` / `CompactAt` | Compaction, see above |
+| `Cache` | A cache breakpoint after each call's last message |
+| `MaxTurns` | Responses per run (0 means 100) |
+| `MaxRetries` | Retries of a transient model failure, with backoff |
 
 ## License
 

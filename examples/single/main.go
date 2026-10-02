@@ -1,99 +1,72 @@
+// Single runs one agent with the coding tools on a task:
+//
+//	DEEPSEEK_API_KEY=... go run ./examples/single
+//
+// Override the model with DEEPSEEK_MODEL.
 package main
 
 import (
 	"context"
 	"fmt"
+	"log"
 	"os"
 
 	"github.com/voocel/agentcore"
-	"github.com/voocel/agentcore/llm"
 	"github.com/voocel/agentcore/tools"
-	"github.com/voocel/litellm/provider"
+	"github.com/voocel/litellm"
+	"github.com/voocel/litellm/provider/deepseek"
 )
 
 func main() {
-	apiKey := os.Getenv("OPENAI_API_KEY")
-	if apiKey == "" {
-		fmt.Fprintln(os.Stderr, "OPENAI_API_KEY not set")
-		os.Exit(1)
-	}
-
-	model, err := llm.NewModel("openai", "gpt-5-mini", provider.Config{APIKey: apiKey})
+	provider, err := deepseek.New(deepseek.Config{APIKey: os.Getenv("DEEPSEEK_API_KEY"), BaseURL: os.Getenv("DEEPSEEK_BASE_URL")})
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "model error: %v\n", err)
-		os.Exit(1)
+		log.Fatal(err)
+	}
+	client, err := litellm.New(provider)
+	if err != nil {
+		log.Fatal(err)
 	}
 
-	// Shared file read state — Read records stamps that Write/Edit use to
-	// enforce read-before-write and detect stale writes.
-	fileState := tools.NewFileReadState()
-
-	agent := agentcore.NewAgent(
-		agentcore.WithModel(model),
-		agentcore.WithSystemPrompt("You are a helpful coding assistant. Use the provided tools to help users."),
-		agentcore.WithTools(
-			tools.NewRead(".", fileState),
-			tools.NewWrite(".", fileState),
-			tools.NewEdit(".", fileState),
-			tools.NewBash("."),
-		),
-		agentcore.WithMaxTurns(20),
-	)
-
-	// Subscribe to events for output
-	agent.Subscribe(func(ev agentcore.Event) {
-		switch ev.Type {
-		case agentcore.EventMessageEnd:
-			if ev.Message != nil && ev.Message.GetRole() == agentcore.RoleAssistant {
-				fmt.Printf("\nAssistant: %s\n", ev.Message.TextContent())
-			}
-		case agentcore.EventToolExecStart:
-			fmt.Printf("  [tool] %s(%s)\n", ev.Tool, string(ev.Args))
-		case agentcore.EventToolExecUpdate:
-			if ev.Progress != nil {
-				fmt.Printf("  [progress:%s] %s\n", ev.Progress.Kind, formatProgress(ev.Progress))
-				break
-			}
-			switch ev.UpdateKind {
-			case agentcore.ToolExecUpdatePreview:
-				fmt.Printf("  [preview] %s\n", string(ev.Result))
-			case agentcore.ToolExecUpdateProgress:
-				fmt.Printf("  [progress] %s\n", string(ev.Result))
-			default:
-				fmt.Printf("  [update] %s\n", string(ev.Result))
-			}
-		case agentcore.EventToolExecEnd:
-			if ev.IsError {
-				fmt.Printf("  [tool] %s error\n", ev.Tool)
-			}
-		case agentcore.EventError:
-			fmt.Fprintf(os.Stderr, "Error: %v\n", ev.Err)
-		}
-	})
-
-	if err := agent.Prompt(context.Background(), "List the files in the current directory and tell me what you see."); err != nil {
-		fmt.Fprintf(os.Stderr, "prompt error: %v\n", err)
-		os.Exit(1)
+	// Files records what read read, so that write and edit refuse to change
+	// a file the model has not seen, or that changed since.
+	workspace := tools.Workspace{Dir: ".", Files: tools.NewFileReadState()}
+	cfg := agentcore.Config{
+		Model:    agentcore.Model{Client: client, Request: litellm.Request{Model: env("DEEPSEEK_MODEL", "deepseek-flash")}},
+		System:   []litellm.Block{litellm.Text("You are a helpful coding assistant. Use the tools to help the user.")},
+		Tools:    workspace.Tools(),
+		MaxTurns: 20,
+		Emit:     show,
 	}
-
-	agent.WaitForIdle()
+	if _, err := agentcore.Run(context.Background(), cfg, nil, agentcore.UserText("List the files in the current directory and tell me what you see.")); err != nil {
+		log.Fatal(err)
+	}
+	fmt.Println()
 }
 
-func formatProgress(progress *agentcore.ProgressPayload) string {
-	if progress == nil {
-		return ""
+// show prints the response as it streams and the tool calls as they run.
+func show(ev agentcore.Event) error {
+	switch ev := ev.(type) {
+	case agentcore.MessageDelta:
+		if d, ok := ev.Event.(litellm.TextDelta); ok {
+			fmt.Print(d.Text)
+		}
+	case agentcore.ToolStart:
+		fmt.Printf("\n[%s] %s\n", ev.Call.Name, ev.Call.Args)
+	case agentcore.ToolUpdate:
+		fmt.Printf("  %v\n", ev.Progress)
+	case agentcore.ToolEnd:
+		if ev.Result.IsError {
+			fmt.Printf("  failed: %s\n", ev.Result.Text())
+		}
+	case agentcore.Retry:
+		fmt.Printf("\n[retry %d/%d in %s] %v\n", ev.Attempt, ev.MaxRetries, ev.Delay, ev.Err)
 	}
-	if progress.Summary != "" {
-		return progress.Summary
+	return nil
+}
+
+func env(key, fallback string) string {
+	if v := os.Getenv(key); v != "" {
+		return v
 	}
-	if progress.Tool != "" {
-		return progress.Tool
-	}
-	if progress.Message != "" {
-		return progress.Message
-	}
-	if progress.Delta != "" {
-		return progress.Delta
-	}
-	return string(progress.Kind)
+	return fallback
 }

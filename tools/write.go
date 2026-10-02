@@ -3,6 +3,7 @@ package tools
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"strings"
@@ -11,33 +12,37 @@ import (
 	"github.com/voocel/agentcore/schema"
 )
 
-// WriteTool writes content to a file, creating directories as needed.
-//
-// Validate enforces read-before-write and detects stale writes when state is
-// non-nil.
-type WriteTool struct {
-	WorkDir   string
-	readState *FileReadState
-	fs        WorkspaceFS
+// Write returns the write tool: it writes content to a file, creating
+// directories as needed, and reports what it wrote. Its Check returns the
+// diff of the change, cut to a few lines, as the call's preview and, with
+// Files, refuses an existing file the model has not read whole, or that
+// changed since.
+func (w Workspace) Write() agentcore.Tool {
+	t := &writeTool{w: w, fs: w.fs()}
+	return agentcore.Tool{
+		Name:        "write",
+		Label:       "Write File",
+		Description: writeDescription,
+		Schema: schema.Object(
+			schema.Property("file_path", schema.String("The path to the file to write or overwrite (relative or absolute)")).Required(),
+			schema.Property("content", schema.String("The content to write to the file")).Required(),
+		),
+		Check: func(ctx context.Context, args json.RawMessage) (string, error) {
+			if err := t.validate(ctx, args); err != nil {
+				return "", err
+			}
+			return t.preview(ctx, args)
+		},
+		Run: t.execute,
+	}
 }
 
-// NewWrite creates a write tool rooted at workDir.
-//
-// Pass the same non-nil FileReadState to NewRead, NewWrite, and NewEdit to
-// enable read-before-write/edit validation. Pass nil to disable this tracking.
-// By default the tool operates on the local filesystem; pass WithFS to inject
-// a different WorkspaceFS backend.
-func NewWrite(workDir string, state *FileReadState, opts ...Option) *WriteTool {
-	return &WriteTool{WorkDir: workDir, readState: state, fs: resolveFS(opts)}
+type writeTool struct {
+	w  Workspace
+	fs FS
 }
 
-func (t *WriteTool) Name() string                                 { return "write" }
-func (t *WriteTool) Label() string                                { return "Write File" }
-func (t *WriteTool) ReadOnly(_ json.RawMessage) bool              { return false }
-func (t *WriteTool) ConcurrencySafe(_ json.RawMessage) bool       { return false }
-func (t *WriteTool) ActivityDescription(_ json.RawMessage) string { return "Writing file" }
-func (t *WriteTool) Description() string {
-	return `Writes a file to the local filesystem.
+const writeDescription = `Writes a file to the local filesystem.
 
 Usage:
 - This tool will overwrite the existing file if there is one at the provided path.
@@ -45,13 +50,6 @@ Usage:
 - Prefer the edit tool for modifying existing files — it only sends the diff. Only use this tool to create new files or for complete rewrites.
 - Creates parent directories if needed.
 - NEVER create documentation files (*.md) or README files unless explicitly requested by the user.`
-}
-func (t *WriteTool) Schema() map[string]any {
-	return schema.Object(
-		schema.Property("file_path", schema.String("The path to the file to write or overwrite (relative or absolute)")).Required(),
-		schema.Property("content", schema.String("The content to write to the file")).Required(),
-	)
-}
 
 type writeArgs struct {
 	FilePath string `json:"file_path"`
@@ -65,13 +63,13 @@ type writeState struct {
 	exists     bool
 }
 
-func (t *WriteTool) parseWrite(ctx context.Context, args json.RawMessage) (*writeState, error) {
+func (t *writeTool) parseWrite(ctx context.Context, args json.RawMessage) (*writeState, error) {
 	var a writeArgs
 	if err := json.Unmarshal(args, &a); err != nil {
 		return nil, fmt.Errorf("invalid args: %w", err)
 	}
 
-	a.FilePath = ResolvePath(effectiveWorkDir(ctx, t.WorkDir), a.FilePath)
+	a.FilePath = ResolvePath(t.w.dir(ctx), a.FilePath)
 
 	contentOld := ""
 	exists := false
@@ -92,106 +90,80 @@ func (t *WriteTool) parseWrite(ctx context.Context, args json.RawMessage) (*writ
 
 const writePreviewMaxLines = 12
 
-func (t *WriteTool) Preview(ctx context.Context, args json.RawMessage) (json.RawMessage, error) {
+func (t *writeTool) preview(ctx context.Context, args json.RawMessage) (string, error) {
 	state, err := t.parseWrite(ctx, args)
 	if err != nil {
-		return nil, err
+		return "", err
 	}
-
 	if !state.exists {
-		return json.Marshal(map[string]any{
-			"message":            fmt.Sprintf("Create %s", state.path),
-			"diff":               writePreview(state.contentNew, writePreviewMaxLines),
-			"first_changed_line": 1,
-		})
+		return writePreview(state.contentNew, writePreviewMaxLines), nil
 	}
-
-	diff, firstLine := generateDiff(state.contentOld, state.contentNew)
-	lines := strings.Count(diff, "\n")
-	if lines > writePreviewMaxLines {
-		kept := keepFirstNLines(diff, writePreviewMaxLines)
-		diff = kept + fmt.Sprintf("\n... [diff truncated, %d more lines]", lines-writePreviewMaxLines)
+	diff := generateDiff(state.contentOld, state.contentNew)
+	if lines := strings.Count(diff, "\n"); lines > writePreviewMaxLines {
+		diff = keepFirstNLines(diff, writePreviewMaxLines) + fmt.Sprintf("... [diff truncated, %d more lines]\n", lines-writePreviewMaxLines)
 	}
-	return json.Marshal(map[string]any{
-		"message":            fmt.Sprintf("Overwrite %s", state.path),
-		"diff":               diff,
-		"first_changed_line": firstLine,
-	})
+	return diff, nil
 }
 
-// Validate enforces read-before-write and detects stale writes.
-//
-// Error codes (stable for tests):
-//   - 2: existing file has not been read this session, or only a partial
-//     slice was read.
-//   - 3: file was modified after the last read.
-func (t *WriteTool) Validate(ctx context.Context, args json.RawMessage) agentcore.ValidationResult {
-	if t.readState == nil {
-		return agentcore.ValidationResult{OK: true}
+// validate enforces read-before-write and detects stale writes: an existing
+// file must have been read whole this session, as overwriting it would drop
+// what the model has not seen, and not modified since.
+func (t *writeTool) validate(ctx context.Context, args json.RawMessage) error {
+	if t.w.Files == nil {
+		return nil
 	}
 
 	var a writeArgs
 	if err := json.Unmarshal(args, &a); err != nil {
-		return agentcore.ValidationResult{OK: false, Message: "invalid args: " + err.Error()}
+		return errors.New("invalid args: " + err.Error())
 	}
-	path := ResolvePath(effectiveWorkDir(ctx, t.WorkDir), a.FilePath)
+	path := ResolvePath(t.w.dir(ctx), a.FilePath)
 
 	info, err := t.fs.Stat(ctx, path)
 	if os.IsNotExist(err) {
-		return agentcore.ValidationResult{OK: true}
+		return nil
 	}
 	if err != nil {
-		return agentcore.ValidationResult{OK: false, Message: "stat " + path + ": " + err.Error()}
+		return errors.New("stat " + path + ": " + err.Error())
 	}
 	if info.IsDir {
-		return agentcore.ValidationResult{OK: false, Message: "path is a directory: " + path}
+		return errors.New("path is a directory: " + path)
 	}
 
-	stamp, ok := t.readState.Get(path)
-	if !ok || stamp.Partial {
-		return agentcore.ValidationResult{
-			OK:        false,
-			ErrorCode: 2,
-			Message:   "File has not been read yet. Read it first before writing to it.",
-		}
+	stamp, ok := t.w.Files.Get(path)
+	if !ok {
+		return errors.New("File has not been read yet. Read it first before writing to it.")
+	}
+	if stamp.Partial {
+		return errors.New("Only part of the file has been read (offset/limit). Read the whole file before overwriting it, or use edit to change part of it.")
 	}
 	// Compare against the content token / mtime recorded at read time, not just
 	// "after ReadAt". Catches mtime regressions too (e.g. git checkout of an
 	// older version), and unsaved-buffer changes when the backend sets Version.
 	if !stampMatches(stamp, info) {
-		return agentcore.ValidationResult{
-			OK:        false,
-			ErrorCode: 3,
-			Message:   "File has been modified since read, either by the user or by a linter. Read it again before attempting to write it.",
-		}
+		return errors.New("File has been modified since read, either by the user or by a linter. Read it again before attempting to write it.")
 	}
-	return agentcore.ValidationResult{OK: true}
+	return nil
 }
 
-func (t *WriteTool) Execute(ctx context.Context, args json.RawMessage) (json.RawMessage, error) {
+func (t *writeTool) execute(ctx context.Context, args json.RawMessage) (agentcore.Result, error) {
 	state, err := t.parseWrite(ctx, args)
 	if err != nil {
-		return nil, err
+		return agentcore.Result{}, err
 	}
-
 	if err := t.fs.MkdirAll(ctx, dirOf(state.path), 0o755); err != nil {
-		return nil, fmt.Errorf("mkdir: %w", err)
+		return agentcore.Result{}, fmt.Errorf("mkdir: %w", err)
 	}
-
 	if err := t.fs.WriteFile(ctx, state.path, []byte(state.contentNew), 0o644); err != nil {
-		return nil, fmt.Errorf("write %s: %w", state.path, err)
+		return agentcore.Result{}, fmt.Errorf("write %s: %w", state.path, err)
 	}
+	t.w.Files.recordWrite(ctx, t.fs, state.path, true)
 
-	action := "overwrote"
+	action := "Overwrote"
 	if !state.exists {
-		action = "created"
+		action = "Created"
 	}
-	return json.Marshal(map[string]any{
-		"message":     fmt.Sprintf("%s %d bytes to %s", action, len(state.contentNew), state.path),
-		"preview":     writePreview(state.contentNew, writePreviewMaxLines),
-		"created":     !state.exists,
-		"overwritten": state.exists,
-	})
+	return agentcore.TextResult(fmt.Sprintf("%s %s (%d bytes).", action, state.path, len(state.contentNew))), nil
 }
 
 // writePreview returns the first maxLines lines of content with line numbers prefixed by "+".

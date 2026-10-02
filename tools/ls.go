@@ -10,30 +10,30 @@ import (
 	"sort"
 	"strings"
 
+	"github.com/voocel/agentcore"
 	"github.com/voocel/agentcore/schema"
 )
 
-// LsTool lists directory contents with optional depth control.
-type LsTool struct {
-	WorkDir string
+// Ls returns the ls tool: it lists directory contents as a tree, to a
+// depth.
+func (w Workspace) Ls() agentcore.Tool {
+	t := &lsTool{w: w}
+	return agentcore.Tool{
+		Name:        "ls",
+		Label:       "List Directory",
+		Description: "List directory contents as a tree. Use this for quick directory structure checks before reading files. Depth controls recursive listing (default 1, max 5). Use ignore to hide generated or irrelevant paths. Common generated directories (node_modules, .git, dist, build, etc.) are hidden by default.",
+		Schema: schema.Object(
+			schema.Property("path", schema.String("Directory path, relative or absolute (default: working directory)")),
+			schema.Property("depth", schema.Int("Recursion depth (default: 1, max: 5)")),
+			schema.Property("ignore", schema.Array("Optional file or directory patterns to ignore (for example: tmp/, *.log, dist)", schema.String("Ignore pattern"))),
+		),
+		Parallel: always,
+		Run:      textRun(t.execute),
+	}
 }
 
-func NewLs(workDir string) *LsTool { return &LsTool{WorkDir: workDir} }
-
-func (t *LsTool) Name() string                                 { return "ls" }
-func (t *LsTool) Label() string                                { return "List Directory" }
-func (t *LsTool) ReadOnly(_ json.RawMessage) bool              { return true }
-func (t *LsTool) ConcurrencySafe(_ json.RawMessage) bool       { return true }
-func (t *LsTool) ActivityDescription(_ json.RawMessage) string { return "Listing directory" }
-func (t *LsTool) Description() string {
-	return "List directory contents as a tree. Use this for quick directory structure checks before reading files. Depth controls recursive listing (default 1, max 5). Use ignore to hide generated or irrelevant paths. Common generated directories (node_modules, .git, dist, build, etc.) are hidden by default."
-}
-func (t *LsTool) Schema() map[string]any {
-	return schema.Object(
-		schema.Property("path", schema.String("Directory path, relative or absolute (default: working directory)")),
-		schema.Property("depth", schema.Int("Recursion depth (default: 1, max: 5)")),
-		schema.Property("ignore", schema.Array("Optional file or directory patterns to ignore (for example: tmp/, *.log, dist)", schema.String("Ignore pattern"))),
-	)
+type lsTool struct {
+	w Workspace
 }
 
 type lsArgs struct {
@@ -74,13 +74,13 @@ var lsDefaultIgnorePatterns = []string{
 	"zig-out/",
 }
 
-func (t *LsTool) Execute(ctx context.Context, args json.RawMessage) (json.RawMessage, error) {
+func (t *lsTool) execute(ctx context.Context, args json.RawMessage) (string, error) {
 	var a lsArgs
 	if err := json.Unmarshal(args, &a); err != nil {
-		return nil, fmt.Errorf("invalid args: %w", err)
+		return "", fmt.Errorf("invalid args: %w", err)
 	}
 
-	dir := ResolvePath(effectiveWorkDir(ctx, t.WorkDir), a.Path)
+	dir := ResolvePath(t.w.dir(ctx), a.Path)
 
 	depth := a.Depth
 	if depth <= 0 {
@@ -98,23 +98,23 @@ func (t *LsTool) Execute(ctx context.Context, args json.RawMessage) (json.RawMes
 	truncated := false
 
 	if err := renderTree(ctx, dir, dir, 0, depth, maxEntries, matcher, &count, &truncated, "", &sb); err != nil {
-		return nil, fmt.Errorf("ls %s: %w", dir, err)
+		return "", fmt.Errorf("ls %s: %w", dir, err)
 	}
 
 	if count == 0 {
-		return json.Marshal("(empty directory)")
+		return "(empty directory)", nil
 	}
 
 	result := strings.TrimRight(dir, string(filepath.Separator)) + "/\n" + strings.TrimRight(sb.String(), "\n")
 	if truncated {
-		result += fmt.Sprintf("\n\n[Listing truncated at %d entries. Use limit=%d for more, or use a specific subdirectory.]", maxEntries, maxEntries*2)
+		result += fmt.Sprintf("\n\n[Listing truncated at %d entries. List a subdirectory, a smaller depth, or ignore more.]", maxEntries)
 	}
 
 	tr := truncateHead(result, 0, defaultMaxBytes)
 	if tr.Truncated {
-		return json.Marshal(tr.Content + "\n\n[Output truncated at " + formatSize(defaultMaxBytes) + ".]")
+		return tr.Content + "\n\n[Output truncated at " + formatSize(defaultMaxBytes) + ".]", nil
 	}
-	return json.Marshal(result)
+	return result, nil
 }
 
 func newIgnoreMatcher(patterns []string) ignoreMatcher {

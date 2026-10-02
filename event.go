@@ -1,165 +1,106 @@
 package agentcore
 
 import (
-	"context"
-	"encoding/json"
 	"time"
+
+	"github.com/voocel/litellm"
 )
 
-// ---------------------------------------------------------------------------
-// Agent Events
-// ---------------------------------------------------------------------------
+// Event is something that happened in a run, delivered to Config.Emit. The
+// events are the types below; switch on them by type.
+//
+// A run streams each response as MessageStart, then MessageDelta events, and
+// records it with MessageEnd, which every message entering the history
+// passes through. Events hold no state that changes later: a MessageEnd's
+// message is final, and the streamed content is in the deltas only.
+type Event interface{ isEvent() }
 
-// EventType identifies agent lifecycle event types.
-type EventType string
+// MessageStart begins a response; MessageDelta events stream its content.
+type MessageStart struct{}
 
-const (
-	EventAgentStart EventType = "agent_start"
-	EventAgentEnd   EventType = "agent_end"
-	EventTurnStart  EventType = "turn_start"
-	// EventModelResponse fires after every model call completes, including any
-	// tool executions it triggered. One model invocation produces one event —
-	// not one logical user exchange — so steering injections and length
-	// recoveries each produce additional ones within the same run.
-	EventModelResponse  EventType = "model_response"
-	EventMessageStart   EventType = "message_start"
-	EventMessageUpdate  EventType = "message_update"
-	EventMessageEnd     EventType = "message_end"
-	EventToolExecStart  EventType = "tool_exec_start"
-	EventToolExecUpdate EventType = "tool_exec_update"
-	EventToolExecEnd    EventType = "tool_exec_end"
-	EventRetry          EventType = "retry"
-	EventError          EventType = "error"
-)
+// MessageDelta is a streamed event of the response under way: a block
+// started, text or arguments added, a block ended, usage. A Retry discards
+// the response so far.
+type MessageDelta struct{ Event litellm.Event }
 
-// ToolExecUpdateKind distinguishes update payload semantics for tool_exec_update events.
-type ToolExecUpdateKind string
+// MessageEnd records a message entering the history: a prompt, a response, a
+// tool result. Returning an error from Emit for it keeps it out and stops the
+// run, so an application stores messages here durably.
+type MessageEnd struct{ Message Message }
 
-const (
-	ToolExecUpdatePreview  ToolExecUpdateKind = "preview"
-	ToolExecUpdateProgress ToolExecUpdateKind = "progress"
-)
+// ToolStart begins a tool call, once its arguments were checked and before
+// the middleware, such as an approval, runs it.
+type ToolStart struct{ Call ToolCall }
 
-// EndReason describes why a single agent run stopped.
-type EndReason string
-
-const (
-	EndReasonStop     EndReason = "stop"
-	EndReasonMaxTurns EndReason = "max_turns"
-	EndReasonAborted  EndReason = "aborted"
-	EndReasonError    EndReason = "error"
-)
-
-// RunSummary captures loop facts that are known at the end of a run.
-// It intentionally excludes higher-level policy judgments.
-type RunSummary struct {
-	TurnCount  int
-	ToolCalls  int
-	ToolErrors int
-	EndReason  EndReason
+// ToolUpdate is the progress a running tool reported, see ReportProgress;
+// it comes between the call's ToolStart and ToolEnd.
+type ToolUpdate struct {
+	Call     ToolCall
+	Progress any
 }
 
-// DeltaKind identifies what kind of content a message_update delta carries.
-type DeltaKind string
-
-const (
-	DeltaText     DeltaKind = ""         // default: regular text
-	DeltaThinking DeltaKind = "thinking" // model reasoning/thinking
-	DeltaToolCall DeltaKind = "toolcall" // tool call argument JSON
-)
-
-// Event is a lifecycle event emitted by the agent loop.
-// This is the single output channel for all lifecycle information.
-type Event struct {
-	Type        EventType
-	Message     AgentMessage    // for message_start/update/end, turn_end
-	Delta       string          // text delta for message_update
-	DeltaKind   DeltaKind       // for message_update: what kind of delta
-	ToolID      string          // for tool_exec_* and toolcall message_update deltas
-	Tool        string          // tool name for tool_exec_*
-	ToolLabel   string          // human-readable tool label (from ToolLabeler)
-	Args        json.RawMessage // tool args for tool_exec_start/tool_exec_update
-	Result      json.RawMessage // tool result for tool_exec_end and preview updates
-	Progress    *ProgressPayload
-	UpdateKind  ToolExecUpdateKind
-	IsError     bool // tool error flag for tool_exec_end
-	Preview     json.RawMessage
-	ToolResults []ToolResult   // for turn_end: all tool results from this turn
-	Err         error          // for error events
-	NewMessages []AgentMessage // for agent_end: messages added during this loop
-	RetryInfo   *RetryInfo     // for retry events
-	Summary     *RunSummary    // for agent_end: factual run summary
+// ToolEnd ends a tool call with its result.
+type ToolEnd struct {
+	Call   ToolCall
+	Result Result
 }
 
-// RetryInfo carries retry context for EventRetry events.
-type RetryInfo struct {
+// TurnEnd ends a turn: a response and the results of the tools it called,
+// all recorded.
+type TurnEnd struct {
+	Message Message
+	Results []Message
+}
+
+// Retry reports a failed model call that the run makes again after Delay.
+type Retry struct {
 	Attempt    int
 	MaxRetries int
 	Delay      time.Duration
 	Err        error
 }
 
-// ---------------------------------------------------------------------------
-// Event Helpers
-// ---------------------------------------------------------------------------
+// CompactionStart begins a compaction of the history.
+type CompactionStart struct{}
 
-// eventSink delivers loop events bound to the run context. It is created
-// once per run at the AgentLoop entry points, so every emission site shares
-// the same lifetime regardless of narrower contexts (per-tool cancellation
-// must not affect event delivery).
-type eventSink struct {
-	ctx context.Context
-	ch  chan<- Event
+// CompactionEnd ends a compaction: with the Compaction that replaces the
+// history, nil when there was nothing to compact, or with Err. Returning an
+// error from Emit for a Compaction keeps the history as it was and stops the
+// run, so an application stores compactions here durably.
+type CompactionEnd struct {
+	Compaction *Compaction
+	Err        error
 }
 
-// emit sends an event to the channel, blocking when it is full — backpressure,
-// never event loss, while the run is live. Once the run context is canceled
-// delivery degrades to best-effort: a buffered/ready send still succeeds (a
-// draining reader receives the terminal events), but when the channel stays
-// full the event is dropped so an abandoned channel cannot leak the loop
-// goroutine.
-func (s eventSink) emit(ev Event) {
-	select {
-	case s.ch <- ev:
-	default:
-		select {
-		case s.ch <- ev:
-		case <-s.ctx.Done():
-		}
-	}
+// RunEnd ends a run, with the error that ended it. It is always the run's
+// last event, delivered even after Emit failed.
+type RunEnd struct {
+	Reason EndReason
+	Err    error
+	// Turns, ToolCalls and FailedCalls count the run's responses, the tool
+	// calls they made and the calls whose result is an error, refused calls
+	// included, which Config.MaxToolErrors does not count.
+	Turns, ToolCalls, FailedCalls int
 }
 
-// emitError sends an error event followed by agent_end.
-func (s eventSink) emitError(err error, summary *RunSummary) {
-	s.emit(Event{Type: EventError, Err: err})
-	s.emit(Event{Type: EventAgentEnd, Err: err, Summary: summary})
-}
+// EndReason is why a run ended.
+type EndReason string
 
-// ---------------------------------------------------------------------------
-// Message Sequence Repair
-// ---------------------------------------------------------------------------
+const (
+	EndDone     EndReason = "done"
+	EndMaxTurns EndReason = "max_turns"
+	EndAborted  EndReason = "aborted"
+	EndError    EndReason = "error"
+)
 
-// DefaultConvertToLLM filters AgentMessages to LLM-compatible Messages.
-// Custom message types are dropped; only user/assistant/system/tool messages pass through.
-func DefaultConvertToLLM(msgs []AgentMessage) []Message {
-	out := make([]Message, 0, len(msgs))
-	for _, m := range msgs {
-		if msg, ok := m.(Message); ok {
-			if msg.StopReason == StopReasonError || msg.StopReason == StopReasonAborted {
-				continue
-			}
-			out = append(out, msg)
-		}
-	}
-	return out
-}
-
-// dequeue drains all messages from the queue.
-func dequeue(queue *[]AgentMessage) []AgentMessage {
-	if len(*queue) == 0 {
-		return nil
-	}
-	result := *queue
-	*queue = nil
-	return result
-}
+func (MessageStart) isEvent()    {}
+func (MessageDelta) isEvent()    {}
+func (MessageEnd) isEvent()      {}
+func (ToolStart) isEvent()       {}
+func (ToolUpdate) isEvent()      {}
+func (ToolEnd) isEvent()         {}
+func (TurnEnd) isEvent()         {}
+func (Retry) isEvent()           {}
+func (CompactionStart) isEvent() {}
+func (CompactionEnd) isEvent()   {}
+func (RunEnd) isEvent()          {}

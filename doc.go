@@ -1,33 +1,21 @@
-// Package agentcore is a minimal, composable toolkit for building AI agent
-// applications in Go. It provides the execution kernel — the agent loop, tool
-// dispatch, context management, and a single event stream — and leaves policy
-// (which model, which tools, when to stop, how to render) to the caller.
+// Package agentcore runs AI agents: a model that calls tools, turn by turn,
+// until its task is done. It is built on litellm, whose messages, blocks and
+// events it uses as they are, and leaves policy — which model, which tools,
+// when to stop, how to render — to the application.
 //
-// Two entry points, one for each level of control:
+// [Run] is the loop: given a [Config] and a history, it calls the model and
+// the tools it asks for, and returns the history it ended with. It holds no
+// state; the caller owns the history. Every lifecycle signal — streamed
+// content, tool calls, retries, compactions — reaches Config.Emit as an
+// [Event], in order, and every message entering the history passes it as a
+// [MessageEnd] first, so an application stores messages there durably.
 //
-//   - [AgentLoop] is a pure function: given prompts, context, and a
-//     [LoopConfig], it runs the loop and returns a <-chan [Event]. It holds no
-//     state of its own — every dependency is injected and every result is an
-//     event. Use it when you want to own the state and drive the loop directly.
+// [Agent] keeps a history for an application and runs it: prompting,
+// steering a run under way, queuing follow-ups, and subscribing to the
+// events. A run, of either, ends when its context is cancelled.
 //
-//   - [Agent] wraps the loop with conversation state, message queues, and
-//     listener dispatch. Construct it with [NewAgent] and the With* options,
-//     register a callback with [Agent.Subscribe], then call [Agent.Prompt].
-//     This is the common case.
-//
-// Every lifecycle signal — streamed text, tool execution, retries, the final
-// summary — flows through the one [Event] channel. A single consumer can drive
-// any front end (TUI, web, Slack, logs) without the kernel knowing which.
-//
-// A small, stable surface carries most uses: [Agent], [AgentLoop], [Event],
-// [Tool], and [Message]. The rest is opt-in — context strategies, stop guards,
-// sub-agents, middleware — reached only when a use case needs it.
-//
-// Models are adapters behind the [ChatModel] interface; the kernel imports no
-// LLM SDK. Provider errors are classified through the [RetryableError] and
-// [RetryHinter] interfaces plus the ErrProvider* sentinels, so any backend can
-// take part in retries and failover. The bundled llm adapter (agentcore/llm)
-// covers OpenAI, Anthropic, and Gemini via litellm.
-//
-// See the examples directory for runnable single- and multi-agent programs.
+// The model is a litellm Client ([Model]); a tool is a [Tool]. A long
+// history is compacted by a [Compactor], such as the summarizing one in
+// agentcore/compact. Packages tools, subagent and task hold coding tools,
+// sub-agents and background tasks, built on the same few types.
 package agentcore

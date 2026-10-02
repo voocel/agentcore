@@ -1,13 +1,17 @@
-// Package task is a unified registry for background tasks. Tools (shell
-// commands, sub-agent dispatch, etc.) register their long-running work via a
-// shared Runtime so callers can list and cancel them through one surface.
+// Package task runs work in the background as tasks the model can follow:
+// each has an ID, a status and an output file, and a message announces it
+// when it ends. The bash tool runs its background commands as tasks, the
+// subagent tool its background agents; [Runtime.Tools] lets the model read
+// and stop them.
 package task
 
 import (
+	"cmp"
 	"context"
 	"fmt"
+	"io"
+	"os"
 	"slices"
-	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -15,71 +19,35 @@ import (
 	"github.com/voocel/agentcore"
 )
 
-// Status represents the lifecycle state of a background task.
+// Status is where a task stands.
 type Status string
 
 const (
 	Running   Status = "running"
 	Completed Status = "completed"
 	Failed    Status = "failed"
-	Killed    Status = "killed"
+	// Killed is a task stopped before it ended.
+	Killed Status = "killed"
 )
 
-// Type distinguishes the origin of a background task.
+// Type is the kind of work a task does.
 type Type string
 
 const (
 	TypeShell    Type = "shell"
 	TypeSubAgent Type = "subagent"
-	TypeTeammate Type = "teammate"
 )
 
-// Identity is the team-aware identity carried by a teammate Entry.
-// nil for non-teammate entries (shell, subagent). Lives in this package
-// rather than agentcore/team to avoid a task↔team import cycle: team needs
-// to read/store Entry.Identity, and task needs to recognise teammate-typed
-// entries for lifecycle handling.
-type Identity struct {
-	AgentID         string // "researcher@my-team"
-	AgentName       string // "researcher"
-	TeamName        string
-	Color           string
-	ParentSessionID string
-}
-
-// MaxAgentDepth caps how deep sub-agents may nest. The main agent is depth 0;
-// a sub-agent it spawns is depth 1; a sub-agent inside that would be depth 2.
-// Today the subagent tool is filtered out of every sub-agent's pool, so depth
-// is structurally capped at 1 — this constant is defense in depth for when
-// team support lands and peer agents gain a spawn channel.
-//
-// 5 is high enough to permit legitimate fan-out but low enough to catch
-// runaway recursion before it burns through tokens.
-const MaxAgentDepth = 5
-
-// depthKey is the ctx key used to thread an agent's depth into the goroutine
-// running it. Sub-agent spawn paths read the parent's depth from ctx, increment
-// it, and pass the new ctx into the child's loop.
-type depthKey struct{}
-
-// DepthFromContext returns the current agent's depth — 0 for the main agent,
-// n+1 inside a depth-n sub-agent. Unset (top-level) ctx returns 0.
-func DepthFromContext(ctx context.Context) int {
-	if v, ok := ctx.Value(depthKey{}).(int); ok {
-		return v
+// outputExt is the extension of the output file of a task of type t: shell
+// output is text, a sub-agent's a JSON line per message.
+func (t Type) outputExt() string {
+	if t == TypeSubAgent {
+		return ".jsonl"
 	}
-	return 0
+	return ".log"
 }
 
-// WithDepth threads `depth` into ctx so a sub-agent spawned via this ctx can
-// read its caller's depth and reject overly deep nesting.
-func WithDepth(ctx context.Context, depth int) context.Context {
-	return context.WithValue(ctx, depthKey{}, depth)
-}
-
-// Entry is the unified representation of any background task.
-// Both shell tools and sub-agent tools register entries through a shared
-// Runtime.
+// Entry is the state of a task.
 type Entry struct {
 	ID          string
 	Type        Type
@@ -87,184 +55,215 @@ type Entry struct {
 	Status      Status
 	StartedAt   time.Time
 	EndedAt     time.Time
-	OutputFile  string // path to output file on disk
-	Error       string
-	ExitCode    int    // shell: process exit code
-	ToolCount   int    // number of tool calls executed
-	Depth       int    // nesting depth: 1 for tasks spawned by the main agent; n+1 inside a depth-n task. See MaxAgentDepth.
-	cancel      func() // unexported: only Stop()/StopAll() should use this
-	active      bool   // execution goroutine has not called Runtime.Done yet
+	// OutputFile is the file the task's output goes to.
+	OutputFile string
+	// Error is why a Failed task failed.
+	Error string
 
-	// Shell-specific
-	PID     int
-	Command string
+	// A shell command.
+	Command  string
+	PID      int
+	ExitCode int
 
-	// SubAgent-specific (also used by teammate, which shares the underlying runAgent loop)
+	// A sub-agent.
 	Agent     string
-	Prompt    string // original task prompt
-	Result    string // final assistant text from the sub-agent
+	Prompt    string
+	Result    string // the agent's last response
+	ToolCount int
 	TokensIn  int
 	TokensOut int
-
-	// Teammate-specific. Identity is non-nil iff Type == TypeTeammate.
-	// IsIdle flips true between turns when the teammate is waiting in its mailbox
-	// channel for the next message.
-	Identity *Identity
-	IsIdle   bool
-
-	// pendingMessages queues parent→child messages delivered to the sub-agent
-	// at the next steering tick. Guarded by Runtime.mu (not a per-entry mutex)
-	// so copyEntry can keep its `cp := *e` pattern without copying a lock.
-	// Drain is called once per turn at most — Runtime.mu contention is a
-	// non-issue at that rate.
-	//
-	// Note: teammates do NOT use pendingMessages — they use the team mailbox
-	// channel for delivery (see agentcore/team). This field stays subagent-only.
-	pendingMessages []string
 }
 
-// IsTerminal reports whether a task has reached a terminal state.
-func (s Status) IsTerminal() bool {
-	return s == Completed || s == Failed || s == Killed
-}
-
-// SetCancel sets the cancellation function for this task entry.
-// Called during registration; only Stop()/StopAll() invoke it.
-func (e *Entry) SetCancel(fn func()) {
-	e.cancel = fn
-}
-
-// Runtime is a unified registry for background tasks.
+// Runtime runs and tracks tasks.
 type Runtime struct {
+	dir    string
+	notify func(agentcore.Message)
+
 	mu     sync.Mutex
-	idle   *sync.Cond
+	idle   *sync.Cond // signaled when no task is active
 	seq    int
 	active int
-	tasks  map[string]*Entry
+	jobs   map[string]*job
 }
 
-// NewRuntime creates an empty runtime.
-func NewRuntime() *Runtime {
-	r := &Runtime{tasks: make(map[string]*Entry)}
+type job struct {
+	entry   Entry
+	cancel  context.CancelFunc
+	stopped bool
+	done    chan struct{} // closed once the task ended and was announced
+}
+
+// NewRuntime returns a Runtime that writes the output of each task to a file
+// in dir, the system's temporary directory if "", and hands notify the
+// message announcing each task that ended; nil drops them.
+func NewRuntime(dir string, notify func(agentcore.Message)) *Runtime {
+	r := &Runtime{dir: dir, notify: notify, jobs: map[string]*job{}}
 	r.idle = sync.NewCond(&r.mu)
 	return r
 }
 
-// NextID generates a sequential task ID with the given prefix (e.g. "shell", "bg").
-func (r *Runtime) NextID(prefix string) string {
+// Task is a task, as its work sees it.
+type Task struct {
+	ID string
+	// Output is the task's output file.
+	Output io.Writer
+	r      *Runtime
+	j      *job
+}
+
+// Update changes the task's entry as its work goes on, such as to count what
+// it did. The Runtime sets the status when the task ends.
+func (t *Task) Update(fn func(*Entry)) {
+	t.r.mu.Lock()
+	defer t.r.mu.Unlock()
+	fn(&t.j.entry)
+}
+
+// Start runs work as a new task, described by e: its Type, its Description
+// and the fields of its type. It returns the task's entry at once; work runs
+// on a goroutine of its own, with a context that keeps ctx's values but not
+// its cancellation and is cancelled when the task is stopped. When work
+// returns, the task ends: Killed if it was stopped, Failed if work failed,
+// Completed otherwise; then notify hears of it.
+func (r *Runtime) Start(ctx context.Context, e Entry, work func(ctx context.Context, t *Task) error) (Entry, error) {
 	r.mu.Lock()
-	defer r.mu.Unlock()
 	r.seq++
-	return prefix + "-" + strconv.Itoa(r.seq)
-}
-
-// Register adds a task entry. A running task remains active until its owner
-// calls Done after all completion work, including notifications, has finished.
-func (r *Runtime) Register(entry *Entry) {
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	r.tasks[entry.ID] = entry
-	if entry.Status == Running {
-		entry.active = true
-		r.active++
-	}
-}
-
-// Get returns a snapshot of a single task, or nil if not found.
-func (r *Runtime) Get(id string) *Entry {
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	e, ok := r.tasks[id]
-	if !ok {
-		return nil
-	}
-	return copyEntry(e)
-}
-
-// List returns snapshots of all tasks, sorted by creation time.
-func (r *Runtime) List() []Entry {
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	out := make([]Entry, 0, len(r.tasks))
-	for _, e := range r.tasks {
-		out = append(out, *copyEntry(e))
-	}
-	slices.SortFunc(out, func(a, b Entry) int {
-		return a.StartedAt.Compare(b.StartedAt)
-	})
-	return out
-}
-
-// Stop cancels a running task by ID. Returns true if a running task was
-// found and its cancel function was invoked. The background goroutine is
-// responsible for writing the terminal status and EndedAt after observing
-// the cancellation.
-func (r *Runtime) Stop(id string) bool {
-	r.mu.Lock()
-	e, ok := r.tasks[id]
-	if !ok || e.Status != Running {
-		r.mu.Unlock()
-		return false
-	}
-	cancel := e.cancel
+	e.ID = fmt.Sprintf("%s-%d", e.Type, r.seq)
 	r.mu.Unlock()
-	if cancel != nil {
-		cancel()
-	}
-	return true
-}
 
-// StopAll cancels all running tasks. Returns the number cancelled.
-func (r *Runtime) StopAll() int {
+	out, err := r.create(e)
+	if err != nil {
+		return Entry{}, fmt.Errorf("task: create output: %w", err)
+	}
+	e.Status, e.StartedAt, e.OutputFile = Running, time.Now(), out.Name()
+	ctx, cancel := context.WithCancel(context.WithoutCancel(ctx))
+	j := &job{entry: e, cancel: cancel, done: make(chan struct{})}
+
 	r.mu.Lock()
-	cancels := make([]func(), 0, len(r.tasks))
-	count := 0
-	for _, e := range r.tasks {
-		if e.Status == Running {
-			count++
-			if e.cancel != nil {
-				cancels = append(cancels, e.cancel)
-			}
+	r.jobs[e.ID] = j
+	r.active++
+	r.mu.Unlock()
+
+	go func() {
+		err := work(ctx, &Task{ID: e.ID, Output: out, r: r, j: j})
+		if cerr := out.Close(); cerr != nil && err == nil {
+			err = fmt.Errorf("close output: %w", cerr)
 		}
-	}
-	r.mu.Unlock()
-	for _, cancel := range cancels {
 		cancel()
-	}
-	return count
+		r.end(j, err)
+	}()
+	return e, nil
 }
 
-// Done marks a task's execution goroutine as fully finished. It must be
-// called after terminal state and completion notifications have been written.
-// Repeated calls and unknown IDs return false.
-func (r *Runtime) Done(id string) bool {
-	r.mu.Lock()
-	e, ok := r.tasks[id]
-	if !ok || !e.active {
-		r.mu.Unlock()
-		return false
+// create opens the output file of e.
+func (r *Runtime) create(e Entry) (*os.File, error) {
+	if r.dir == "" {
+		return os.CreateTemp("", "agentcore-"+e.ID+"-*"+e.Type.outputExt())
 	}
-	e.active = false
+	if err := os.MkdirAll(r.dir, 0o755); err != nil {
+		return nil, err
+	}
+	// A unique name: a Runtime resumed in the same dir counts from 1 again.
+	return os.CreateTemp(r.dir, e.ID+"-*"+e.Type.outputExt())
+}
+
+// end settles the task j, which work ended with err, and announces it.
+func (r *Runtime) end(j *job, err error) {
+	r.mu.Lock()
+	e := &j.entry
+	e.EndedAt = time.Now()
+	switch {
+	case j.stopped:
+		e.Status = Killed
+	case err != nil:
+		e.Status, e.Error = Failed, err.Error()
+	default:
+		e.Status = Completed
+	}
+	ended := *e
+	r.mu.Unlock()
+
+	if r.notify != nil {
+		r.notify(notification(ended))
+	}
+
+	r.mu.Lock()
+	close(j.done)
 	r.active--
 	if r.active == 0 {
 		r.idle.Broadcast()
 	}
 	r.mu.Unlock()
-	return true
 }
 
-// Active returns the number of task goroutines that have not called Done.
-// Terminal tasks remain active while their completion notification is being
-// delivered, so callers can distinguish visible status from true quiescence.
+// Get returns the entry of task id.
+func (r *Runtime) Get(id string) (Entry, bool) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	j, ok := r.jobs[id]
+	if !ok {
+		return Entry{}, false
+	}
+	return j.entry, true
+}
+
+// List returns the entries of all tasks, oldest first.
+func (r *Runtime) List() []Entry {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	out := make([]Entry, 0, len(r.jobs))
+	for _, j := range r.jobs {
+		out = append(out, j.entry)
+	}
+	slices.SortFunc(out, func(a, b Entry) int { return a.StartedAt.Compare(b.StartedAt) })
+	return out
+}
+
+// Stop stops task id, which ends Killed. It reports whether the task was
+// running.
+func (r *Runtime) Stop(id string) bool {
+	r.mu.Lock()
+	j, ok := r.jobs[id]
+	running := ok && j.entry.Status == Running && !j.stopped
+	if running {
+		j.stopped = true
+	}
+	r.mu.Unlock()
+	if running {
+		j.cancel()
+	}
+	return running
+}
+
+// StopAll stops every running task and returns how many it stopped.
+func (r *Runtime) StopAll() int {
+	r.mu.Lock()
+	var ids []string
+	for id, j := range r.jobs {
+		if j.entry.Status == Running {
+			ids = append(ids, id)
+		}
+	}
+	r.mu.Unlock()
+	n := 0
+	for _, id := range ids {
+		if r.Stop(id) {
+			n++
+		}
+	}
+	return n
+}
+
+// Active returns how many tasks have not ended, their announcement
+// included.
 func (r *Runtime) Active() int {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	return r.active
 }
 
-// Wait blocks until the runtime observes no active tasks. Work registered
-// while it is waiting is included, so shutdown can wait for nested work
-// without polling or imposing a timeout.
+// Wait returns once no task is active, counting those started while it
+// waits, such as by a task of its own.
 func (r *Runtime) Wait() {
 	r.mu.Lock()
 	defer r.mu.Unlock()
@@ -273,223 +272,73 @@ func (r *Runtime) Wait() {
 	}
 }
 
-// Update applies a mutation function to a task entry under the lock.
-// Returns false if the task is not found.
-func (r *Runtime) Update(id string, fn func(e *Entry)) bool {
+// WaitFor returns the entry of task id once it ended and was announced, or
+// ctx's error first.
+func (r *Runtime) WaitFor(ctx context.Context, id string) (Entry, error) {
 	r.mu.Lock()
-	defer r.mu.Unlock()
-	e, ok := r.tasks[id]
+	j, ok := r.jobs[id]
+	r.mu.Unlock()
 	if !ok {
-		return false
+		return Entry{}, fmt.Errorf("task %s not found", id)
 	}
-	fn(e)
-	return true
+	select {
+	case <-j.done:
+	case <-ctx.Done():
+		return Entry{}, ctx.Err()
+	}
+	e, _ := r.Get(id)
+	return e, nil
 }
 
-// AppendStatus enumerates the outcomes of AppendPending. We return a status
-// instead of (bool, error) because the caller (a tool) needs to format three
-// distinct user-visible messages: "queued", "not found", and "task already
-// finished" — each implies a different follow-up.
-type AppendStatus int
+// KindNotification marks the message announcing that a task ended.
+const KindNotification = "task_notification"
 
-const (
-	AppendOK       AppendStatus = iota // message queued
-	AppendNotFound                     // no entry with that ID
-	AppendTerminal                     // entry exists but already in terminal state
-)
-
-// AppendPending queues a message for delivery to a sub-agent's next steering
-// tick. Returns the outcome so the caller can choose its error wording.
-//
-// Terminal tasks are NOT auto-resumed here — resuming from disk transcripts
-// is a later capability. Today the parent agent gets AppendTerminal back and
-// reports the failure to the user.
-func (r *Runtime) AppendPending(id, msg string) AppendStatus {
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	e, ok := r.tasks[id]
-	if !ok {
-		return AppendNotFound
-	}
-	if e.Status.IsTerminal() {
-		return AppendTerminal
-	}
-	e.pendingMessages = append(e.pendingMessages, msg)
-	return AppendOK
-}
-
-// DrainPending returns and clears the queued messages for the given task.
-// Returns nil when there is nothing queued so callers can short-circuit.
-// Called from the sub-agent loop's steering hook — see subagent.runAgent.
-func (r *Runtime) DrainPending(id string) []string {
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	e, ok := r.tasks[id]
-	if !ok || len(e.pendingMessages) == 0 {
-		return nil
-	}
-	out := e.pendingMessages
-	e.pendingMessages = nil
-	return out
-}
-
-func copyEntry(e *Entry) *Entry {
-	cp := *e
-	cp.cancel = nil          // snapshots don't carry cancel
-	cp.active = false        // snapshots don't carry lifecycle bookkeeping
-	cp.pendingMessages = nil // snapshots don't carry the live queue
-	return &cp
-}
-
-// ---------------------------------------------------------------------------
-// Notification
-// ---------------------------------------------------------------------------
-
-// CompletedTag is the XML-style wrapper tag used in the AgentMessage emitted
-// by ToAgentMessage().
-const CompletedTag = "background-task-completed"
-
-// Usage summarises a sub-agent's resource consumption for the notification.
-type Usage struct {
-	TotalTokens int
-	ToolUses    int
-	DurationMs  int64
-}
-
-// Notification is the payload delivered to the calling agent when a
-// background task finishes. The parent agent receives this wrapped as XML so
-// it can both react immediately to <result> and read <output-file> on demand.
-type Notification struct {
-	TaskID      string
-	Type        Type
-	Status      Status
-	Description string
-
-	// SubAgent
-	Agent  string
-	Result string // final assistant text — lets parent continue without IO
-	Usage  *Usage
-
-	// Shell
-	Command  string
-	ExitCode *int
-
-	// Common
-	OutputFile string // disk path to the full transcript / log
-	Error      string
-}
-
-// NotificationFromEntry converts a task entry into a notification payload.
-func NotificationFromEntry(e *Entry) Notification {
-	if e == nil {
-		return Notification{}
-	}
-	n := Notification{
-		TaskID:      e.ID,
-		Type:        e.Type,
-		Status:      e.Status,
-		Description: e.Description,
-		OutputFile:  e.OutputFile,
-		Error:       e.Error,
-		Command:     e.Command,
-		Agent:       e.Agent,
-		Result:      e.Result,
-	}
-	if e.Type == TypeShell && e.Status != Running {
-		exitCode := e.ExitCode
-		n.ExitCode = &exitCode
-	}
-	if e.Type == TypeSubAgent && e.Status.IsTerminal() {
-		n.Usage = &Usage{
-			TotalTokens: e.TokensIn + e.TokensOut,
-			ToolUses:    e.ToolCount,
-			DurationMs:  durationMs(e.StartedAt, e.EndedAt),
-		}
-	}
-	return n
-}
-
-func durationMs(start, end time.Time) int64 {
-	if start.IsZero() || end.IsZero() {
-		return 0
-	}
-	return end.Sub(start).Milliseconds()
-}
-
-// ToAgentMessage wraps the notification as a user-role AgentMessage that the
-// parent agent can consume as a follow-up. The XML is hand-formatted with
-// nested elements (instead of JSON-in-XML) because LLMs parse structured XML
-// reliably and the format mirrors patterns Claude already recognises.
-func (n Notification) ToAgentMessage() agentcore.AgentMessage {
+// notification is the message announcing that the task e ended, for the
+// agent that started it to go on with. Its fields are escaped, so that no
+// output can forge one.
+func notification(e Entry) agentcore.Message {
 	var b strings.Builder
-	fmt.Fprintf(&b, "<%s>\n", CompletedTag)
-	fmt.Fprintf(&b, "<task-id>%s</task-id>\n", n.TaskID)
-	fmt.Fprintf(&b, "<type>%s</type>\n", n.Type)
-	fmt.Fprintf(&b, "<status>%s</status>\n", n.Status)
-	fmt.Fprintf(&b, "<summary>%s</summary>\n", summarise(n))
-
-	if n.Agent != "" {
-		fmt.Fprintf(&b, "<agent>%s</agent>\n", n.Agent)
+	field := func(name, value string) {
+		if value != "" {
+			fmt.Fprintf(&b, "<%s>%s</%s>\n", name, escape(value), name)
+		}
 	}
-	if n.Command != "" {
-		fmt.Fprintf(&b, "<command>%s</command>\n", n.Command)
+	b.WriteString("<task-notification>\n")
+	field("task-id", e.ID)
+	field("type", string(e.Type))
+	field("status", string(e.Status))
+	field("summary", summary(e))
+	switch e.Type {
+	case TypeShell:
+		field("command", e.Command)
+	case TypeSubAgent:
+		field("agent", e.Agent)
+		field("result", e.Result)
+		field("usage", fmt.Sprintf("%d tokens, %d tool uses, %s", e.TokensIn+e.TokensOut, e.ToolCount, e.EndedAt.Sub(e.StartedAt).Round(time.Second)))
 	}
-	if n.ExitCode != nil {
-		fmt.Fprintf(&b, "<exit-code>%d</exit-code>\n", *n.ExitCode)
-	}
-	if n.Error != "" {
-		fmt.Fprintf(&b, "<error>%s</error>\n", n.Error)
-	}
-	if n.Result != "" {
-		fmt.Fprintf(&b, "<result>%s</result>\n", n.Result)
-	}
-	if n.Usage != nil {
-		fmt.Fprintf(&b, "<usage><total-tokens>%d</total-tokens><tool-uses>%d</tool-uses><duration-ms>%d</duration-ms></usage>\n",
-			n.Usage.TotalTokens, n.Usage.ToolUses, n.Usage.DurationMs)
-	}
-	if n.OutputFile != "" {
-		fmt.Fprintf(&b, "<output-file>%s</output-file>\n", n.OutputFile)
-	}
-	fmt.Fprintf(&b, "</%s>", CompletedTag)
-	return agentcore.UserMsg(b.String())
+	field("error", e.Error)
+	field("output-file", e.OutputFile)
+	b.WriteString("</task-notification>")
+	m := agentcore.UserText(b.String())
+	m.Kind = KindNotification
+	return m
 }
 
-func summarise(n Notification) string {
-	label := n.Description
-	if label == "" {
-		switch n.Type {
-		case TypeSubAgent:
-			label = n.Agent
-		case TypeShell:
-			label = n.Command
-		}
+var escape = strings.NewReplacer("&", "&amp;", "<", "&lt;", ">", "&gt;").Replace
+
+// summary says in a line what became of the task e.
+func summary(e Entry) string {
+	what := fmt.Sprintf("Task %q", cmp.Or(e.Description, e.Command))
+	if e.Type == TypeSubAgent {
+		what = fmt.Sprintf("Agent %q", cmp.Or(e.Description, e.Agent))
 	}
-	noun := "Task"
-	if n.Type == TypeSubAgent {
-		noun = fmt.Sprintf("Agent %q", label)
-		label = ""
-	}
-	switch n.Status {
+	switch e.Status {
 	case Completed:
-		if label != "" {
-			return fmt.Sprintf("%s %q completed", noun, label)
-		}
-		return noun + " completed"
+		return what + " completed"
 	case Failed:
-		reason := n.Error
-		if reason == "" {
-			reason = "unknown error"
-		}
-		if label != "" {
-			return fmt.Sprintf("%s %q failed: %s", noun, label, reason)
-		}
-		return fmt.Sprintf("%s failed: %s", noun, reason)
+		return what + " failed: " + e.Error
 	case Killed:
-		if label != "" {
-			return fmt.Sprintf("%s %q was stopped", noun, label)
-		}
-		return noun + " was stopped"
-	default:
-		return string(n.Status)
+		return what + " was stopped"
 	}
+	return what + " is " + string(e.Status)
 }

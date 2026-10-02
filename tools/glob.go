@@ -11,31 +11,30 @@ import (
 	"sort"
 	"strings"
 
+	"github.com/voocel/agentcore"
 	"github.com/voocel/agentcore/schema"
 )
 
-// GlobTool matches files by glob pattern and returns relative paths
-// sorted by modification time (newest first).
-// Uses rg --files if available, falls back to filepath.WalkDir.
-type GlobTool struct {
-	WorkDir string
+// Glob returns the glob tool: it matches files by glob pattern and returns
+// their relative paths, newest first. It uses rg --files if available, and
+// filepath.WalkDir otherwise; either way, .git is left out.
+func (w Workspace) Glob() agentcore.Tool {
+	t := &globTool{w: w}
+	return agentcore.Tool{
+		Name:        "glob",
+		Label:       "Match Files",
+		Description: "Fast file pattern matching for any codebase size. Supports path-aware glob patterns like '**/*.js' and 'src/**/*.ts'. Returns matching relative file paths sorted by modification time (newest first). Use this when you need to find files by name pattern before reading or grepping them.",
+		Schema: schema.Object(
+			schema.Property("pattern", schema.String("Glob pattern to match files (for example: '*.go', '**/*.js', 'src/**/*.ts')")).Required(),
+			schema.Property("path", schema.String("Directory to search in, relative or absolute (default: working directory)")),
+		),
+		Parallel: always,
+		Run:      textRun(t.execute),
+	}
 }
 
-func NewGlob(workDir string) *GlobTool { return &GlobTool{WorkDir: workDir} }
-
-func (t *GlobTool) Name() string                                 { return "glob" }
-func (t *GlobTool) Label() string                                { return "Match Files" }
-func (t *GlobTool) ReadOnly(_ json.RawMessage) bool              { return true }
-func (t *GlobTool) ConcurrencySafe(_ json.RawMessage) bool       { return true }
-func (t *GlobTool) ActivityDescription(_ json.RawMessage) string { return "Searching files" }
-func (t *GlobTool) Description() string {
-	return "Fast file pattern matching for any codebase size. Supports path-aware glob patterns like '**/*.js' and 'src/**/*.ts'. Returns matching relative file paths sorted by modification time (newest first). Use this when you need to find files by name pattern before reading or grepping them."
-}
-func (t *GlobTool) Schema() map[string]any {
-	return schema.Object(
-		schema.Property("pattern", schema.String("Glob pattern to match files (for example: '*.go', '**/*.js', 'src/**/*.ts')")).Required(),
-		schema.Property("path", schema.String("Directory to search in, relative or absolute (default: working directory)")),
-	)
+type globTool struct {
+	w Workspace
 }
 
 type globArgs struct {
@@ -50,22 +49,22 @@ type globMatch struct {
 
 const globMaxResults = 200
 
-func (t *GlobTool) Execute(ctx context.Context, args json.RawMessage) (json.RawMessage, error) {
+func (t *globTool) execute(ctx context.Context, args json.RawMessage) (string, error) {
 	var a globArgs
 	if err := json.Unmarshal(args, &a); err != nil {
-		return nil, fmt.Errorf("invalid args: %w", err)
+		return "", fmt.Errorf("invalid args: %w", err)
 	}
 	if strings.TrimSpace(a.Pattern) == "" {
-		return nil, fmt.Errorf("pattern is required")
+		return "", fmt.Errorf("pattern is required")
 	}
 
-	searchDir := ResolvePath(effectiveWorkDir(ctx, t.WorkDir), a.Path)
+	searchDir := ResolvePath(t.w.dir(ctx), a.Path)
 	info, err := os.Stat(searchDir)
 	if err != nil {
-		return nil, fmt.Errorf("glob %s: %w", searchDir, err)
+		return "", fmt.Errorf("glob %s: %w", searchDir, err)
 	}
 	if !info.IsDir() {
-		return nil, fmt.Errorf("glob %s: not a directory", searchDir)
+		return "", fmt.Errorf("glob %s: not a directory", searchDir)
 	}
 
 	if result, ok, err := t.globWithRg(ctx, a.Pattern, searchDir); err == nil && ok {
@@ -74,10 +73,10 @@ func (t *GlobTool) Execute(ctx context.Context, args json.RawMessage) (json.RawM
 	return t.globWithWalk(ctx, a.Pattern, searchDir)
 }
 
-func (t *GlobTool) globWithRg(ctx context.Context, pattern, dir string) (json.RawMessage, bool, error) {
+func (t *globTool) globWithRg(ctx context.Context, pattern, dir string) (string, bool, error) {
 	rgPath, err := exec.LookPath("rg")
 	if err != nil {
-		return nil, false, err
+		return "", false, err
 	}
 
 	cmd := exec.CommandContext(ctx, rgPath,
@@ -85,16 +84,17 @@ func (t *GlobTool) globWithRg(ctx context.Context, pattern, dir string) (json.Ra
 		"--glob", pattern,
 		"--color=never",
 		"--hidden",
+		"--glob", "!.git",
 		"--no-require-git",
 		dir,
 	)
 
 	stdout, err := cmd.StdoutPipe()
 	if err != nil {
-		return nil, false, err
+		return "", false, err
 	}
 	if err := cmd.Start(); err != nil {
-		return nil, false, err
+		return "", false, err
 	}
 
 	matches := make([]globMatch, 0, 64)
@@ -134,7 +134,7 @@ func (t *GlobTool) globWithRg(ctx context.Context, pattern, dir string) (json.Ra
 	return result, true, err
 }
 
-func (t *GlobTool) globWithWalk(ctx context.Context, pattern, dir string) (json.RawMessage, error) {
+func (t *globTool) globWithWalk(ctx context.Context, pattern, dir string) (string, error) {
 	matches := make([]globMatch, 0, 64)
 	truncated := false
 
@@ -176,15 +176,15 @@ func (t *GlobTool) globWithWalk(ctx context.Context, pattern, dir string) (json.
 		return nil
 	})
 	if err != nil && err != filepath.SkipAll {
-		return nil, fmt.Errorf("glob %s: %w", dir, err)
+		return "", fmt.Errorf("glob %s: %w", dir, err)
 	}
 
 	return formatGlobMatches(matches, truncated)
 }
 
-func formatGlobMatches(matches []globMatch, truncated bool) (json.RawMessage, error) {
+func formatGlobMatches(matches []globMatch, truncated bool) (string, error) {
 	if len(matches) == 0 {
-		return json.Marshal("No files found.")
+		return "No files found.", nil
 	}
 
 	sort.SliceStable(matches, func(i, j int) bool {
@@ -205,7 +205,7 @@ func formatGlobMatches(matches []globMatch, truncated bool) (json.RawMessage, er
 	result := strings.Join(lines, "\n")
 	tr := truncateHead(result, 0, defaultMaxBytes)
 	if tr.Truncated {
-		return json.Marshal(tr.Content + "\n\n[Output truncated at " + formatSize(defaultMaxBytes) + ".]")
+		return tr.Content + "\n\n[Output truncated at " + formatSize(defaultMaxBytes) + ".]", nil
 	}
-	return json.Marshal(result)
+	return result, nil
 }

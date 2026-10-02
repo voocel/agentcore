@@ -13,33 +13,36 @@ import (
 	"regexp"
 	"strings"
 
+	"github.com/voocel/agentcore"
 	"github.com/voocel/agentcore/schema"
 )
 
-// GrepTool searches file contents by pattern.
-// Uses ripgrep (rg) if available, falls back to regexp + bufio.Scanner.
-type GrepTool struct {
-	WorkDir string
+// Grep returns the grep tool: it searches file contents by pattern, with
+// ripgrep (rg) if available, and regexp and bufio.Scanner otherwise.
+func (w Workspace) Grep() agentcore.Tool {
+	t := &grepTool{w: w}
+	return agentcore.Tool{
+		Name:        "grep",
+		Label:       "Search Content",
+		Description: "Fast content search across files. Supports regex patterns by default, or exact text with literal=true. Use glob to narrow which files are searched. Returns relative file paths, line numbers, and matching lines (default limit: 100). Use bash only when you need shell-specific pipelines, counting, or custom post-processing.",
+		Schema:      grepSchema(),
+		Parallel:    always,
+		Run:         textRun(t.execute),
+	}
 }
 
-func NewGrep(workDir string) *GrepTool { return &GrepTool{WorkDir: workDir} }
-
-func (t *GrepTool) Name() string                                 { return "grep" }
-func (t *GrepTool) Label() string                                { return "Search Content" }
-func (t *GrepTool) ReadOnly(_ json.RawMessage) bool              { return true }
-func (t *GrepTool) ConcurrencySafe(_ json.RawMessage) bool       { return true }
-func (t *GrepTool) ActivityDescription(_ json.RawMessage) string { return "Searching content" }
-func (t *GrepTool) Description() string {
-	return "Fast content search across files. Supports regex patterns by default, or exact text with literal=true. Use glob to narrow which files are searched. Returns relative file paths, line numbers, and matching lines (default limit: 100). Use bash only when you need shell-specific pipelines, counting, or custom post-processing."
+type grepTool struct {
+	w Workspace
 }
-func (t *GrepTool) Schema() map[string]any {
+
+func grepSchema() map[string]any {
 	return schema.Object(
 		schema.Property("pattern", schema.String("Search pattern (regex by default, or exact text with literal=true)")).Required(),
 		schema.Property("path", schema.String("File or directory to search, relative or absolute (default: working directory)")),
 		schema.Property("glob", schema.String("Optional file glob filter (for example: '*.go', 'src/**/*.ts')")),
-		schema.Property("ignoreCase", schema.Bool("Case insensitive search")),
+		schema.Property("ignore_case", schema.Bool("Case insensitive search")),
 		schema.Property("literal", schema.Bool("Treat pattern as literal string, not regex")),
-		schema.Property("contextLines", schema.Int("Number of context lines around each match (default: 0)")),
+		schema.Property("context_lines", schema.Int("Number of context lines around each match (default: 0)")),
 		schema.Property("limit", schema.Int("Maximum number of matches (default: 100)")),
 	)
 }
@@ -48,9 +51,9 @@ type grepArgs struct {
 	Pattern      string `json:"pattern"`
 	Path         string `json:"path"`
 	Glob         string `json:"glob"`
-	IgnoreCase   bool   `json:"ignoreCase"`
+	IgnoreCase   bool   `json:"ignore_case"`
 	Literal      bool   `json:"literal"`
-	ContextLines int    `json:"contextLines"`
+	ContextLines int    `json:"context_lines"`
 	Limit        int    `json:"limit"`
 }
 
@@ -68,16 +71,16 @@ func isRgMatchLine(line string) bool {
 	return rgMatchLineRe.MatchString(line)
 }
 
-func (t *GrepTool) Execute(ctx context.Context, args json.RawMessage) (json.RawMessage, error) {
+func (t *grepTool) execute(ctx context.Context, args json.RawMessage) (string, error) {
 	var a grepArgs
 	if err := json.Unmarshal(args, &a); err != nil {
-		return nil, fmt.Errorf("invalid args: %w", err)
+		return "", fmt.Errorf("invalid args: %w", err)
 	}
 	if a.Limit <= 0 {
 		a.Limit = grepDefaultLimit
 	}
 
-	searchPath := ResolvePath(effectiveWorkDir(ctx, t.WorkDir), a.Path)
+	searchPath := ResolvePath(t.w.dir(ctx), a.Path)
 
 	// Try ripgrep first
 	if result, err := t.grepWithRg(ctx, a, searchPath); err == nil {
@@ -90,10 +93,10 @@ func (t *GrepTool) Execute(ctx context.Context, args json.RawMessage) (json.RawM
 
 // grepWithRg uses ripgrep with streaming output.
 // Kills the process once the match limit is reached.
-func (t *GrepTool) grepWithRg(ctx context.Context, a grepArgs, searchPath string) (json.RawMessage, error) {
+func (t *grepTool) grepWithRg(ctx context.Context, a grepArgs, searchPath string) (string, error) {
 	rgPath, err := exec.LookPath("rg")
 	if err != nil {
-		return nil, err
+		return "", err
 	}
 
 	cmdArgs := []string{"--line-number", "--no-heading", "--color", "never"}
@@ -118,10 +121,10 @@ func (t *GrepTool) grepWithRg(ctx context.Context, a grepArgs, searchPath string
 	cmd.Stderr = &stderr
 	stdout, err := cmd.StdoutPipe()
 	if err != nil {
-		return nil, fmt.Errorf("pipe: %w", err)
+		return "", fmt.Errorf("pipe: %w", err)
 	}
 	if err := cmd.Start(); err != nil {
-		return nil, fmt.Errorf("start rg: %w", err)
+		return "", fmt.Errorf("start rg: %w", err)
 	}
 
 	prefix := searchPath + string(filepath.Separator)
@@ -164,7 +167,7 @@ func (t *GrepTool) grepWithRg(ctx context.Context, a grepArgs, searchPath string
 		}
 	}
 	if err := scanner.Err(); err != nil {
-		return nil, fmt.Errorf("scan rg output: %w", err)
+		return "", fmt.Errorf("scan rg output: %w", err)
 	}
 
 	// Kill rg process early if we hit the limit
@@ -178,19 +181,19 @@ func (t *GrepTool) grepWithRg(ctx context.Context, a grepArgs, searchPath string
 		if errors.As(waitErr, &exitErr) {
 			exitCode = exitErr.ExitCode()
 		} else if !hitLimit {
-			return nil, fmt.Errorf("wait rg: %w", waitErr)
+			return "", fmt.Errorf("wait rg: %w", waitErr)
 		}
 	}
 
 	if len(lines) == 0 {
 		errMsg := strings.TrimSpace(stderr.String())
 		if exitCode == 1 || (exitCode == 0 && errMsg == "") {
-			return json.Marshal("No matches found.")
+			return "No matches found.", nil
 		}
 		if errMsg != "" {
-			return nil, fmt.Errorf("grep: %s", errMsg)
+			return "", fmt.Errorf("grep: %s", errMsg)
 		}
-		return json.Marshal("No matches found.")
+		return "No matches found.", nil
 	}
 
 	result := strings.Join(lines, "\n")
@@ -199,12 +202,12 @@ func (t *GrepTool) grepWithRg(ctx context.Context, a grepArgs, searchPath string
 	// Apply byte truncation
 	tr := truncateHead(result, 0, grepMaxBytes)
 	if tr.Truncated {
-		return json.Marshal(tr.Content + "\n\n[Output truncated.]")
+		return tr.Content + "\n\n[Output truncated.]", nil
 	}
-	return json.Marshal(result)
+	return result, nil
 }
 
-func (t *GrepTool) grepWithGo(ctx context.Context, a grepArgs, searchPath string) (json.RawMessage, error) {
+func (t *grepTool) grepWithGo(ctx context.Context, a grepArgs, searchPath string) (string, error) {
 	pattern := a.Pattern
 	if a.Literal {
 		pattern = regexp.QuoteMeta(pattern)
@@ -214,7 +217,7 @@ func (t *GrepTool) grepWithGo(ctx context.Context, a grepArgs, searchPath string
 	}
 	re, err := regexp.Compile(pattern)
 	if err != nil {
-		return nil, fmt.Errorf("invalid pattern: %w", err)
+		return "", fmt.Errorf("invalid pattern: %w", err)
 	}
 
 	var results []string
@@ -280,16 +283,16 @@ func (t *GrepTool) grepWithGo(ctx context.Context, a grepArgs, searchPath string
 	})
 
 	if err != nil && err != filepath.SkipAll {
-		return nil, fmt.Errorf("search: %w", err)
+		return "", fmt.Errorf("search: %w", err)
 	}
 
 	if len(results) == 0 {
-		return json.Marshal("No matches found.")
+		return "No matches found.", nil
 	}
 
 	result := strings.Join(results, "\n")
 	result = appendGrepNotices(result, limit, matchCount >= limit, false)
-	return json.Marshal(result)
+	return result, nil
 }
 
 func appendGrepNotices(result string, limit int, hitLimit, partial bool) string {

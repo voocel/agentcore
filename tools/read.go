@@ -4,7 +4,6 @@ import (
 	"bufio"
 	"bytes"
 	"context"
-	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"image"
@@ -21,6 +20,7 @@ import (
 
 	"github.com/voocel/agentcore"
 	"github.com/voocel/agentcore/schema"
+	"github.com/voocel/litellm"
 	"golang.org/x/image/draw"
 	_ "golang.org/x/image/webp"
 )
@@ -38,35 +38,31 @@ const (
 	readMaxLineLen   = 2000
 )
 
-// ReadTool reads file contents with optional offset and limit.
-// Supports directory listings and image files. Text output is streamed and
-// truncated by line count / byte size. Binary files are rejected.
-//
-// Successful reads record a stamp when state is non-nil. Write and Edit tools
-// constructed with the same state enforce read-before-write and detect stale
-// writes.
-type ReadTool struct {
-	WorkDir   string
-	readState *FileReadState
-	fs        WorkspaceFS
+// Read returns the read tool: it reads a file, from an offset and up to a
+// limit, lists a directory, or reads an image. Text is cut at a line count
+// and a byte size; binary files are refused. What it read goes to Files.
+func (w Workspace) Read() agentcore.Tool {
+	t := &readTool{w: w, fs: w.fs()}
+	return agentcore.Tool{
+		Name:        "read",
+		Label:       "Read File",
+		Description: readDescription(),
+		Schema: schema.Object(
+			schema.Property("file_path", schema.String("The path to the file or directory to read (relative or absolute)")).Required(),
+			schema.Property("offset", schema.Int("The line number to start reading from. Only provide if the file is too large to read at once")),
+			schema.Property("limit", schema.Int("The number of lines to read. Only provide if the file is too large to read at once")),
+		),
+		Parallel: always,
+		Run:      t.run,
+	}
 }
 
-// NewRead creates a read tool rooted at workDir.
-//
-// Pass the same non-nil FileReadState to NewRead, NewWrite, and NewEdit to
-// enable read-before-write/edit validation. Pass nil to disable this tracking.
-// By default the tool operates on the local filesystem; pass WithFS to inject
-// a different WorkspaceFS backend.
-func NewRead(workDir string, state *FileReadState, opts ...Option) *ReadTool {
-	return &ReadTool{WorkDir: workDir, readState: state, fs: resolveFS(opts)}
+type readTool struct {
+	w  Workspace
+	fs FS
 }
 
-func (t *ReadTool) Name() string                                 { return "read" }
-func (t *ReadTool) Label() string                                { return "Read File" }
-func (t *ReadTool) ReadOnly(_ json.RawMessage) bool              { return true }
-func (t *ReadTool) ConcurrencySafe(_ json.RawMessage) bool       { return true }
-func (t *ReadTool) ActivityDescription(_ json.RawMessage) string { return "Reading file" }
-func (t *ReadTool) Description() string {
+func readDescription() string {
 	return fmt.Sprintf(
 		`Reads a file from the local filesystem. You can access any file directly by using this tool.
 
@@ -82,13 +78,6 @@ Usage:
 		defaultMaxLines, defaultMaxLines, formatSize(defaultMaxBytes),
 	)
 }
-func (t *ReadTool) Schema() map[string]any {
-	return schema.Object(
-		schema.Property("file_path", schema.String("The path to the file or directory to read (relative or absolute)")).Required(),
-		schema.Property("offset", schema.Int("The line number to start reading from. Only provide if the file is too large to read at once")),
-		schema.Property("limit", schema.Int("The number of lines to read. Only provide if the file is too large to read at once")),
-	)
-}
 
 type readArgs struct {
 	FilePath string `json:"file_path"`
@@ -97,55 +86,39 @@ type readArgs struct {
 }
 
 type resolvedRead struct {
-	path    string
-	offset  int
-	limit   int
-	info    FileInfo
-	partial bool // user explicitly passed offset or limit
+	path   string
+	offset int
+	limit  int
+	info   FileInfo
 }
 
-// Execute returns a text-only result (for backward compatibility / middleware).
-func (t *ReadTool) Execute(ctx context.Context, args json.RawMessage) (json.RawMessage, error) {
+// run reads the file, directory or image args names.
+func (t *readTool) run(ctx context.Context, args json.RawMessage) (agentcore.Result, error) {
 	a, err := t.parseArgs(ctx, args)
 	if err != nil {
-		return nil, err
-	}
-
-	result, err := t.readTextual(ctx, a)
-	if err != nil {
-		return nil, err
-	}
-	t.recordRead(a)
-	return json.Marshal(result)
-}
-
-// ExecuteContent returns rich content blocks (text or image).
-// Implements agentcore.ContentTool.
-func (t *ReadTool) ExecuteContent(ctx context.Context, args json.RawMessage) ([]agentcore.ContentBlock, error) {
-	a, err := t.parseArgs(ctx, args)
-	if err != nil {
-		return nil, err
+		return agentcore.Result{}, err
 	}
 
 	if !a.info.IsDir {
 		if mime := t.detectImageMIME(ctx, a.path); mime != "" {
 			blocks, err := t.readImage(ctx, a.path, mime)
-			if err == nil {
-				t.recordRead(a)
+			if err != nil {
+				return agentcore.Result{}, err
 			}
-			return blocks, err
+			t.recordRead(a, false)
+			return agentcore.Result{Content: blocks}, nil
 		}
 	}
 
-	result, err := t.readTextual(ctx, a)
+	result, partial, err := t.readTextual(ctx, a)
 	if err != nil {
-		return nil, err
+		return agentcore.Result{}, err
 	}
-	t.recordRead(a)
-	return []agentcore.ContentBlock{agentcore.TextBlock(result)}, nil
+	t.recordRead(a, partial)
+	return agentcore.TextResult(result), nil
 }
 
-func (t *ReadTool) parseArgs(ctx context.Context, args json.RawMessage) (resolvedRead, error) {
+func (t *readTool) parseArgs(ctx context.Context, args json.RawMessage) (resolvedRead, error) {
 	var a readArgs
 	if err := json.Unmarshal(args, &a); err != nil {
 		return resolvedRead{}, fmt.Errorf("invalid args: %w", err)
@@ -154,7 +127,7 @@ func (t *ReadTool) parseArgs(ctx context.Context, args json.RawMessage) (resolve
 		return resolvedRead{}, fmt.Errorf("offset must be greater than or equal to 1")
 	}
 
-	p := ResolvePath(effectiveWorkDir(ctx, t.WorkDir), a.FilePath)
+	p := ResolvePath(t.w.dir(ctx), a.FilePath)
 	info, err := t.fs.Stat(ctx, p)
 	if err != nil {
 		if os.IsNotExist(err) {
@@ -163,7 +136,6 @@ func (t *ReadTool) parseArgs(ctx context.Context, args json.RawMessage) (resolve
 		return resolvedRead{}, fmt.Errorf("read %s: %w", p, err)
 	}
 
-	partial := a.Offset > 0 || a.Limit > 0
 	offset := a.Offset
 	if offset <= 0 {
 		offset = 1
@@ -173,52 +145,43 @@ func (t *ReadTool) parseArgs(ctx context.Context, args json.RawMessage) (resolve
 		limit = readDefaultLimit
 	}
 
-	return resolvedRead{
-		path:    p,
-		offset:  offset,
-		limit:   limit,
-		info:    info,
-		partial: partial,
-	}, nil
+	return resolvedRead{path: p, offset: offset, limit: limit, info: info}, nil
 }
 
-// recordRead writes the read timestamp to FileReadState. Skipped for
-// directories. Files are keyed by absolute path so write/edit (which also
-// use ResolvePath) hit the same bucket.
-func (t *ReadTool) recordRead(a resolvedRead) {
-	if t.readState == nil || a.path == "" || a.info.IsDir {
+// recordRead records the read of a file in Files, partial when the model
+// did not see all of it. Files are keyed by absolute path, as write and edit
+// resolve them.
+func (t *readTool) recordRead(a resolvedRead, partial bool) {
+	if t.w.Files == nil || a.info.IsDir {
 		return
 	}
-	t.readState.Set(a.path, FileReadStamp{
+	t.w.Files.Set(a.path, FileReadStamp{
 		ReadAt:  time.Now(),
 		Mtime:   a.info.ModTime,
 		Version: a.info.Version,
-		Partial: a.partial,
+		Partial: partial,
 	})
 }
 
-func (t *ReadTool) readTextual(ctx context.Context, a resolvedRead) (string, error) {
+// readTextual reads a directory or a text file; partial reports a file read
+// in part.
+func (t *readTool) readTextual(ctx context.Context, a resolvedRead) (text string, partial bool, err error) {
 	if a.info.IsDir {
-		return t.readDirectory(ctx, a)
+		text, err := t.readDirectory(ctx, a)
+		return text, false, err
 	}
-
-	if mime := t.detectImageMIME(ctx, a.path); mime != "" {
-		return fmt.Sprintf("Read image file [%s]", mime), nil
-	}
-
 	isBinary, err := t.isBinaryFile(ctx, a.path, a.info.Size)
 	if err != nil {
-		return "", err
+		return "", false, err
 	}
 	if isBinary {
-		return "", fmt.Errorf("cannot read binary file: %s", a.path)
+		return "", false, fmt.Errorf("cannot read binary file: %s", a.path)
 	}
-
 	return t.readTextFile(ctx, a)
 }
 
 // readImage reads a file as an image, optionally resizes, and returns content blocks.
-func (t *ReadTool) readImage(ctx context.Context, path, mime string) ([]agentcore.ContentBlock, error) {
+func (t *readTool) readImage(ctx context.Context, path, mime string) ([]litellm.Block, error) {
 	data, err := t.fs.ReadFile(ctx, path)
 	if err != nil {
 		return nil, fmt.Errorf("read %s: %w", path, err)
@@ -234,10 +197,9 @@ func (t *ReadTool) readImage(ctx context.Context, path, mime string) ([]agentcor
 		note += " " + resNote
 	}
 
-	encoded := base64.StdEncoding.EncodeToString(data)
-	return []agentcore.ContentBlock{
-		agentcore.TextBlock(note),
-		agentcore.ImageBlock(encoded, mime),
+	return []litellm.Block{
+		litellm.Text(note),
+		litellm.ImageBlock{Data: data, MIME: mime},
 	}, nil
 }
 
@@ -277,7 +239,7 @@ func resizeImage(data []byte, mime string) ([]byte, string, string) {
 	return jpegBuf.Bytes(), "image/jpeg", fmt.Sprintf("[Resized %dx%d → %dx%d]", w, h, newW, newH)
 }
 
-func (t *ReadTool) readDirectory(ctx context.Context, a resolvedRead) (string, error) {
+func (t *readTool) readDirectory(ctx context.Context, a resolvedRead) (string, error) {
 	entries, err := t.fs.ReadDir(ctx, a.path)
 	if err != nil {
 		return "", fmt.Errorf("read directory %s: %w", a.path, err)
@@ -318,10 +280,12 @@ func (t *ReadTool) readDirectory(ctx context.Context, a resolvedRead) (string, e
 	return result, nil
 }
 
-func (t *ReadTool) readTextFile(ctx context.Context, a resolvedRead) (string, error) {
+// readTextFile reads the lines of a file a asks for; partial reports that
+// the model did not see all of it.
+func (t *readTool) readTextFile(ctx context.Context, a resolvedRead) (string, bool, error) {
 	f, err := t.fs.Open(ctx, a.path)
 	if err != nil {
-		return "", fmt.Errorf("read %s: %w", a.path, err)
+		return "", false, fmt.Errorf("read %s: %w", a.path, err)
 	}
 	defer f.Close()
 
@@ -337,7 +301,7 @@ func (t *ReadTool) readTextFile(ctx context.Context, a resolvedRead) (string, er
 
 	for scanner.Scan() {
 		if ctx.Err() != nil {
-			return "", ctx.Err()
+			return "", false, ctx.Err()
 		}
 		totalLines++
 		if totalLines < a.offset {
@@ -355,7 +319,7 @@ func (t *ReadTool) readTextFile(ctx context.Context, a resolvedRead) (string, er
 		rendered := fmt.Sprintf("%d\t%s\n", totalLines, line)
 		if written+len(rendered) > defaultMaxBytes {
 			if readLines == 0 {
-				return fmt.Sprintf("[File %s: first line exceeds %s limit. Use offset/limit to read in chunks.]", a.path, formatSize(defaultMaxBytes)), nil
+				return fmt.Sprintf("[File %s: first line exceeds %s limit. Use offset/limit to read in chunks.]", a.path, formatSize(defaultMaxBytes)), true, nil
 			}
 			truncatedByBytes = true
 			hasMore = true
@@ -366,17 +330,17 @@ func (t *ReadTool) readTextFile(ctx context.Context, a resolvedRead) (string, er
 		readLines++
 	}
 	if err := scanner.Err(); err != nil {
-		return "", fmt.Errorf("scan %s: %w", a.path, err)
+		return "", false, fmt.Errorf("scan %s: %w", a.path, err)
 	}
 
 	if totalLines == 0 {
 		if a.offset > 1 {
-			return "", fmt.Errorf("offset %d is beyond end of file (0 lines)", a.offset)
+			return "", false, fmt.Errorf("offset %d is beyond end of file (0 lines)", a.offset)
 		}
-		return "[End of file - total 0 lines.]", nil
+		return "[End of file - total 0 lines.]", false, nil
 	}
 	if a.offset > totalLines {
-		return "", fmt.Errorf("offset %d is beyond end of file (%d lines)", a.offset, totalLines)
+		return "", false, fmt.Errorf("offset %d is beyond end of file (%d lines)", a.offset, totalLines)
 	}
 
 	result := strings.TrimRight(sb.String(), "\n")
@@ -387,10 +351,10 @@ func (t *ReadTool) readTextFile(ctx context.Context, a resolvedRead) (string, er
 	} else if result != "" {
 		result += fmt.Sprintf("\n\n[End of file - total %d lines.]", totalLines)
 	}
-	return result, nil
+	return result, a.offset > 1 || hasMore, nil
 }
 
-func (t *ReadTool) notFoundWithSuggestions(ctx context.Context, target string) string {
+func (t *readTool) notFoundWithSuggestions(ctx context.Context, target string) string {
 	dir := dirOf(target)
 	base := filepath.Base(target)
 	entries, err := t.fs.ReadDir(ctx, dir)
@@ -422,7 +386,7 @@ func (t *ReadTool) notFoundWithSuggestions(ctx context.Context, target string) s
 
 // detectImageMIME sniffs the file's content type and returns the MIME type
 // if it's a supported image format, or "" otherwise.
-func (t *ReadTool) detectImageMIME(ctx context.Context, path string) string {
+func (t *readTool) detectImageMIME(ctx context.Context, path string) string {
 	f, err := t.fs.Open(ctx, path)
 	if err != nil {
 		return ""
@@ -442,7 +406,7 @@ func (t *ReadTool) detectImageMIME(ctx context.Context, path string) string {
 	return ""
 }
 
-func (t *ReadTool) isBinaryFile(ctx context.Context, path string, size int64) (bool, error) {
+func (t *readTool) isBinaryFile(ctx context.Context, path string, size int64) (bool, error) {
 	switch strings.ToLower(filepath.Ext(path)) {
 	case ".zip", ".tar", ".gz", ".exe", ".dll", ".so", ".class", ".jar", ".war",
 		".7z", ".doc", ".docx", ".xls", ".xlsx", ".ppt", ".pptx", ".odt", ".ods",
