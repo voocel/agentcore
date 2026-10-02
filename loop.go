@@ -28,7 +28,8 @@ type Config struct {
 
 	// Steering returns the messages to deliver before the next model call,
 	// such as what a user typed while the run worked. It is called at the
-	// start and after each turn.
+	// start, after each turn, and after each compaction in the run, which
+	// can take long.
 	Steering func() []Message
 	// FollowUp returns the messages to go on with when the run would stop.
 	FollowUp func() []Message
@@ -260,6 +261,16 @@ func (r *run) steering() []Message {
 	return r.cfg.Steering()
 }
 
+// steer records the messages Steering has now.
+func (r *run) steer() error {
+	for _, msg := range r.steering() {
+		if err := r.record(msg); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
 func (r *run) followUp() []Message {
 	if r.cfg.FollowUp == nil {
 		return nil
@@ -271,9 +282,10 @@ func (r *run) followUp() []Message {
 // the invalid arguments of its calls fixed (see invalidArgs). Before the
 // call, a history grown past CompactAt is compacted, as far as that
 // succeeds; on a context overflow, it is compacted and the call made again,
-// once. Transient failures are retried. A response that fails for good, or
-// is cancelled, is recorded with what streamed of it, as StopError or
-// StopAborted, so every MessageStart ends with a MessageEnd or a Retry.
+// once. What was steered while it compacted goes into that call. Transient
+// failures are retried. A response that fails for good, or is cancelled, is
+// recorded with what streamed of it, as StopError or StopAborted, so every
+// MessageStart ends with a MessageEnd or a Retry.
 func (r *run) respond() (Message, map[string]string, error) {
 	compacted := false
 	if r.cfg.Compactor != nil && r.cfg.CompactAt > 0 && Estimate(r.cfg, r.history) > r.cfg.CompactAt {
@@ -282,6 +294,9 @@ func (r *run) respond() (Message, map[string]string, error) {
 			return Message{}, nil, err
 		}
 		compacted = err == nil
+		if err := r.steer(); err != nil {
+			return Message{}, nil, err
+		}
 	}
 	for attempt := 0; ; attempt++ {
 		msg, started, err := r.call()
@@ -290,6 +305,9 @@ func (r *run) respond() (Message, map[string]string, error) {
 			changed, cerr := r.compact()
 			if cerr != nil {
 				return Message{}, nil, cerr
+			}
+			if serr := r.steer(); serr != nil {
+				return Message{}, nil, serr
 			}
 			if changed {
 				msg, started, err = r.call()

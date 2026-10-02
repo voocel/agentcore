@@ -13,14 +13,18 @@ import (
 )
 
 // summarizer replaces all but the last message with a summary, recording
-// the calls it was given.
+// the calls it was given. during, if set, runs as it compacts.
 type summarizer struct {
-	calls []Call
-	err   error
+	calls  []Call
+	err    error
+	during func()
 }
 
 func (s *summarizer) Compact(_ context.Context, history []Message, call func([]Message) Call) (*Compaction, error) {
 	s.calls = append(s.calls, call(history))
+	if s.during != nil {
+		s.during()
+	}
 	if s.err != nil {
 		return nil, s.err
 	}
@@ -115,6 +119,42 @@ func TestRunOverflowCompactsOnce(t *testing.T) {
 	p = litellmtest.New(litellmtest.Fail(overflow))
 	if _, err := Run(context.Background(), Config{Model: testModel(t, p), Compactor: &summarizer{}}, []Message{UserText("huge")}); litellm.ErrorTypeOf(err) != litellm.ErrorTypeContextOverflow {
 		t.Fatalf("nothing to compact: %v", err)
+	}
+}
+
+// What is steered while the run compacts goes into the call that follows,
+// not the one after the next turn.
+func TestRunSteeringDuringCompaction(t *testing.T) {
+	overflow := litellm.NewError("test", litellm.ErrorTypeContextOverflow, "prompt is too long", nil)
+	cases := map[string]struct {
+		compactAt int
+		replies   []litellmtest.Reply
+	}{
+		"at CompactAt": {500, []litellmtest.Reply{litellmtest.Text("ok")}},
+		"on overflow":  {0, []litellmtest.Reply{litellmtest.Fail(overflow), litellmtest.Text("ok")}},
+	}
+	for name, tc := range cases {
+		t.Run(name, func(t *testing.T) {
+			var queue []Message
+			steer := func() []Message {
+				q := queue
+				queue = nil
+				return q
+			}
+			p := litellmtest.New(tc.replies...)
+			s := &summarizer{during: func() { queue = append(queue, UserText("also this")) }}
+			history, err := Run(context.Background(), Config{Model: testModel(t, p), Compactor: s, CompactAt: tc.compactAt, Steering: steer}, bigHistory())
+			if err != nil {
+				t.Fatal(err)
+			}
+			reqs := p.Requests()
+			if len(reqs) != len(tc.replies) || lastText(reqs[len(reqs)-1]) != "also this" {
+				t.Fatalf("%d requests, the last ending with %q", len(reqs), lastText(reqs[len(reqs)-1]))
+			}
+			if n := len(history); history[n-2].Text() != "also this" || history[n-1].Text() != "ok" {
+				t.Fatalf("history roles = %v", roles(history))
+			}
+		})
 	}
 }
 
