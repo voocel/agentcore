@@ -4,7 +4,6 @@ import (
 	"context"
 	"errors"
 	"reflect"
-	"strconv"
 	"strings"
 	"testing"
 
@@ -19,13 +18,6 @@ func assistant(blocks ...litellm.Block) agentcore.Message {
 
 func readCall(id, args string) litellm.ToolUseBlock {
 	return litellm.ToolUseBlock{ID: id, Name: "read", Arguments: args}
-}
-
-func toolGroup(id, result string) []agentcore.Message {
-	return []agentcore.Message{
-		assistant(readCall(id, `{}`)),
-		agentcore.ToolResult(id, agentcore.TextResult(result)),
-	}
 }
 
 func history() []agentcore.Message {
@@ -60,42 +52,6 @@ func callFor(t *testing.T, p litellm.Provider) func([]agentcore.Message) agentco
 	return func(h []agentcore.Message) agentcore.Call { return agentcore.BuildCall(cfg, h) }
 }
 
-func TestCutPoint(t *testing.T) {
-	msgs := []agentcore.Message{agentcore.UserText("old"), assistant(litellm.Text("done")), agentcore.UserText(strings.Repeat("recent", 100))}
-	if cut := cutPoint(msgs, 10); cut != 2 {
-		t.Fatalf("cut at %d, want the recent user message", cut)
-	}
-
-	// A cut landing on a tool result retreats to the call that issued it.
-	msgs = []agentcore.Message{
-		agentcore.UserText(strings.Repeat("b", 400)),
-		assistant(readCall("1", `{}`), readCall("2", `{}`)),
-		agentcore.ToolResult("1", agentcore.TextResult(strings.Repeat("a", 400))),
-		agentcore.ToolResult("2", agentcore.TextResult(strings.Repeat("a", 400))),
-		agentcore.UserText("recent"),
-	}
-	if cut := cutPoint(msgs, 120); cut != 1 {
-		t.Fatalf("cut at %d, want the tool call at 1", cut)
-	}
-
-	// Sub-agent runs are one task and then tool groups; the cut lands inside.
-	msgs = []agentcore.Message{agentcore.UserText("task")}
-	for i := 1; i <= 4; i++ {
-		msgs = append(msgs, toolGroup(strconv.Itoa(i), strings.Repeat("a", 400))...)
-	}
-	if cut := cutPoint(msgs, 150); cut != 5 || len(msgs[cut].ToolCalls()) == 0 {
-		t.Fatalf("cut at %d, want the third tool call at 5", cut)
-	}
-
-	msgs = append([]agentcore.Message{agentcore.UserText("task")}, toolGroup("1", strings.Repeat("a", 400))...)
-	if cut := cutPoint(msgs, 10000); cut != 0 {
-		t.Fatalf("a suffix covering everything cut at %d", cut)
-	}
-	if cut := cutPoint(msgs[1:], 50); cut != 0 {
-		t.Fatalf("a retreat to the first message cut at %d", cut)
-	}
-}
-
 func TestExtractFileOps(t *testing.T) {
 	msgs := []agentcore.Message{assistant(
 		readCall("1", `{"path":"a.go"}`),
@@ -110,8 +66,12 @@ func TestExtractFileOps(t *testing.T) {
 	}
 }
 
+// The history is replaced by its summary, but for the prompt at its end the
+// model has yet to answer; the summary call's usage is reported.
 func TestCompactReplacesOldHistoryWithSummary(t *testing.T) {
-	p := litellmtest.New(litellmtest.Text("<analysis>a</analysis><summary>checkpoint body</summary>"))
+	reply := litellmtest.Text("<analysis>a</analysis><summary>checkpoint body</summary>")
+	reply.Usage = litellm.Usage{InputTokens: 900, OutputTokens: 40}
+	p := litellmtest.New(reply)
 	msgs := history()
 	c, err := Summarizer{}.Compact(context.Background(), msgs, callFor(t, p))
 	if err != nil {
@@ -119,6 +79,9 @@ func TestCompactReplacesOldHistoryWithSummary(t *testing.T) {
 	}
 	if c == nil || len(c.Messages) != 2 || c.Replaced != 4 || c.Messages[0].Kind != agentcore.KindSummary {
 		t.Fatalf("compaction = %+v", c)
+	}
+	if c.Usage == nil || c.Usage.InputTokens != 900 || c.Usage.OutputTokens != 40 {
+		t.Fatalf("usage = %+v", c.Usage)
 	}
 	text := agentcore.SummaryText(c.Messages[0])
 	if !strings.HasPrefix(text, "checkpoint body") ||
@@ -229,28 +192,31 @@ func TestTruncateForSummaryKeepsRunesWhole(t *testing.T) {
 	}
 }
 
-// The tools the replaced part loaded stay loaded.
-func TestCompactKeepsLoadedTools(t *testing.T) {
+// Mid-task, nothing of the history is replayed: no response, with the
+// reasoning bound to what came before it, and no tool load, so the deferred
+// tools it loaded are found again.
+func TestCompactReplaysNothing(t *testing.T) {
 	p := litellmtest.New(litellmtest.Text("<summary>checkpoint body</summary>"))
 	search := litellm.ToolUseBlock{ID: "s1", Name: "tool_search", Arguments: `{"query":"select:deploy"}`}
-	msgs := append([]agentcore.Message{
+	msgs := []agentcore.Message{
 		agentcore.UserText(strings.Repeat("a", 4000)),
-		assistant(search),
-		agentcore.ToolResult("s1", agentcore.Result{Content: []litellm.Block{litellm.ToolReferenceBlock{ToolName: "deploy"}, litellm.Text("Tool loaded.")}}),
-	}, history()[1:]...)
+		assistant(litellm.ReasoningBlock{Text: "find a tool"}, search),
+		agentcore.ToolResult("s1", agentcore.Result{Content: []litellm.Block{litellm.ToolReferenceBlock{ToolName: "deploy"}}}),
+		assistant(litellm.ReasoningBlock{Text: "read it"}, readCall("r1", `{"file_path":"a.go"}`)),
+		agentcore.ToolResult("r1", agentcore.TextResult("package a")),
+	}
 	call := callFor(t, p)
 	c, err := Summarizer{}.Compact(context.Background(), msgs, call)
-	if err != nil || c == nil {
+	if err != nil || c == nil || len(c.Messages) != 1 || c.Replaced != len(msgs) {
 		t.Fatalf("compaction %+v, %v", c, err)
 	}
-	offered := map[string]bool{}
-	for _, tool := range call(c.Messages).Request.Tools {
-		offered[tool.Name] = true
+	req := call(c.Messages).Request
+	for _, tool := range req.OfferedTools() {
+		if tool.Name == "deploy" {
+			t.Fatal("a tool load survived the compaction")
+		}
 	}
-	if !offered["deploy"] {
-		t.Fatalf("deploy unloaded by the compaction: %v", offered)
-	}
-	if got := c.Messages[2]; len(got.Blocks) != 1 || got.Text() != "" {
-		t.Fatalf("the replayed result holds %#v", got.Blocks)
+	if !strings.Contains(c.Messages[0].Text(), "Continue from where it leaves off") {
+		t.Fatalf("the summary does not carry the work on: %q", c.Messages[0].Text())
 	}
 }

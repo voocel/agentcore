@@ -17,8 +17,8 @@ import (
 // Edit returns the edit tool: it replaces exact strings in a file,
 // normalizing line endings and matching fuzzily. Its result is a line naming
 // the file over the diff of the edit; its Check returns the diff as the
-// call's preview and, with Files, refuses a file the model has not read, or
-// that changed since.
+// call's preview. With Files, its Check and Run refuse a file the model has
+// not read, or that changed since.
 func (w Workspace) Edit() agentcore.Tool {
 	t := &editTool{w: w, fs: w.fs()}
 	return agentcore.Tool{
@@ -198,7 +198,12 @@ func (t *editTool) preview(ctx context.Context, args json.RawMessage) (string, e
 	return generateDiff(r.oldContent, r.newContent), nil
 }
 
+// execute checks the file again: it may have changed while the call
+// awaited approval.
 func (t *editTool) execute(ctx context.Context, args json.RawMessage) (agentcore.Result, error) {
+	if err := t.validate(ctx, args); err != nil {
+		return agentcore.Result{}, err
+	}
 	r, err := t.parseAndMatch(ctx, args)
 	if err != nil {
 		return agentcore.Result{}, err
@@ -361,10 +366,12 @@ func fuzzyFind(content, oldText string) (idx, matchLen int) {
 	return startByte, endByte - startByte
 }
 
+// indentAwareFind matches oldText as whole lines, each with the newline that
+// ends it; a final newline in oldText ends its last line.
 func indentAwareFind(content, oldText string) (idx, matchLen, count int) {
-	oldLines := strings.Split(oldText, "\n")
+	oldLines := strings.Split(strings.TrimSuffix(oldText, "\n"), "\n")
 	contentLines := strings.Split(content, "\n")
-	if len(oldLines) == 0 || len(oldLines) > len(contentLines) {
+	if len(oldLines) > len(contentLines) {
 		return -1, 0, 0
 	}
 
@@ -377,9 +384,10 @@ func indentAwareFind(content, oldText string) (idx, matchLen, count int) {
 		if normalizeLinesForIndentAware(window) != target {
 			continue
 		}
+		last := i + len(oldLines) - 1
 		matches = append(matches, struct{ start, end int }{
 			start: lineStarts[i],
-			end:   lineStarts[i+len(oldLines)],
+			end:   min(lineStarts[last]+len(contentLines[last])+1, len(content)),
 		})
 	}
 
@@ -725,9 +733,6 @@ func lineStartOffsets(text string) []int {
 		if text[i] == '\n' {
 			offsets = append(offsets, i+1)
 		}
-	}
-	if offsets[len(offsets)-1] != len(text) {
-		offsets = append(offsets, len(text))
 	}
 	return offsets
 }

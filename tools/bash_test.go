@@ -51,6 +51,21 @@ func TestBashLongOutputKeepsTheTail(t *testing.T) {
 		t.Fatalf("full output: %v", err)
 	}
 
+	// Output past what is kept in memory still reaches the file whole.
+	got, err = bash(t, ".", map[string]any{"command": "seq 1 300000"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	lines = strings.Split(got, "\n")
+	note = lines[len(lines)-1]
+	if lines[len(lines)-3] != "300000" || !strings.HasPrefix(note, "[Showing the last ") || !strings.Contains(note, " of 300000 lines. Full output: ") {
+		t.Fatalf("tail ends %q", lines[len(lines)-3:])
+	}
+	full = strings.TrimSuffix(note[strings.Index(note, "Full output: ")+len("Full output: "):], "]")
+	if data, err := os.ReadFile(full); err != nil || !strings.HasPrefix(string(data), "1\n2\n") || !strings.HasSuffix(string(data), "\n299999\n300000\n") {
+		t.Fatalf("full output: %v", err)
+	}
+
 	got, err = bash(t, ".", map[string]any{"command": "yes a | tr -d '\\n' | head -c 300000"})
 	if err != nil || !strings.Contains(got, "aaaa") {
 		t.Fatalf("a long single line was dropped: %v", err)

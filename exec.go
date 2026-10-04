@@ -3,21 +3,27 @@ package agentcore
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"sync"
 
 	"github.com/voocel/litellm"
 )
 
-// invalidArgs fixes the tool calls of msg whose arguments are not JSON, as a
-// response cut off at the output limit leaves them, so that msg can be
-// stored and sent back: their arguments become {}. It returns, by call, what
-// the model reads instead of a result.
+// invalidArgs fixes the tool calls of msg whose arguments are not the JSON
+// object every protocol takes, as a response cut off at the output limit
+// leaves them, so that msg can be stored and sent back: their arguments
+// become {}. It returns, by call, what the model reads instead of a result.
 func invalidArgs(msg *Message) map[string]string {
 	var bad map[string]string
 	for i, block := range msg.Blocks {
 		call, ok := block.(litellm.ToolUseBlock)
-		if !ok || json.Valid([]byte(call.Arguments)) {
+		if !ok {
+			continue
+		}
+		var object map[string]json.RawMessage
+		err := json.Unmarshal([]byte(call.Arguments), &object)
+		if err == nil && object != nil {
 			continue
 		}
 		if bad == nil {
@@ -27,9 +33,10 @@ func invalidArgs(msg *Message) map[string]string {
 		if msg.Stop == StopLength {
 			bad[call.ID] = "The response hit the output token limit, so the arguments of this call were cut off and it did not run. Make the call again, splitting large content across several calls."
 		} else {
-			var probe any
-			err := json.Unmarshal([]byte(call.Arguments), &probe)
-			bad[call.ID] = fmt.Sprintf("The arguments of this call are not valid JSON (%v), so it did not run. Received: %s", err, call.Arguments)
+			if err == nil {
+				err = errors.New("null")
+			}
+			bad[call.ID] = fmt.Sprintf("The arguments of this call are not a JSON object (%v), so it did not run. Received: %s", err, call.Arguments)
 		}
 		call.Arguments = "{}"
 		msg.Blocks[i] = call

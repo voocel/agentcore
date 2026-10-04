@@ -116,13 +116,13 @@ A run ends when its context is cancelled. `Prompt` fails with `ErrBusy` while a 
 | `MessageEnd` | a message enters the history: a prompt, a response, a tool result |
 | `ToolStart` / `ToolUpdate` / `ToolEnd` | a tool call starts, before the middleware (approval) / reports progress / ends with its result |
 | `TurnEnd` | a response and the results of its tool calls are recorded |
-| `Retry` | a model call failed transiently and will be made again |
+| `Retry` | a model call failed and will be made again: after a wait, or, on a context overflow, after compacting |
 | `CompactionStart` / `CompactionEnd` | the history is compacted |
 | `RunEnd` | the run ends, with its reason, error and counts; always the last event |
 
 Events are delivered one at a time; `Emit` must not block for long. Returning an error from it stops the run: the tool calls under way are cancelled and no further event is delivered but the `RunEnd`, which is always the last. The event refused takes no effect: a refused `MessageEnd` or `CompactionEnd` keeps the message or compaction out of the history.
 
-Messages enter the history in the order they were taken, timed as they do; those taken from `Steering`, `FollowUp` or `OnStop` are recorded even when the run then ends before the model answers them. A response that fails, whether the vendor ended it with an error, the stream broke off or the run was cancelled, is recorded with what streamed of it, `Stop` set to `StopError` or `StopAborted` and its tool calls dropped, so a transcript shows it; it is never sent to the model again.
+Messages enter the history in the order they were taken, timed as they do; those taken from `Steering`, `FollowUp` or `OnStop` are recorded even when the run then ends before the model answers them. None of these is consulted once the run is cancelled. A response that fails, whether the vendor ended it with an error, the stream broke off or the run was cancelled, is recorded with what streamed of it, `Stop` set to `StopError` or `StopAborted` and its tool calls dropped, so a transcript shows it; it is never sent to the model again.
 
 ## Tools
 
@@ -144,7 +144,7 @@ weather := agentcore.NewTool("weather", "Current weather of a city",
 - Arguments are validated against `Schema` before a call runs; the model reads what does not fit.
 - `Check` vets a call before it is approved and may return a preview for people, such as the diff `edit` and `write` return, found on `ToolCall.Preview`.
 - `Parallel` lets calls run alongside the other parallel calls of their turn, up to `MaxToolConcurrency`.
-- `Deferred` tools are offered only once a tool reference in the history names them, as `tool_search` returns (see `tools.Defer`).
+- `Deferred` tools are offered only once a tool reference in the history names them, as `tool_search` returns (see `tools.Defer`). Anthropic receives them all from the first call, marked `defer_loading`, so the tools of a conversation never change; see `litellm.Tool`.
 - A `Result` holds litellm blocks (text, images, tool references); `Result.Text` is its text. `Terminate` ends the run once the turn is recorded.
 - A running tool reports progress with `agentcore.ReportProgress(ctx, v)`; it arrives as `ToolUpdate`. `bash` reports lines of output as strings, `subagent` reports `subagent.Progress`.
 
@@ -185,7 +185,7 @@ cfg.Tools = workspace.Tools() // or workspace.Read(), workspace.Bash(), ...
 
 Results are plain text. A failing command is not a failed `bash` call: its output and exit code are what the model needs. With `Files`, `write` refuses an existing file the model has not read whole, and `write` and `edit` one that changed since it was read. The working directory of a call's context (`tools.WithCwd`) overrides `Dir`, as for a git worktree entered mid-run. `bash` needs a POSIX shell (`bash` or `sh`) on PATH; on Windows that means Git Bash.
 
-`tools.Defer(tools)` puts tools behind `tool_search` (`query`, `max_results`), whose description lists their names: the model sees their schemas only once it searched for them.
+`tools.Defer(tools)` puts tools behind `tool_search` (`query`, `max_results`): the model sees their schemas only once it searched for them. The definition of `tool_search` does not depend on the tools, so tools deferred later leave earlier requests intact; the application tells the model their names, such as in a message.
 
 ## Background Tasks
 
@@ -203,9 +203,9 @@ cfg.Compactor = compact.Summarizer{}
 cfg.CompactAt = 100_000
 ```
 
-The loop compacts before a call whose history is estimated above `CompactAt`, and once when the provider reports a context overflow, then makes the call again; the first may fail without ending the run, the second may not. The estimate counts from the last response's reported input tokens. `CompactAt` should sit well above what a compaction keeps, or every call compacts again.
+The loop compacts before a call whose history is estimated above `CompactAt`, and once when the provider reports a context overflow, then makes the call again; the first may fail without ending the run, the second may not. The calls a compaction makes are retried as `Retry` allows, and their usage, on `Compaction.Usage`, is priced as a response's. The estimate counts from the last response's reported input tokens. `CompactAt` should sit well above what a compaction keeps, or every call compacts again.
 
-`compact.Summarizer` keeps the recent messages verbatim, a quarter of the history between 2k and 20k tokens, and replaces the rest with a checkpoint the conversation's own model writes: it extends the conversation's call for the part it replaces, which is served from the prompt cache, and asks for the checkpoint in `<summary>` tags; when that does not fit, or the answer has no tags, it asks a second time with a plain-text transcript. The checkpoint lists the files the replaced part read and changed, and the tools it loaded stay loaded. Implement `agentcore.Compactor` for another strategy.
+`compact.Summarizer` replaces the history with a checkpoint the conversation's own model writes, keeping only the prompts at its end the model has yet to answer. Nothing else is replayed: Claude rejects reasoning kept past a rewrite of what came before it, and the deferred tools the history loaded are searched for again. It extends the conversation's call for the history it replaces, which is served from the prompt cache, and asks for the checkpoint in `<summary>` tags; when that does not fit, or the answer has no tags, it asks a second time with a plain-text transcript. The checkpoint lists the files the replaced part read and changed. Implement `agentcore.Compactor` for another strategy.
 
 ## Sub-agents
 
@@ -236,9 +236,9 @@ The model calls `subagent` with `agent` and `task` to run one agent; with `tasks
 | `MaxToolConcurrency` | Parallel calls running at once (below 2, one by one) |
 | `MaxToolErrors` | Disables a tool failing that many turns in a row (0 never) |
 | `Compactor` / `CompactAt` | Compaction, see above |
-| `Cache` | A cache breakpoint after each call's last message |
+| `Cache` | Cache breakpoints after each call's last message and after the last message of the call before, which that call wrote |
 | `MaxTurns` | Responses per run (0 means 100) |
-| `MaxRetries` | Retries of a transient model failure, with backoff |
+| `Retry` | A `retry.Policy` pacing the calls made again after a transient failure; the zero value makes none |
 
 ## License
 

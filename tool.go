@@ -20,7 +20,7 @@ type Tool struct {
 	Label string
 	// Deferred tools are offered to the model only once a
 	// litellm.ToolReferenceBlock in the history names them, as a tool search
-	// returns; until then they cost no context.
+	// returns; until then they cost no context. See litellm.Tool.
 	Deferred bool
 	// Parallel reports whether a call may run alongside the other parallel
 	// calls of its turn; nil means never.

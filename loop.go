@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/voocel/litellm"
+	"github.com/voocel/litellm/retry"
 )
 
 // Config configures a run.
@@ -40,7 +41,7 @@ type Config struct {
 	//
 	// Messages Steering, FollowUp and OnStop return are recorded at once,
 	// even when the run then ends, cancelled or at MaxTurns, before the
-	// model answers them.
+	// model answers them. None is consulted once the run is cancelled.
 	OnStop func(ctx context.Context, s StopInfo) ([]Message, error)
 
 	// Middleware wraps every tool call, the first outermost.
@@ -62,16 +63,21 @@ type Config struct {
 	// keeps, or every call compacts again.
 	Compactor Compactor
 	CompactAt int
-	// Cache, if set, places a cache breakpoint after each call's last
-	// message, so a call reads the history the one before sent from the
-	// prompt cache.
+	// Cache, if set, places two cache breakpoints: after each call's last
+	// message, and after the last message of the call before, so a call
+	// reads the history that call sent from the prompt cache however many
+	// blocks the turn between them added. With the system prompt's, they
+	// must stay within the provider's limit, 4 on Anthropic; breakpoints of
+	// a longer TTL must come before those of a shorter one.
 	Cache *litellm.CacheControl
 
 	// MaxTurns bounds the responses of a run; 0 means 100.
 	MaxTurns int
-	// MaxRetries is how many times a model call that failed transiently,
-	// such as on a rate limit or a dropped connection, is made again.
-	MaxRetries int
+	// Retry paces the model calls made again after failing for a while,
+	// such as on a rate limit or a dropped connection: a response, or a
+	// compaction, makes at most Retry.MaxAttempts calls. The zero Policy
+	// makes none again.
+	Retry retry.Policy
 }
 
 // StopInfo is what OnStop decides on.
@@ -87,7 +93,6 @@ type StopInfo struct {
 const (
 	defaultMaxTurns       = 100
 	maxLengthRecoveries   = 3
-	maxRetryDelay         = 60 * time.Second
 	lengthRecoveryPrompt  = "Output token limit hit. Resume directly - no apology, no recap of what you were doing. Pick up mid-thought if that is where the cut happened. Break remaining work into smaller pieces."
 	interruptedToolResult = "Interrupted: the run was cancelled before this tool call ran."
 )
@@ -106,7 +111,10 @@ func Run(ctx context.Context, cfg Config, history []Message, prompts ...Message)
 	runCtx, cancel := context.WithCancelCause(ctx)
 	defer cancel(nil)
 	r := &run{ctx: runCtx, cancel: cancel, cfg: cfg, history: slices.Clone(history), toolErrors: map[string]int{}}
-	err := r.loop(prompts)
+	err := cfg.validate()
+	if err == nil {
+		err = r.loop(prompts)
+	}
 	reason := EndDone
 	switch {
 	case r.failed() != nil:
@@ -125,6 +133,16 @@ func Run(ctx context.Context, cfg Config, history []Message, prompts ...Message)
 		_ = cfg.Emit(RunEnd{Reason: reason, Err: err, Turns: r.turns, ToolCalls: r.toolCalls, FailedCalls: r.failedCalls})
 	}
 	return r.history, err
+}
+
+// validate reports a Config a run cannot use.
+func (cfg Config) validate() error {
+	if p := cfg.Model.Pricing; p != nil {
+		if err := p.Validate(); err != nil {
+			return fmt.Errorf("agentcore: model pricing: %w", err)
+		}
+	}
+	return nil
 }
 
 type run struct {
@@ -216,6 +234,10 @@ func (r *run) loop(prompts []Message) error {
 		if err := r.emit(TurnEnd{Message: msg, Results: results}); err != nil {
 			return err
 		}
+		// What was queued stays queued once the run is cancelled.
+		if err := r.ctx.Err(); err != nil {
+			return err
+		}
 
 		stopping := terminated || len(results) == 0
 		if stopping && !terminated && msg.Stop == StopLength && r.lengthRecoveries < maxLengthRecoveries {
@@ -281,11 +303,11 @@ func (r *run) followUp() []Message {
 // respond gets the model's response to the history and records it, with
 // the invalid arguments of its calls fixed (see invalidArgs). Before the
 // call, a history grown past CompactAt is compacted, as far as that
-// succeeds; on a context overflow, it is compacted and the call made again,
-// once. What was steered while it compacted goes into that call. Transient
-// failures are retried. A response that fails for good, or is cancelled, is
-// recorded with what streamed of it, as StopError or StopAborted, so every
-// MessageStart ends with a MessageEnd or a Retry.
+// succeeds. A call that fails on a context overflow is made again, once,
+// after compacting; one that fails for a while, as Retry allows; Steering
+// is consulted after a compaction. A response that fails for good, or is
+// cancelled, is recorded with what streamed of it, as StopError or
+// StopAborted, so every MessageStart ends with a MessageEnd or a Retry.
 func (r *run) respond() (Message, map[string]string, error) {
 	compacted := false
 	if r.cfg.Compactor != nil && r.cfg.CompactAt > 0 && Estimate(r.cfg, r.history) > r.cfg.CompactAt {
@@ -298,41 +320,39 @@ func (r *run) respond() (Message, map[string]string, error) {
 			return Message{}, nil, err
 		}
 	}
-	for attempt := 0; ; attempt++ {
+	for attempt := 1; ; attempt++ {
 		msg, started, err := r.call()
-		if err != nil && litellm.ErrorTypeOf(err) == litellm.ErrorTypeContextOverflow && !compacted && r.cfg.Compactor != nil {
-			compacted = true
-			changed, cerr := r.compact()
-			if cerr != nil {
-				return Message{}, nil, cerr
-			}
-			if serr := r.steer(); serr != nil {
-				return Message{}, nil, serr
-			}
-			if changed {
-				msg, started, err = r.call()
-			}
-		}
 		if err == nil {
 			bad := invalidArgs(&msg)
 			return msg, bad, r.record(msg)
 		}
-		cancelled := r.ctx.Err() != nil
-		if !cancelled && litellm.IsTemporaryError(err) && attempt < r.cfg.MaxRetries {
-			delay := retryDelay(err, attempt)
-			if err := r.emit(Retry{Attempt: attempt + 1, MaxRetries: r.cfg.MaxRetries, Delay: delay, Err: err}); err != nil {
+		if r.ctx.Err() == nil && !compacted && r.cfg.Compactor != nil && litellm.ErrorTypeOf(err) == litellm.ErrorTypeContextOverflow {
+			compacted = true
+			if eerr := r.emit(Retry{Attempt: attempt + 1, Err: err}); eerr != nil {
+				return Message{}, nil, eerr
+			}
+			changed, cerr := r.compact()
+			if cerr != nil {
+				return Message{}, nil, cerr
+			}
+			if !changed {
 				return Message{}, nil, err
 			}
-			select {
-			case <-r.ctx.Done():
-				return Message{}, nil, r.ctx.Err()
-			case <-time.After(delay):
+			if serr := r.steer(); serr != nil {
+				return Message{}, nil, serr
 			}
+			continue
+		}
+		again, rerr := r.retry(attempt, err)
+		if rerr != nil {
+			return Message{}, nil, rerr
+		}
+		if again {
 			continue
 		}
 		if started {
 			msg.Stop = StopError
-			if cancelled {
+			if r.ctx.Err() != nil {
 				msg.Stop = StopAborted
 			}
 			// Its calls are not made: their arguments may be incomplete.
@@ -344,20 +364,33 @@ func (r *run) respond() (Message, map[string]string, error) {
 				return Message{}, nil, rerr
 			}
 		}
-		if cancelled {
-			return Message{}, nil, r.ctx.Err()
+		if err := r.ctx.Err(); err != nil {
+			return Message{}, nil, err
 		}
 		return Message{}, nil, err
 	}
 }
 
-// retryDelay is the server's Retry-After, or else exponential backoff from
-// one second, at most maxRetryDelay.
-func retryDelay(err error, attempt int) time.Duration {
-	if d := litellm.RetryAfter(err); d > 0 {
-		return min(d, maxRetryDelay)
+// retry reports whether a model call that failed with err, on its attempt,
+// is to be made again: when err is temporary and Retry allows, after the
+// wait it reports with a Retry event.
+func (r *run) retry(attempt int, err error) (bool, error) {
+	if r.ctx.Err() != nil || !litellm.IsTemporaryError(err) || attempt >= r.cfg.Retry.MaxAttempts {
+		return false, nil
 	}
-	return min(time.Second<<attempt, maxRetryDelay)
+	delay, ok := r.cfg.Retry.Delay(attempt, litellm.RetryAfter(err))
+	if !ok {
+		return false, nil
+	}
+	if err := r.emit(Retry{Attempt: attempt + 1, Delay: delay, Err: err}); err != nil {
+		return false, err
+	}
+	select {
+	case <-r.ctx.Done():
+		return false, r.ctx.Err()
+	case <-time.After(delay):
+		return true, nil
+	}
 }
 
 // call makes one streamed model call for the history. On failure it returns
@@ -390,13 +423,16 @@ func (r *run) compact() (bool, error) {
 	if err := r.emit(CompactionStart{}); err != nil {
 		return false, err
 	}
-	c, err := r.cfg.Compactor.Compact(r.ctx, r.history, func(h []Message) Call { return BuildCall(r.cfg, h) })
+	c, err := r.compaction()
 	if err != nil {
 		err = fmt.Errorf("agentcore: compact: %w", err)
 		if eerr := r.emit(CompactionEnd{Err: err}); eerr != nil {
 			return false, eerr
 		}
 		return false, err
+	}
+	if c != nil && c.Usage != nil {
+		c.Usage = usage(c.Usage.Usage, r.cfg.Model.Pricing)
 	}
 	if err := r.emit(CompactionEnd{Compaction: c}); err != nil {
 		return false, err
@@ -406,4 +442,22 @@ func (r *run) compact() (bool, error) {
 	}
 	r.history = slices.Clone(c.Messages)
 	return true, nil
+}
+
+// compaction has the Compactor rewrite the history, making its calls again
+// as Retry allows when one fails for a while.
+func (r *run) compaction() (*Compaction, error) {
+	for attempt := 1; ; attempt++ {
+		c, err := r.cfg.Compactor.Compact(r.ctx, r.history, func(h []Message) Call { return BuildCall(r.cfg, h) })
+		if err == nil {
+			return c, nil
+		}
+		again, rerr := r.retry(attempt, err)
+		if rerr != nil {
+			return nil, rerr
+		}
+		if !again {
+			return nil, err
+		}
+	}
 }

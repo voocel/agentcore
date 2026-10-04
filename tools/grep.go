@@ -111,12 +111,19 @@ func (t *grepTool) grepWithRg(ctx context.Context, a grepArgs, searchPath string
 		cmdArgs = append(cmdArgs, fmt.Sprintf("--context=%d", a.ContextLines))
 	}
 	if a.Glob != "" {
-		cmdArgs = append(cmdArgs, "--glob", a.Glob)
+		cmdArgs = append(cmdArgs, "--glob="+a.Glob)
 	}
 
-	cmdArgs = append(cmdArgs, a.Pattern, searchPath)
+	// rg matches globs against paths relative to its working directory, so
+	// it runs in the directory searched.
+	dir, target := searchPath, "."
+	if info, err := os.Stat(searchPath); err == nil && !info.IsDir() {
+		dir, target = filepath.Dir(searchPath), filepath.Base(searchPath)
+	}
+	cmdArgs = append(cmdArgs, "-e", a.Pattern, "--", target)
 
 	cmd := exec.CommandContext(ctx, rgPath, cmdArgs...)
+	cmd.Dir = dir
 	var stderr bytes.Buffer
 	cmd.Stderr = &stderr
 	stdout, err := cmd.StdoutPipe()
@@ -127,7 +134,7 @@ func (t *grepTool) grepWithRg(ctx context.Context, a grepArgs, searchPath string
 		return "", fmt.Errorf("start rg: %w", err)
 	}
 
-	prefix := searchPath + string(filepath.Separator)
+	prefix := "." + string(filepath.Separator)
 	scanner := bufio.NewScanner(stdout)
 	scanner.Buffer(make([]byte, 256*1024), 256*1024)
 
@@ -166,15 +173,15 @@ func (t *grepTool) grepWithRg(ctx context.Context, a grepArgs, searchPath string
 			break
 		}
 	}
-	if err := scanner.Err(); err != nil {
-		return "", fmt.Errorf("scan rg output: %w", err)
-	}
-
-	// Kill rg process early if we hit the limit
-	if hitLimit && cmd.Process != nil {
+	// rg is stopped once its output is no longer read.
+	scanErr := scanner.Err()
+	if hitLimit || scanErr != nil {
 		cmd.Process.Kill()
 	}
 	waitErr := cmd.Wait()
+	if scanErr != nil {
+		return "", fmt.Errorf("scan rg output: %w", scanErr)
+	}
 	exitCode := 0
 	if waitErr != nil {
 		var exitErr *exec.ExitError

@@ -76,14 +76,10 @@ func stopReason(f litellm.FinishReason) StopReason {
 	}
 }
 
-// Usage is what a response used. Input counts all prompt tokens, cache reads
-// and writes included; Output counts reasoning.
+// Usage is what a response used, and what that cost when the model's
+// pricing is known.
 type Usage struct {
-	Input      int `json:"input"`
-	Output     int `json:"output"`
-	CacheRead  int `json:"cache_read,omitempty"`
-	CacheWrite int `json:"cache_write,omitempty"`
-	// Cost is what it cost, when the model's pricing is known.
+	litellm.Usage
 	Cost *catalog.Cost `json:"cost,omitempty"`
 }
 
@@ -93,35 +89,26 @@ func (u *Usage) Add(o *Usage) {
 	if o == nil {
 		return
 	}
-	u.Input += o.Input
-	u.Output += o.Output
-	u.CacheRead += o.CacheRead
-	u.CacheWrite += o.CacheWrite
+	u.Usage.Add(o.Usage)
 	if o.Cost == nil {
 		return
 	}
-	var c catalog.Cost
+	// A new total: u may share its cost with the usage it was copied from.
+	total := *o.Cost
 	if u.Cost != nil {
-		c = *u.Cost
+		total.Add(*u.Cost)
 	}
-	u.Cost = &catalog.Cost{
-		Input:      c.Input + o.Cost.Input,
-		Output:     c.Output + o.Cost.Output,
-		CacheRead:  c.CacheRead + o.Cost.CacheRead,
-		CacheWrite: c.CacheWrite + o.Cost.CacheWrite,
-		Total:      c.Total + o.Cost.Total,
-	}
+	u.Cost = &total
 }
 
-// usage is the usage a response reported, priced; nil when it reported
-// none.
+// usage is u priced, nil when it counts nothing. The cost stays unknown
+// when the counts do not add up, or pricing has no rate for one of them.
 func usage(u litellm.Usage, pricing *catalog.Pricing) *Usage {
 	if u == (litellm.Usage{}) {
 		return nil
 	}
-	out := &Usage{Input: u.InputTokens, Output: u.OutputTokens, CacheRead: u.CacheReadTokens, CacheWrite: u.CacheWriteTokens}
+	out := &Usage{Usage: u}
 	if pricing != nil {
-		// Inconsistent counts leave the cost unknown.
 		if cost, err := pricing.Cost(u); err == nil {
 			out.Cost = &cost
 		}

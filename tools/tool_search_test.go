@@ -3,10 +3,11 @@ package tools
 import (
 	"context"
 	"encoding/json"
-	"strings"
+	"reflect"
 	"testing"
 
 	"github.com/voocel/agentcore"
+	"github.com/voocel/litellm"
 )
 
 func named(name string) agentcore.Tool {
@@ -15,7 +16,8 @@ func named(name string) agentcore.Tool {
 
 func offered(tools []agentcore.Tool, history []agentcore.Message) map[string]bool {
 	out := map[string]bool{}
-	for _, spec := range agentcore.BuildCall(agentcore.Config{Tools: tools}, history).Request.Tools {
+	req := agentcore.BuildCall(agentcore.Config{Tools: tools}, history).Request
+	for _, spec := range req.OfferedTools() {
 		out[spec.Name] = true
 	}
 	return out
@@ -24,8 +26,9 @@ func offered(tools []agentcore.Tool, history []agentcore.Message) map[string]boo
 func TestDeferredToolsLoadOnceTheHistoryReferencesThem(t *testing.T) {
 	deferred := Defer([]agentcore.Tool{named("deploy"), named("rollback")})
 	search := deferred[0]
-	if !strings.HasSuffix(search.Description, "Deferred tools: deploy, rollback") {
-		t.Fatalf("description = %q", search.Description)
+	// Deferring more tools leaves the definition of tool_search as it was.
+	if later := Defer([]agentcore.Tool{named("deploy")})[0]; later.Description != search.Description || !reflect.DeepEqual(later.Schema, search.Schema) {
+		t.Fatal("the definition of tool_search depends on the tools")
 	}
 	tools := append([]agentcore.Tool{named("read")}, deferred...)
 
@@ -38,7 +41,8 @@ func TestDeferredToolsLoadOnceTheHistoryReferencesThem(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	history = append(history, agentcore.ToolResult("c1", res))
+	call := litellm.ToolUseBlock{ID: "c1", Name: "tool_search", Arguments: `{"query":"select:deploy,unknown"}`}
+	history = append(history, agentcore.Message{Role: litellm.RoleAssistant, Blocks: []litellm.Block{call}}, agentcore.ToolResult("c1", res))
 	if got := offered(tools, history); len(got) != 3 || !got["deploy"] || got["rollback"] {
 		t.Fatalf("after the search, offered %v", got)
 	}

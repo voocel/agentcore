@@ -14,12 +14,13 @@ import (
 	"github.com/voocel/litellm"
 	"github.com/voocel/litellm/catalog"
 	"github.com/voocel/litellm/litellmtest"
+	"github.com/voocel/litellm/retry"
 )
 
 func TestRunTextResponse(t *testing.T) {
 	p := litellmtest.New(litellmtest.Reply{Blocks: []litellm.Block{litellm.Text("hello")}, Usage: litellm.Usage{InputTokens: 10, OutputTokens: 5}})
 	m := testModel(t, p)
-	m.Pricing = &catalog.Pricing{InputCostPerToken: 0.1, OutputCostPerToken: 1}
+	m.Pricing = &catalog.Pricing{Rates: catalog.Rates{Input: 0.1, Output: 1}}
 	rec := &recorder{}
 	history, err := Run(context.Background(), Config{Model: m, Emit: rec.emit, System: []litellm.Block{litellm.Text("be brief")}}, nil, UserText("hi"))
 	if err != nil {
@@ -32,7 +33,7 @@ func TestRunTextResponse(t *testing.T) {
 	if resp.Text() != "hello" || resp.Stop != StopEnd || resp.Provider != "test" || resp.Model != "m" || resp.Time.IsZero() {
 		t.Fatalf("response = %#v", resp)
 	}
-	if resp.Usage.Input != 10 || resp.Usage.Output != 5 || resp.Usage.Cost.Total != 6 {
+	if resp.Usage.InputTokens != 10 || resp.Usage.OutputTokens != 5 || resp.Usage.Cost.Total != 6 {
 		t.Fatalf("usage = %#v, cost %#v", resp.Usage, resp.Usage.Cost)
 	}
 	if !reflect.DeepEqual(rec.recorded(), history) {
@@ -119,7 +120,7 @@ func TestRunAbortDuringResponse(t *testing.T) {
 		}
 		return rec.emit(ev)
 	}
-	history, err := Run(ctx, Config{Model: testModel(t, p), Tools: []Tool{echoTool()}, Emit: emit, MaxRetries: 3}, nil, UserText("go"))
+	history, err := Run(ctx, Config{Model: testModel(t, p), Tools: []Tool{echoTool()}, Emit: emit, Retry: retry.Policy{MaxAttempts: 4}}, nil, UserText("go"))
 	if !errors.Is(err, context.Canceled) {
 		t.Fatalf("err = %v", err)
 	}
@@ -312,12 +313,13 @@ func TestRunRecordFailureStopsTools(t *testing.T) {
 	}
 }
 
-// Arguments that are not JSON become {} in the history, which stays
-// storable, and the model reads why the call did not run.
+// Arguments that are not a JSON object become {} in the history, which
+// stays storable and sendable, and the model reads why the call did not run.
 func TestRunInvalidArguments(t *testing.T) {
 	p := litellmtest.New(
 		litellmtest.Respond(call("c1", "echo", `{"text":`)),
 		litellmtest.Reply{Blocks: []litellm.Block{call("c2", "echo", `{"text":"lo`)}, FinishReason: litellm.FinishReasonLength},
+		litellmtest.Respond(call("c3", "echo", `null`)),
 		litellmtest.Text("ok"),
 	)
 	history, err := Run(context.Background(), Config{Model: testModel(t, p), Tools: []Tool{echoTool()}}, nil, UserText("go"))
@@ -330,11 +332,14 @@ func TestRunInvalidArguments(t *testing.T) {
 	if got := history[1].ToolCalls()[0].Arguments; got != "{}" {
 		t.Fatalf("arguments = %s", got)
 	}
-	if !strings.Contains(history[2].Text(), `not valid JSON`) || !strings.Contains(history[2].Text(), `{"text":`) {
+	if !strings.Contains(history[2].Text(), `not a JSON object`) || !strings.Contains(history[2].Text(), `{"text":`) {
 		t.Fatalf("first result = %q", history[2].Text())
 	}
 	if !strings.Contains(history[4].Text(), "output token limit") {
 		t.Fatalf("second result = %q", history[4].Text())
+	}
+	if got := history[5].ToolCalls()[0].Arguments; got != "{}" || !strings.Contains(history[6].Text(), `not a JSON object (null)`) {
+		t.Fatalf("null arguments = %s, result %q", got, history[6].Text())
 	}
 }
 
@@ -392,7 +397,7 @@ func TestRunTerminateAndStop(t *testing.T) {
 	}
 }
 
-// Transient failures are retried up to MaxRetries, after the server's
+// Transient failures are retried as Retry allows, after the server's
 // Retry-After; others are not.
 func TestRunRetries(t *testing.T) {
 	limited := litellm.NewError("test", litellm.ErrorTypeRateLimit, "slow down", nil)
@@ -405,23 +410,51 @@ func TestRunRetries(t *testing.T) {
 		litellmtest.Text("whole"),
 	)
 	rec := &recorder{}
-	history, err := Run(context.Background(), Config{Model: testModel(t, p), Emit: rec.emit, MaxRetries: 2}, nil, UserText("go"))
+	history, err := Run(context.Background(), Config{Model: testModel(t, p), Emit: rec.emit, Retry: retry.Policy{MaxAttempts: 3}}, nil, UserText("go"))
 	if err != nil || len(history) != 2 || history[1].Text() != "whole" {
 		t.Fatalf("err = %v, history %#v", err, history)
 	}
 	retries := of[Retry](rec)
-	if len(retries) != 2 || retries[1].Attempt != 2 || retries[0].Delay != time.Millisecond {
+	if len(retries) != 2 || retries[0].Attempt != 2 || retries[1].Attempt != 3 || retries[0].Delay != time.Millisecond {
 		t.Fatalf("retries = %#v", retries)
 	}
 
 	p = litellmtest.New(litellmtest.Fail(limited), litellmtest.Fail(limited))
-	if _, err := Run(context.Background(), Config{Model: testModel(t, p), MaxRetries: 1}, nil, UserText("go")); litellm.ErrorTypeOf(err) != litellm.ErrorTypeRateLimit || len(p.Requests()) != 2 {
-		t.Fatalf("past MaxRetries: err %v, requests %d", err, len(p.Requests()))
+	if _, err := Run(context.Background(), Config{Model: testModel(t, p), Retry: retry.Policy{MaxAttempts: 2}}, nil, UserText("go")); litellm.ErrorTypeOf(err) != litellm.ErrorTypeRateLimit || len(p.Requests()) != 2 {
+		t.Fatalf("past MaxAttempts: err %v, requests %d", err, len(p.Requests()))
 	}
 	auth := litellm.NewError("test", litellm.ErrorTypeAuth, "bad key", nil)
 	p = litellmtest.New(litellmtest.Fail(auth))
-	if _, err := Run(context.Background(), Config{Model: testModel(t, p), MaxRetries: 3}, nil, UserText("go")); litellm.ErrorTypeOf(err) != litellm.ErrorTypeAuth || len(p.Requests()) != 1 {
+	if _, err := Run(context.Background(), Config{Model: testModel(t, p), Retry: retry.Policy{MaxAttempts: 4}}, nil, UserText("go")); litellm.ErrorTypeOf(err) != litellm.ErrorTypeAuth || len(p.Requests()) != 1 {
 		t.Fatalf("auth: err %v, requests %d", err, len(p.Requests()))
+	}
+}
+
+// Once the run is cancelled, what was queued stays queued.
+func TestRunCancelledLeavesQueues(t *testing.T) {
+	p := litellmtest.New(litellmtest.Respond(call("c1", "echo", `{"text":"x"}`)), litellmtest.Text("unreached"))
+	ctx, cancel := context.WithCancel(context.Background())
+	echo := echoTool()
+	echo.Run = func(context.Context, json.RawMessage) (Result, error) { cancel(); return TextResult("x"), nil }
+	consulted := 0
+	queue := func() []Message { consulted++; return nil }
+	cfg := Config{Model: testModel(t, p), Tools: []Tool{echo}, Steering: queue, FollowUp: queue,
+		OnStop: func(context.Context, StopInfo) ([]Message, error) { consulted++; return nil, nil }}
+	if _, err := Run(ctx, cfg, nil, UserText("go")); !errors.Is(err, context.Canceled) {
+		t.Fatalf("err = %v", err)
+	}
+	if consulted != 1 {
+		t.Fatalf("queues consulted %d times, want only at the start", consulted)
+	}
+}
+
+// A server asking for a longer wait than MaxRetryAfter ends retrying.
+func TestRunRetryAfterBeyondPolicy(t *testing.T) {
+	limited := litellm.NewError("test", litellm.ErrorTypeRateLimit, "slow down", nil)
+	limited.RetryAfter = time.Hour
+	p := litellmtest.New(litellmtest.Fail(limited), litellmtest.Text("too early"))
+	if _, err := Run(context.Background(), Config{Model: testModel(t, p), Retry: retry.Policy{MaxAttempts: 3}}, nil, UserText("go")); litellm.ErrorTypeOf(err) != litellm.ErrorTypeRateLimit || len(p.Requests()) != 1 {
+		t.Fatalf("err %v, requests %d", err, len(p.Requests()))
 	}
 }
 

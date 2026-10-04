@@ -108,6 +108,44 @@ func TestOutsideChangesStillNeedARead(t *testing.T) {
 	}
 }
 
+// A file changed while a checked call awaited approval is not overwritten.
+func TestRunChecksTheFileAgain(t *testing.T) {
+	dir, read, write, edit := fileTools(t)
+	path := filepath.Join(dir, "a.txt")
+	for _, c := range []struct {
+		tool agentcore.Tool
+		args any
+	}{
+		{edit, editArgs{FilePath: path, OldString: "one", NewString: "uno"}},
+		{write, writeArgs{FilePath: path, Content: "uno\n"}},
+	} {
+		if err := os.WriteFile(path, []byte("one\n"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		if err := call(t, read, readArgs{FilePath: path}); err != nil {
+			t.Fatal(err)
+		}
+		raw := mustJSON(t, c.args)
+		if _, err := c.tool.Check(context.Background(), raw); err != nil {
+			t.Fatal(err)
+		}
+		later := mtimeOf(t, path).Add(2 * time.Second)
+		if err := os.WriteFile(path, []byte("one, edited by the user\n"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Chtimes(path, later, later); err != nil {
+			t.Fatal(err)
+		}
+		_, err := c.tool.Run(context.Background(), raw)
+		if err == nil || !strings.Contains(err.Error(), "modified since read") {
+			t.Fatalf("%s after an outside change: %v", c.tool.Name, err)
+		}
+		if got, _ := os.ReadFile(path); string(got) != "one, edited by the user\n" {
+			t.Fatalf("%s overwrote the user's change: %q", c.tool.Name, got)
+		}
+	}
+}
+
 func mtimeOf(t *testing.T, path string) time.Time {
 	t.Helper()
 	info, err := os.Stat(path)

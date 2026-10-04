@@ -116,13 +116,13 @@ cancel()                                                     // 结束运行
 | `MessageEnd` | 一条消息进入历史：提示、响应、工具结果 |
 | `ToolStart` / `ToolUpdate` / `ToolEnd` | 工具调用开始（在中间件即审批之前）/ 报告进度 / 带结果结束 |
 | `TurnEnd` | 一个响应及其工具调用的结果都已记录 |
-| `Retry` | 模型调用临时失败，将重试 |
+| `Retry` | 模型调用失败，将再次调用：等待之后，或在上下文溢出时压缩之后 |
 | `CompactionStart` / `CompactionEnd` | 历史被压缩 |
 | `RunEnd` | 运行结束，带原因、错误和计数；总是最后一个事件 |
 
 事件逐个投递，`Emit` 不应长时间阻塞。它返回错误会停止运行：进行中的工具调用被取消，此后只再投递 `RunEnd`，它总是最后一个事件。被拒的事件不生效：被拒的 `MessageEnd` 或 `CompactionEnd` 不让这条消息或这次压缩进入历史。
 
-消息按取出的顺序进入历史，并在进入时打上时间；从 `Steering`、`FollowUp` 或 `OnStop` 取出的消息，即使运行随后在模型作答前结束，也会记录。失败的响应——厂商以错误结束、流中断或运行被取消——连同已流出的内容一起记录，`Stop` 为 `StopError` 或 `StopAborted`，其中的工具调用被丢弃，便于在记录中呈现；它不会再发给模型。
+消息按取出的顺序进入历史，并在进入时打上时间；从 `Steering`、`FollowUp` 或 `OnStop` 取出的消息，即使运行随后在模型作答前结束，也会记录；运行被取消后不再从中取消息。失败的响应——厂商以错误结束、流中断或运行被取消——连同已流出的内容一起记录，`Stop` 为 `StopError` 或 `StopAborted`，其中的工具调用被丢弃，便于在记录中呈现；它不会再发给模型。
 
 ## 工具
 
@@ -144,7 +144,7 @@ weather := agentcore.NewTool("weather", "Current weather of a city",
 - 调用前按 `Schema` 校验参数；不符合的地方会告诉模型。
 - `Check` 在审批和执行前检查调用，并可返回给人看的预览，如 `edit` 和 `write` 返回的 diff，见 `ToolCall.Preview`。
 - `Parallel` 允许调用与同一轮的其他并行调用一起运行，上限为 `MaxToolConcurrency`。
-- `Deferred` 工具只在历史中有工具引用点名之后才提供给模型，`tool_search` 返回的就是这种引用（见 `tools.Defer`）。
+- `Deferred` 工具只在历史中有工具引用点名之后才提供给模型，`tool_search` 返回的就是这种引用（见 `tools.Defer`）。Anthropic 从第一次调用起就收到全部工具，延迟的标为 `defer_loading`，因此一次对话的工具列表始终不变；见 `litellm.Tool`。
 - `Result` 装的是 litellm 块（文本、图片、工具引用），`Result.Text` 取其文本。`Terminate` 在本轮记录完成后结束运行。
 - 运行中的工具用 `agentcore.ReportProgress(ctx, v)` 报告进度，以 `ToolUpdate` 送达。`bash` 以字符串报告每行输出，`subagent` 报告 `subagent.Progress`。
 
@@ -185,7 +185,7 @@ cfg.Tools = workspace.Tools() // 或 workspace.Read()、workspace.Bash() ……
 
 结果都是纯文本。命令失败不算 `bash` 调用失败：模型需要的正是它的输出和退出码。有 `Files` 时，`write` 拒绝覆盖模型没有完整读过的已有文件，`write` 和 `edit` 拒绝读过之后又被改动的文件。调用 ctx 携带的工作目录（`tools.WithCwd`）优先于 `Dir`，比如运行中途进入的 git worktree。`bash` 需要 PATH 上有 POSIX shell（`bash` 或 `sh`），Windows 上即 Git Bash。
 
-`tools.Defer(tools)` 把工具放到 `tool_search`（`query`、`max_results`）后面，它的描述列出这些工具的名字：模型搜索过之后才看到它们的 schema。
+`tools.Defer(tools)` 把工具放到 `tool_search`（`query`、`max_results`）后面：模型搜索过之后才看到它们的 schema。`tool_search` 的定义与这些工具无关，因此之后再延迟的工具不会改动此前的请求；工具名由应用告诉模型，比如放在一条消息里。
 
 ## 后台任务
 
@@ -203,9 +203,9 @@ cfg.Compactor = compact.Summarizer{}
 cfg.CompactAt = 100_000
 ```
 
-循环在估算历史超过 `CompactAt` 的调用之前压缩；provider 报告上下文溢出时压缩一次再重试该调用。前者失败不会结束运行，后者必须成功。估算以上一个响应报告的输入 token 为基准。`CompactAt` 应明显高于压缩后保留的量，否则每次调用都会再压缩。
+循环在估算历史超过 `CompactAt` 的调用之前压缩；provider 报告上下文溢出时压缩一次再重试该调用。前者失败不会结束运行，后者必须成功。压缩发出的调用按 `Retry` 重试，它们的用量放在 `Compaction.Usage`，和响应一样计价。估算以上一个响应报告的输入 token 为基准。`CompactAt` 应明显高于压缩后保留的量，否则每次调用都会再压缩。
 
-`compact.Summarizer` 原样保留最近的消息（历史的四分之一，在 2k 到 20k token 之间），其余换成对话自己的模型写的检查点：它延伸对话中被替换那部分的调用，因此命中提示缓存，并要求把检查点写在 `<summary>` 标签里；请求放不下或回答没有标签时，再用纯文本记录请求一次。检查点列出被替换部分读过和改过的文件，它加载过的工具仍然保持加载。需要别的策略就实现 `agentcore.Compactor`。
+`compact.Summarizer` 把历史换成对话自己的模型写的检查点，只原样保留末尾模型尚未回答的提示。其余一概不重放：Claude 会拒绝在前文被改写之后仍保留的推理，历史加载过的延迟工具则在需要时重新搜索。它延伸对话中被替换那部分的调用，因此命中提示缓存，并要求把检查点写在 `<summary>` 标签里；请求放不下或回答没有标签时，再用纯文本记录请求一次。检查点列出被替换部分读过和改过的文件。需要别的策略就实现 `agentcore.Compactor`。
 
 ## 子 agent
 
@@ -236,9 +236,9 @@ delegate := subagent.New(tasks, // nil 不提供后台模式
 | `MaxToolConcurrency` | 同时运行的并行调用数（小于 2 时逐个运行） |
 | `MaxToolErrors` | 工具连续失败这么多轮后禁用（0 表示不禁用） |
 | `Compactor` / `CompactAt` | 压缩，见上文 |
-| `Cache` | 在每次调用的最后一条消息后放置缓存断点 |
+| `Cache` | 在每次调用的最后一条消息后、以及上一次调用的最后一条消息后放置缓存断点（上一次调用在那里写过缓存） |
 | `MaxTurns` | 每次运行的响应数上限（0 表示 100） |
-| `MaxRetries` | 模型临时失败的重试次数，带退避 |
+| `Retry` | `retry.Policy`，决定临时失败后再次调用的节奏；零值不重试 |
 
 ## 许可证
 

@@ -9,14 +9,18 @@ import (
 	"time"
 
 	"github.com/voocel/litellm"
+	"github.com/voocel/litellm/catalog"
 	"github.com/voocel/litellm/litellmtest"
+	"github.com/voocel/litellm/retry"
 )
 
 // summarizer replaces all but the last message with a summary, recording
 // the calls it was given. during, if set, runs as it compacts.
 type summarizer struct {
-	calls  []Call
-	err    error
+	calls []Call
+	// errs are what its calls fail with, in turn, before one succeeds.
+	errs   []error
+	usage  litellm.Usage
 	during func()
 }
 
@@ -25,14 +29,16 @@ func (s *summarizer) Compact(_ context.Context, history []Message, call func([]M
 	if s.during != nil {
 		s.during()
 	}
-	if s.err != nil {
-		return nil, s.err
+	if len(s.errs) > 0 {
+		err := s.errs[0]
+		s.errs = s.errs[1:]
+		return nil, err
 	}
 	if len(history) < 2 {
 		return nil, nil
 	}
 	kept := history[len(history)-1:]
-	return &Compaction{Messages: append([]Message{SummaryMessage("earlier work")}, kept...), Replaced: len(history) - 1}, nil
+	return &Compaction{Messages: append([]Message{SummaryMessage("earlier work")}, kept...), Replaced: len(history) - 1, Usage: &Usage{Usage: s.usage}}, nil
 }
 
 func bigHistory() []Message {
@@ -74,7 +80,7 @@ func TestRunCompactsAboveCompactAt(t *testing.T) {
 // history it replaced: they do not set off another one.
 func TestEstimateAfterCompaction(t *testing.T) {
 	old := assistant(StopEnd, litellm.Text("noted"))
-	old.Usage = &Usage{Input: 90_000}
+	old.Usage = &Usage{Usage: litellm.Usage{InputTokens: 90_000}}
 	old.Time = time.Now().Add(-time.Minute)
 	history := []Message{SummaryMessage("earlier work"), old, UserText("next")}
 	if got := Estimate(Config{}, history); got > 1000 {
@@ -82,7 +88,7 @@ func TestEstimateAfterCompaction(t *testing.T) {
 	}
 
 	fresh := assistant(StopEnd, litellm.Text("ok"))
-	fresh.Usage = &Usage{Input: 5000}
+	fresh.Usage = &Usage{Usage: litellm.Usage{InputTokens: 5000}}
 	fresh.Time = time.Now().Add(time.Minute)
 	history = append(history, fresh, UserText(strings.Repeat("a", 400)))
 	if got := Estimate(Config{}, history); got != 5000+1+100 {
@@ -90,7 +96,7 @@ func TestEstimateAfterCompaction(t *testing.T) {
 	}
 
 	failed := assistant(StopError, litellm.Text("x"))
-	failed.Usage = &Usage{Input: 1}
+	failed.Usage = &Usage{Usage: litellm.Usage{InputTokens: 1}}
 	failed.Time = time.Now().Add(2 * time.Minute)
 	if got := Estimate(Config{}, append(history, failed)); got != 5000+1+100+1 {
 		t.Fatalf("estimate counted from a failed response: %d", got)
@@ -98,6 +104,27 @@ func TestEstimateAfterCompaction(t *testing.T) {
 
 	if got := estimateText("你好世界"); got != 6 {
 		t.Fatalf("CJK estimate = %d", got)
+	}
+}
+
+// A compaction's usage is priced as a response's is.
+func TestRunPricesCompactions(t *testing.T) {
+	p := litellmtest.New(litellmtest.Text("ok"))
+	m := testModel(t, p)
+	m.Pricing = &catalog.Pricing{Rates: catalog.Rates{Input: 1, Output: 2}}
+	rec := &recorder{}
+	s := &summarizer{usage: litellm.Usage{InputTokens: 10, OutputTokens: 1}}
+	if _, err := Run(context.Background(), Config{Model: m, Compactor: s, CompactAt: 500, Emit: rec.emit}, bigHistory()); err != nil {
+		t.Fatal(err)
+	}
+	ends := of[CompactionEnd](rec)
+	if len(ends) != 1 || ends[0].Compaction.Usage.Cost == nil || ends[0].Compaction.Usage.Cost.Total != 12 {
+		t.Fatalf("compactions = %+v", ends)
+	}
+
+	m.Pricing = &catalog.Pricing{Rates: catalog.Rates{Input: -1}}
+	if _, err := Run(context.Background(), Config{Model: m}, nil, UserText("go")); err == nil || len(p.Requests()) != 1 {
+		t.Fatalf("invalid pricing: %v, requests %d", err, len(p.Requests()))
 	}
 }
 
@@ -112,13 +139,59 @@ func TestRunOverflowCompactsOnce(t *testing.T) {
 
 	p = litellmtest.New(litellmtest.Fail(overflow), litellmtest.Fail(overflow))
 	s = &summarizer{}
-	if _, err := Run(context.Background(), Config{Model: testModel(t, p), Compactor: s, MaxRetries: 3}, bigHistory()); litellm.ErrorTypeOf(err) != litellm.ErrorTypeContextOverflow || len(s.calls) != 1 || len(p.Requests()) != 2 {
+	if _, err := Run(context.Background(), Config{Model: testModel(t, p), Compactor: s, Retry: retry.Policy{MaxAttempts: 4}}, bigHistory()); litellm.ErrorTypeOf(err) != litellm.ErrorTypeContextOverflow || len(s.calls) != 1 || len(p.Requests()) != 2 {
 		t.Fatalf("second overflow: err %v, compactions %d, requests %d", err, len(s.calls), len(p.Requests()))
+	}
+
+	// The compaction's calls are made again as the response's are.
+	overloaded := litellm.NewError("test", litellm.ErrorTypeOverloaded, "busy", nil)
+	overloaded.RetryAfter = time.Millisecond
+	p = litellmtest.New(litellmtest.Fail(overflow), litellmtest.Text("fits now"))
+	s = &summarizer{errs: []error{overloaded}}
+	rec := &recorder{}
+	history, err = Run(context.Background(), Config{Model: testModel(t, p), Compactor: s, Retry: retry.Policy{MaxAttempts: 2}, Emit: rec.emit}, bigHistory())
+	if err != nil || history[len(history)-1].Text() != "fits now" || len(s.calls) != 2 {
+		t.Fatalf("overloaded compaction: err %v, compactions %d", err, len(s.calls))
+	}
+	if retries := of[Retry](rec); len(retries) != 2 || retries[0].Delay != 0 || retries[1].Delay != time.Millisecond {
+		t.Fatalf("retries = %#v", retries)
 	}
 
 	p = litellmtest.New(litellmtest.Fail(overflow))
 	if _, err := Run(context.Background(), Config{Model: testModel(t, p), Compactor: &summarizer{}}, []Message{UserText("huge")}); litellm.ErrorTypeOf(err) != litellm.ErrorTypeContextOverflow {
 		t.Fatalf("nothing to compact: %v", err)
+	}
+}
+
+// An overflow reported once the response began streaming ends that
+// response with a Retry before the history is compacted.
+func TestRunOverflowMidStream(t *testing.T) {
+	overflow := litellm.NewError("test", litellm.ErrorTypeContextOverflow, "prompt is too long", nil)
+	p := litellmtest.New(litellmtest.Reply{StreamErr: overflow}, litellmtest.Text("fits now"))
+	rec := &recorder{}
+	history, err := Run(context.Background(), Config{Model: testModel(t, p), Compactor: &summarizer{}, Emit: rec.emit}, bigHistory())
+	if err != nil || history[len(history)-1].Text() != "fits now" {
+		t.Fatalf("err %v, history %v", err, roles(history))
+	}
+	open := false
+	for _, ev := range rec.events {
+		switch e := ev.(type) {
+		case MessageStart:
+			if open {
+				t.Fatal("a response began before the one before it ended")
+			}
+			open = true
+		case MessageEnd:
+			if e.Message.Role == litellm.RoleAssistant {
+				open = false
+			}
+		case Retry:
+			open = false
+		case CompactionStart:
+			if open {
+				t.Fatal("compacted while a response was open")
+			}
+		}
 	}
 }
 
@@ -178,14 +251,14 @@ func TestRunCompactionFailures(t *testing.T) {
 
 	boom := errors.New("summary model down")
 	rec := &recorder{}
-	history, err = Run(context.Background(), Config{Model: testModel(t, p), Compactor: &summarizer{err: boom}, CompactAt: 500, Emit: rec.emit}, bigHistory())
+	history, err = Run(context.Background(), Config{Model: testModel(t, p), Compactor: &summarizer{errs: []error{boom}}, CompactAt: 500, Emit: rec.emit}, bigHistory())
 	if err != nil || !errors.Is(of[CompactionEnd](rec)[0].Err, boom) || history[len(history)-1].Text() != "unreached" {
 		t.Fatalf("failed compaction at CompactAt: err %v, history %v", err, roles(history))
 	}
 
 	overflow := litellm.NewError("test", litellm.ErrorTypeContextOverflow, "prompt is too long", nil)
 	p = litellmtest.New(litellmtest.Fail(overflow))
-	if _, err := Run(context.Background(), Config{Model: testModel(t, p), Compactor: &summarizer{err: boom}}, bigHistory()); !errors.Is(err, boom) {
+	if _, err := Run(context.Background(), Config{Model: testModel(t, p), Compactor: &summarizer{errs: []error{boom}}}, bigHistory()); !errors.Is(err, boom) {
 		t.Fatalf("failed compaction on overflow: %v", err)
 	}
 

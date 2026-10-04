@@ -39,3 +39,32 @@ func TestGrepOptions(t *testing.T) {
 		t.Fatalf("grep = %q, %v", got, err)
 	}
 }
+
+// Globs with a directory part match paths under the directory searched.
+func TestSearchGlobsWithDirectories(t *testing.T) {
+	dir := searchFixture(t)
+	os.MkdirAll(filepath.Join(dir, "src/a"), 0o755)
+	if err := os.WriteFile(filepath.Join(dir, "src/a/b.ts"), []byte("hello\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	got, err := run(t, Workspace{Dir: dir}.Glob(), map[string]any{"pattern": "src/**/*.ts"})
+	if err != nil || !strings.Contains(got, filepath.Join("src", "a", "b.ts")) {
+		t.Fatalf("glob = %q, %v", got, err)
+	}
+	got, err = run(t, Workspace{Dir: dir}.Grep(), map[string]any{"pattern": "hello", "glob": "src/**/*.ts"})
+	if err != nil || !strings.Contains(got, filepath.Join("src", "a", "b.ts")+":1:hello") {
+		t.Fatalf("grep = %q, %v", got, err)
+	}
+}
+
+// A pattern that reads as a flag is searched for.
+func TestGrepPatternIsNotAFlag(t *testing.T) {
+	dir := searchFixture(t)
+	if err := os.WriteFile(filepath.Join(dir, "flags.txt"), []byte("run --pre=cat\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	got, err := run(t, Workspace{Dir: dir}.Grep(), map[string]any{"pattern": "--pre=cat"})
+	if err != nil || !strings.Contains(got, "flags.txt:1:run --pre=cat") {
+		t.Fatalf("grep = %q, %v", got, err)
+	}
+}

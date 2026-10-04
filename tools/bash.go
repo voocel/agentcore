@@ -167,19 +167,22 @@ func foreground(ctx context.Context, shell string, argv []string, dir string, ti
 	}
 	pw.Close()
 
-	var output []byte
+	out := &output{}
+	defer out.close()
 	var readErr error
 	done := make(chan struct{})
 	go func() {
 		defer close(done)
-		output, readErr = readLines(pr, func(line string) { agentcore.ReportProgress(ctx, line) })
+		readErr = readLines(pr, out, func(line string) { agentcore.ReportProgress(ctx, line) })
 	}()
 	waitErr := cmd.Wait()
 	// A process the command left running may hold the pipe open: its output
 	// after the command ended is not waited for long.
+	drained := true
 	select {
 	case <-done:
 	case <-time.After(500 * time.Millisecond):
+		drained = false
 	}
 	pr.Close()
 	<-done
@@ -195,10 +198,13 @@ func foreground(ctx context.Context, shell string, argv []string, dir string, ti
 		return "", fmt.Errorf("command failed: %w", waitErr)
 	}
 
-	text, cut := tailOutput(string(output))
+	text, cut := out.result()
 	var notes []string
 	if cut != "" {
 		notes = append(notes, cut)
+	}
+	if !drained {
+		notes = append(notes, "[Output written after the command exited, by processes it left running, is not shown.]")
 	}
 	if code := cmd.ProcessState.ExitCode(); code != 0 && !timedOut {
 		notes = append(notes, fmt.Sprintf("[exit code %d]", code))
@@ -212,14 +218,13 @@ func foreground(ctx context.Context, shell string, argv []string, dir string, ti
 	return text, nil
 }
 
-// readLines reads r to its end, calling line with each line as it comes,
-// and returns all it read.
-func readLines(r io.Reader, line func(string)) ([]byte, error) {
-	var all, pending []byte
+// readLines copies r to w, calling line with each line as it comes.
+func readLines(r io.Reader, w io.Writer, line func(string)) error {
+	var pending []byte
 	buf := make([]byte, 32*1024)
 	for {
 		n, err := r.Read(buf)
-		all = append(all, buf[:n]...)
+		w.Write(buf[:n])
 		pending = append(pending, buf[:n]...)
 		for {
 			i := bytes.IndexByte(pending, '\n')
@@ -234,33 +239,102 @@ func readLines(r io.Reader, line func(string)) ([]byte, error) {
 				line(string(pending))
 			}
 			if errors.Is(err, io.EOF) || errors.Is(err, os.ErrClosed) {
-				return all, nil
+				return nil
 			}
-			return all, err
+			return err
 		}
 	}
 }
 
-// tailOutput returns the tail of a command's output the model reads and,
-// when that is cut, a line saying so; the whole output then goes to a file
-// the model can read.
-func tailOutput(output string) (text, cut string) {
-	output = strings.TrimSuffix(output, "\n")
-	if output == "" {
-		return "(no output)", ""
+// outputMemory bounds what output a command keeps in memory.
+const outputMemory = 4 * defaultMaxBytes
+
+// output collects a command's output: its tail in memory and, once that is
+// trimmed, the whole of it in a file the model can read.
+type output struct {
+	tail    []byte // the end of the output: all of it until trimmed
+	trimmed bool
+	lines   int      // newlines in the whole output
+	file    *os.File // the whole output, if saved
+	failed  bool     // saving it failed
+	shown   bool     // the result names the file
+}
+
+func (o *output) Write(p []byte) (int, error) {
+	o.lines += bytes.Count(p, []byte{'\n'})
+	o.tail = append(o.tail, p...)
+	switch {
+	case o.trimmed:
+		o.save(p)
+	case len(o.tail) > 2*outputMemory:
+		o.trimmed = true
+		o.save(o.tail)
 	}
-	tr := truncateTail(output, defaultMaxLines, defaultMaxBytes)
-	if !tr.Truncated {
-		return output, ""
+	if o.trimmed && len(o.tail) > 2*outputMemory {
+		o.tail = append([]byte(nil), o.tail[len(o.tail)-outputMemory:]...)
 	}
-	cut = fmt.Sprintf("[Showing the last %d of %d lines.]", tr.OutputLines, tr.TotalLines)
-	if f, err := os.CreateTemp("", "agentcore-bash-*.log"); err == nil {
-		_, werr := f.WriteString(output)
-		if cerr := f.Close(); werr == nil && cerr == nil {
-			cut = fmt.Sprintf("[Showing the last %d of %d lines. Full output: %s]", tr.OutputLines, tr.TotalLines, f.Name())
+	return len(p), nil
+}
+
+// save appends p to the file of the whole output, created on first use. A
+// failure leaves the output without one.
+func (o *output) save(p []byte) {
+	if o.failed {
+		return
+	}
+	if o.file == nil {
+		f, err := os.CreateTemp("", "agentcore-bash-*.log")
+		if err != nil {
+			o.failed = true
+			return
+		}
+		o.file = f
+	}
+	if _, err := o.file.Write(p); err != nil {
+		o.failed = true
+	}
+}
+
+// result returns the tail of the output the model reads and, when that is
+// cut, a line saying so, naming the file that holds the whole output.
+func (o *output) result() (text, cut string) {
+	tail := string(o.tail)
+	if o.trimmed {
+		// The tail starts within a line.
+		if i := strings.IndexByte(tail, '\n'); i >= 0 {
+			tail = tail[i+1:]
 		}
 	}
-	return tr.Content, cut
+	tail = strings.TrimSuffix(tail, "\n")
+	if tail == "" && !o.trimmed {
+		return "(no output)", ""
+	}
+	tr := truncateTail(tail, defaultMaxLines, defaultMaxBytes)
+	if !tr.Truncated && !o.trimmed {
+		return tail, ""
+	}
+	total := o.lines
+	if !bytes.HasSuffix(o.tail, []byte{'\n'}) {
+		total++
+	}
+	if !o.trimmed {
+		o.save(o.tail)
+	}
+	if o.file == nil || o.failed || o.file.Close() != nil {
+		o.failed = true
+		return tr.Content, fmt.Sprintf("[Showing the last %d of %d lines.]", tr.OutputLines, total)
+	}
+	o.shown = true
+	return tr.Content, fmt.Sprintf("[Showing the last %d of %d lines. Full output: %s]", tr.OutputLines, total, o.file.Name())
+}
+
+// close removes the file of the whole output unless the result named it.
+func (o *output) close() {
+	if o.file == nil || o.shown {
+		return
+	}
+	o.file.Close()
+	os.Remove(o.file.Name())
 }
 
 // command is the shell running argv in dir, killed with its process group

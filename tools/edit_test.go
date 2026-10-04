@@ -18,7 +18,7 @@ func TestEditFuzzyMatchTrailingUnicodeSpace(t *testing.T) {
 		t.Fatalf("write fixture: %v", err)
 	}
 
-	tool := Workspace{Dir: dir, Files: NewFileReadState()}.Edit()
+	tool := Workspace{Dir: dir}.Edit()
 	args, err := json.Marshal(map[string]any{
 		"file_path":  "test.txt",
 		"old_string": "line\n",
@@ -51,7 +51,7 @@ func TestEditFuzzyDoesNotChangeUnrelatedSameLineText(t *testing.T) {
 		t.Fatalf("write fixture: %v", err)
 	}
 
-	tool := Workspace{Dir: dir, Files: NewFileReadState()}.Edit()
+	tool := Workspace{Dir: dir}.Edit()
 	args, err := json.Marshal(map[string]any{
 		"file_path":  "test.txt",
 		"old_string": "target='old'",
@@ -123,7 +123,7 @@ func TestEditIndentAwareMatch(t *testing.T) {
 		t.Fatalf("write fixture: %v", err)
 	}
 
-	tool := Workspace{Dir: dir, Files: NewFileReadState()}.Edit()
+	tool := Workspace{Dir: dir}.Edit()
 	args, err := json.Marshal(map[string]any{
 		"file_path":  "test.txt",
 		"old_string": "if true {\n\tprintln(\"old\")\n}",
@@ -147,6 +147,27 @@ func TestEditIndentAwareMatch(t *testing.T) {
 	}
 }
 
+func TestIndentAwareFindWholeLines(t *testing.T) {
+	t.Parallel()
+
+	cases := []struct{ content, old, want string }{
+		{"class A:\n    def f(self):\n        return 1\n\nx = 1\n", "def f(self):\n    return 1\n", "    def f(self):\n        return 1\n"},
+		{"class A:\n    def f(self):\n        return 1\n\nx = 1\n", "def f(self):\n    return 1", "    def f(self):\n        return 1\n"},
+		{"class A:\n    def f(self):\n        return 1\n", "def f(self):\n    return 1\n", "    def f(self):\n        return 1\n"},
+		{"class A:\n    def f(self):\n        return 1", "def f(self):\n    return 1\n", "    def f(self):\n        return 1"},
+	}
+	for _, c := range cases {
+		idx, n, count := indentAwareFind(c.content, c.old)
+		if count != 1 {
+			t.Errorf("%q in %q: %d matches", c.old, c.content, count)
+			continue
+		}
+		if got := c.content[idx : idx+n]; got != c.want {
+			t.Errorf("%q in %q: matched %q, want %q", c.old, c.content, got, c.want)
+		}
+	}
+}
+
 func TestEditIndentAwareRequiresUniqueMatch(t *testing.T) {
 	t.Parallel()
 
@@ -157,7 +178,7 @@ func TestEditIndentAwareRequiresUniqueMatch(t *testing.T) {
 		t.Fatalf("write fixture: %v", err)
 	}
 
-	tool := Workspace{Dir: dir, Files: NewFileReadState()}.Edit()
+	tool := Workspace{Dir: dir}.Edit()
 	args, err := json.Marshal(map[string]any{
 		"file_path":  "test.txt",
 		"old_string": "if true {\n\tprintln(\"old\")\n}",
@@ -182,7 +203,7 @@ func TestEditFailureIncludesClosestMatchHint(t *testing.T) {
 		t.Fatalf("write fixture: %v", err)
 	}
 
-	tool := Workspace{Dir: dir, Files: NewFileReadState()}.Edit()
+	tool := Workspace{Dir: dir}.Edit()
 	args, err := json.Marshal(map[string]any{
 		"file_path":  "test.txt",
 		"old_string": "if true {\n\tprintln(\"old\")\n}",
@@ -221,7 +242,7 @@ func TestEditFailureIncludesClosestChineseMatchHint(t *testing.T) {
 		t.Fatalf("write fixture: %v", err)
 	}
 
-	tool := Workspace{Dir: dir, Files: NewFileReadState()}.Edit()
+	tool := Workspace{Dir: dir}.Edit()
 	args, err := json.Marshal(map[string]any{
 		"file_path":  "chapter.md",
 		"old_string": "她说这话的时候，语气很平，没有愤怒，没有嘲讽，只是在陈述。",
@@ -261,7 +282,7 @@ func TestEditFailureOmitsUnrelatedChineseCandidate(t *testing.T) {
 		t.Fatalf("write fixture: %v", err)
 	}
 
-	tool := Workspace{Dir: dir, Files: NewFileReadState()}.Edit()
+	tool := Workspace{Dir: dir}.Edit()
 	args, err := json.Marshal(map[string]any{
 		"file_path":  "chapter.md",
 		"old_string": "实验数据已经完成全部校验。",

@@ -14,9 +14,9 @@ import (
 
 // Write returns the write tool: it writes content to a file, creating
 // directories as needed, and reports what it wrote. Its Check returns the
-// diff of the change, cut to a few lines, as the call's preview and, with
-// Files, refuses an existing file the model has not read whole, or that
-// changed since.
+// diff of the change, cut to a few lines, as the call's preview. With Files,
+// its Check and Run refuse an existing file the model has not read whole, or
+// that changed since.
 func (w Workspace) Write() agentcore.Tool {
 	t := &writeTool{w: w, fs: w.fs()}
 	return agentcore.Tool{
@@ -146,7 +146,12 @@ func (t *writeTool) validate(ctx context.Context, args json.RawMessage) error {
 	return nil
 }
 
+// execute checks the file again: it may have changed while the call
+// awaited approval.
 func (t *writeTool) execute(ctx context.Context, args json.RawMessage) (agentcore.Result, error) {
+	if err := t.validate(ctx, args); err != nil {
+		return agentcore.Result{}, err
+	}
 	state, err := t.parseWrite(ctx, args)
 	if err != nil {
 		return agentcore.Result{}, err

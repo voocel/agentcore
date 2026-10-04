@@ -12,15 +12,16 @@ import (
 	"github.com/voocel/litellm"
 )
 
-// Defer puts tools behind the tool_search tool: it returns tool_search,
-// whose description lists their names, followed by the tools, marked
-// Deferred. The model sees only their names until it searches for them;
-// a search returns references to the tools it found, which offer them from
-// then on (see Tool.Deferred).
+// Defer puts tools behind the tool_search tool: it returns tool_search
+// followed by the tools, marked Deferred. A search returns references to the
+// tools it found, which offer them from then on (see Tool.Deferred).
+//
+// The definition of tool_search does not depend on the tools, so a tool
+// deferred later leaves the requests made before intact. The model learns
+// the names to search for from the application, such as in a message.
 func Defer(tools []agentcore.Tool) []agentcore.Tool {
 	t := &toolSearchTool{}
 	out := make([]agentcore.Tool, 0, len(tools)+1)
-	names := make([]string, 0, len(tools))
 	for _, d := range tools {
 		entry := toolSearchEntry{Name: d.Name, Description: d.Description}
 		if props, ok := d.Schema["properties"].(map[string]any); ok {
@@ -29,7 +30,6 @@ func Defer(tools []agentcore.Tool) []agentcore.Tool {
 			}
 		}
 		t.entries = append(t.entries, entry)
-		names = append(names, d.Name)
 		d.Deferred = true
 		out = append(out, d)
 	}
@@ -40,8 +40,7 @@ func Defer(tools []agentcore.Tool) []agentcore.Tool {
 			"Until fetched, only a deferred tool's name is known — there is no parameter schema, " +
 			"so the tool cannot be invoked. This tool takes a query, matches it against " +
 			"the deferred tools, and loads the matched ones. Query modes: \"select:Name1,Name2\" for exact selection, " +
-			"\"/regex_pattern/\" for regex matching, or plain keywords for scored search.\n\n" +
-			"Deferred tools: " + strings.Join(names, ", "),
+			"\"/regex_pattern/\" for regex matching, or plain keywords for scored search.",
 		Schema: map[string]any{
 			"type": "object",
 			"properties": map[string]any{

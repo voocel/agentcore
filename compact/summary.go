@@ -81,9 +81,10 @@ Update the existing structured summary with new information. RULES:
 
 // forkSummary extends the conversation's call for the history to replace
 // with forkInstruction, so the provider serves that history from the prompt
-// cache. It returns "" when the request no longer fits or the model answered
-// without a tagged summary, leaving the transcript path to take over.
-func forkSummary(ctx context.Context, call agentcore.Call) (string, error) {
+// cache, adding what the call used to used. It returns "" when the request
+// no longer fits or the model answered without a tagged summary, leaving the
+// transcript path to take over.
+func forkSummary(ctx context.Context, call agentcore.Call, used *litellm.Usage) (string, error) {
 	req := call.Request
 	req.Messages = append(slices.Clip(req.Messages), litellm.UserText(forkInstruction))
 	resp, err := call.Client.Chat(ctx, req)
@@ -93,6 +94,7 @@ func forkSummary(ctx context.Context, call agentcore.Call) (string, error) {
 	if err != nil {
 		return "", fmt.Errorf("summarize: %w", err)
 	}
+	used.Add(resp.Usage)
 	// Only tagged output counts: an ordinary task reply must not become the
 	// checkpoint.
 	return extractTaggedBlock(stripAnalysisBlock(resp.Text()), "summary"), nil
@@ -100,9 +102,10 @@ func forkSummary(ctx context.Context, call agentcore.Call) (string, error) {
 
 // standaloneSummary summarizes a plain-text transcript of history with the
 // conversation's model, without tools and with the vendor's default
-// thinking, folding in the previous summary. When the transcript itself
-// overflows, the oldest user turns are dropped until it fits.
-func standaloneSummary(ctx context.Context, call agentcore.Call, history []agentcore.Message, previous string) (string, error) {
+// thinking, folding in the previous summary, and adds what its calls used to
+// used. When the transcript itself overflows, the oldest user turns are
+// dropped until it fits.
+func standaloneSummary(ctx context.Context, call agentcore.Call, history []agentcore.Message, previous string, used *litellm.Usage) (string, error) {
 	instruction := summaryPrompt
 	if previous != "" {
 		instruction = "<previous-summary>\n" + previous + "\n</previous-summary>\n\n" + updateSummaryPrompt
@@ -117,6 +120,7 @@ func standaloneSummary(ctx context.Context, call agentcore.Call, history []agent
 		}
 		resp, err := call.Client.Chat(ctx, req)
 		if err == nil {
+			used.Add(resp.Usage)
 			if summary := extractStoredSummary(resp.Text()); summary != "" {
 				return summary, nil
 			}

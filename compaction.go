@@ -14,8 +14,8 @@ import (
 // such as for a manual compaction.
 //
 // The deferred tools a history loaded stay offered only while a tool
-// reference in it names them (see Tool.Deferred): a compactor that replaces
-// the results holding the references keeps them in the new history.
+// reference in it names them (see Tool.Deferred): once a compaction replaced
+// the results holding the references, the model searches for them again.
 type Compactor interface {
 	// Compact rewrites history. call builds the call the loop would make for
 	// a history, as BuildCall does with the run's Config: a compactor that
@@ -32,15 +32,19 @@ type Compaction struct {
 	Messages []Message
 	// Replaced is how many messages of the history the rewrite stands in for.
 	Replaced int
+	// Usage is what the model calls of the rewrite used, if any; a run
+	// prices it as it does responses.
+	Usage *Usage
 }
 
 const (
 	summaryOpen  = "<context-summary>\n"
-	summaryClose = "\n</context-summary>"
+	summaryClose = "\n</context-summary>\n\nThis summary stands in for the conversation so far. Continue from where it leaves off, without recapping it or asking for what it settles."
 )
 
 // SummaryMessage returns the message that stands in for history a
-// compaction replaced with summary. Models read it as a user message.
+// compaction replaced with summary, telling the model to carry on from it.
+// Models read it as a user message.
 func SummaryMessage(summary string) Message {
 	m := UserText(summaryOpen + summary + summaryClose)
 	m.Kind = KindSummary
@@ -63,13 +67,14 @@ const imageTokens = 1200
 // did, as right after a compaction.
 func Estimate(cfg Config, history []Message) int {
 	if i := usageAnchor(history); i >= 0 {
-		return history[i].Usage.Input + estimateMessages(history[i:])
+		return history[i].Usage.InputTokens + estimateMessages(history[i:])
 	}
 	tokens := estimateMessages(history)
 	for _, b := range cfg.System {
 		tokens += estimateBlock(b)
 	}
-	for _, t := range toolSpecs(cfg.Tools, history) {
+	req := BuildCall(cfg, history).Request
+	for _, t := range req.OfferedTools() {
 		tokens += estimateText(t.Name+t.Description) + len(t.Parameters)/4
 	}
 	return tokens
@@ -88,7 +93,7 @@ func usageAnchor(history []Message) int {
 	}
 	for i := len(history) - 1; i >= 0; i-- {
 		m := history[i]
-		if m.Role != litellm.RoleAssistant || m.Usage == nil || m.Usage.Input == 0 ||
+		if m.Role != litellm.RoleAssistant || m.Usage == nil || m.Usage.InputTokens == 0 ||
 			m.Stop == StopError || m.Stop == StopAborted {
 			continue
 		}
@@ -100,8 +105,8 @@ func usageAnchor(history []Message) int {
 	return -1
 }
 
-// EstimateMessage approximates the tokens of m's content.
-func EstimateMessage(m Message) int {
+// estimateMessage approximates the tokens of m's content.
+func estimateMessage(m Message) int {
 	tokens := 0
 	for _, b := range m.Blocks {
 		tokens += estimateBlock(b)
@@ -112,7 +117,7 @@ func EstimateMessage(m Message) int {
 func estimateMessages(msgs []Message) int {
 	total := 0
 	for _, m := range msgs {
-		total += EstimateMessage(m)
+		total += estimateMessage(m)
 	}
 	return total
 }

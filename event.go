@@ -52,12 +52,13 @@ type TurnEnd struct {
 	Results []Message
 }
 
-// Retry reports a failed model call that the run makes again after Delay.
+// Retry reports a model call that failed with Err, which the run makes
+// again after Delay; one that overflowed the context, after compacting.
+// Attempt numbers the call to come, the first made again being 2.
 type Retry struct {
-	Attempt    int
-	MaxRetries int
-	Delay      time.Duration
-	Err        error
+	Attempt int
+	Delay   time.Duration
+	Err     error
 }
 
 // CompactionStart begins a compaction of the history.

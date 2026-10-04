@@ -73,10 +73,10 @@ func TestBuildCall(t *testing.T) {
 		t.Fatalf("request = %#v", req)
 	}
 	var names []string
-	for _, tool := range req.Tools {
+	for _, tool := range req.OfferedTools() {
 		names = append(names, tool.Name)
 	}
-	if !reflect.DeepEqual(names, []string{"read", "deploy"}) || string(req.Tools[0].Parameters) != `{"type":"object"}` {
+	if len(req.Tools) != 3 || !req.Tools[2].Deferred || !reflect.DeepEqual(names, []string{"read", "deploy"}) || string(req.Tools[0].Parameters) != `{"type":"object"}` {
 		t.Fatalf("tools = %v", req.Tools)
 	}
 	last := req.Messages[4].Blocks
@@ -86,8 +86,33 @@ func TestBuildCall(t *testing.T) {
 	if history[3].Blocks[0].(litellm.TextBlock).Cache != nil {
 		t.Fatal("the breakpoint changed the history")
 	}
-	if c.Request.Messages[3].Blocks[0].(litellm.ToolResultBlock).Cache != nil {
-		t.Fatal("a breakpoint before the last message")
+	if c.Request.Messages[3].Blocks[0].(litellm.ToolResultBlock).Cache == nil {
+		t.Fatal("no breakpoint where the call before ended")
+	}
+}
+
+// A call marks where it ends and where the call before ended, which that
+// call wrote to the cache.
+func TestBuildCallMarksTheCallBefore(t *testing.T) {
+	history := []Message{
+		UserText("go"),
+		assistant(StopToolUse, call("c1", "read", `{}`)),
+		ToolResult("c1", TextResult("one")),
+		assistant(StopToolUse, call("c2", "read", `{}`), call("c3", "read", `{}`)),
+		ToolResult("c2", TextResult("two")),
+		ToolResult("c3", TextResult("three")),
+	}
+	msgs := BuildCall(Config{Cache: &litellm.CacheControl{TTL: "1h"}}, history).Request.Messages
+	var marked []int
+	for i, m := range msgs {
+		for _, b := range m.Blocks {
+			if r, ok := b.(litellm.ToolResultBlock); ok && r.Cache != nil && r.Cache.TTL == "1h" {
+				marked = append(marked, i)
+			}
+		}
+	}
+	if !reflect.DeepEqual(marked, []int{2, 5}) {
+		t.Fatalf("breakpoints after messages %v, want [2 5]", marked)
 	}
 }
 
@@ -98,7 +123,7 @@ func TestMessageJSON(t *testing.T) {
 			Role:     litellm.RoleAssistant,
 			Blocks:   []litellm.Block{litellm.ReasoningBlock{Text: "hm", State: &litellm.ProviderState{Provider: "p", Data: json.RawMessage(`{"s":1}`)}}, call("c1", "read", `{"path":"a"}`)},
 			Stop:     StopToolUse,
-			Usage:    &Usage{Input: 10, Output: 2, CacheRead: 8},
+			Usage:    &Usage{Usage: litellm.Usage{InputTokens: 10, OutputTokens: 2, ReasoningTokens: 1, CacheReadTokens: 8, CacheWrite1hTokens: 1}},
 			Provider: "p",
 			Model:    "m",
 			Time:     time.Now(),
@@ -132,12 +157,12 @@ func TestMessageJSON(t *testing.T) {
 
 func TestUsageAdd(t *testing.T) {
 	var total Usage
-	priced := &Usage{Input: 10, Output: 2, Cost: &catalog.Cost{Total: 0.5}}
+	priced := &Usage{Usage: litellm.Usage{InputTokens: 10, OutputTokens: 2, ReasoningTokens: 1}, Cost: &catalog.Cost{Total: 0.5}}
 	total.Add(priced)
 	total.Add(nil)
-	total.Add(&Usage{Input: 1})
+	total.Add(&Usage{Usage: litellm.Usage{InputTokens: 1}})
 	total.Add(priced)
-	if total.Input != 21 || total.Output != 4 || total.Cost == nil || total.Cost.Total != 1 || priced.Cost.Total != 0.5 {
+	if total.InputTokens != 21 || total.OutputTokens != 4 || total.ReasoningTokens != 2 || total.Cost == nil || total.Cost.Total != 1 || priced.Cost.Total != 0.5 {
 		t.Fatalf("total = %+v, cost %+v", total, total.Cost)
 	}
 }

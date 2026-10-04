@@ -290,7 +290,7 @@ func runTask(ctx context.Context, t *task.Task, r *run, prompt string) (string, 
 			t.Update(func(e *task.Entry) { e.ToolCount++ })
 		case agentcore.MessageEnd:
 			if u := ev.Message.Usage; u != nil {
-				t.Update(func(e *task.Entry) { e.TokensIn += u.Input; e.TokensOut += u.Output })
+				t.Update(func(e *task.Entry) { e.TokensIn += u.InputTokens; e.TokensOut += u.OutputTokens })
 			}
 			if err := enc.Encode(ev.Message); err != nil {
 				return fmt.Errorf("write the transcript: %w", err)

@@ -59,7 +59,7 @@ func show(ev agentcore.Event) error {
 			fmt.Printf("  failed: %s\n", ev.Result.Text())
 		}
 	case agentcore.Retry:
-		fmt.Printf("\n[retry %d/%d in %s] %v\n", ev.Attempt, ev.MaxRetries, ev.Delay, ev.Err)
+		fmt.Printf("\n[attempt %d in %s] %v\n", ev.Attempt, ev.Delay, ev.Err)
 	}
 	return nil
 }

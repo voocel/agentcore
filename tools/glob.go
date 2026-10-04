@@ -79,15 +79,17 @@ func (t *globTool) globWithRg(ctx context.Context, pattern, dir string) (string,
 		return "", false, err
 	}
 
+	// rg matches globs against paths relative to its working directory.
 	cmd := exec.CommandContext(ctx, rgPath,
 		"--files",
-		"--glob", pattern,
+		"--glob="+pattern,
 		"--color=never",
 		"--hidden",
-		"--glob", "!.git",
+		"--glob=!.git",
 		"--no-require-git",
-		dir,
+		"--", ".",
 	)
+	cmd.Dir = dir
 
 	stdout, err := cmd.StdoutPipe()
 	if err != nil {
@@ -110,22 +112,18 @@ func (t *globTool) globWithRg(ctx context.Context, pattern, dir string) (string,
 			break
 		}
 
-		fullPath := line
-		if !filepath.IsAbs(fullPath) {
-			fullPath = filepath.Join(dir, line)
-		}
-		info, err := os.Stat(fullPath)
+		rel := filepath.Clean(line)
+		info, err := os.Stat(filepath.Join(dir, rel))
 		if err != nil || info.IsDir() {
 			continue
 		}
-		rel, _ := filepath.Rel(dir, fullPath)
 		matches = append(matches, globMatch{
 			rel:   rel,
 			mtime: info.ModTime().UnixNano(),
 		})
 	}
 
-	if truncated && cmd.Process != nil {
+	if truncated {
 		cmd.Process.Kill()
 	}
 	cmd.Wait()

@@ -2,8 +2,8 @@
 // and holds what they share: read, write and edit work on files through its
 // [FS] and check writes against what the model read; bash runs commands, in
 // the background as tasks of its task.Runtime; glob, grep and ls find and
-// list files. [Defer] puts tools behind tool_search, so that the model sees
-// only their names until it needs them.
+// list files. [Defer] puts tools behind tool_search, so that their schemas
+// cost no context until the model needs them.
 //
 // Relative paths resolve against the Workspace's Dir, or the working
 // directory a call's context carries ([WithCwd]); it is not a sandbox.

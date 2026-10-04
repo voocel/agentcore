@@ -41,7 +41,7 @@ func BuildCall(cfg Config, history []Message) Call {
 	}
 	req := cfg.Model.Request
 	req.Messages = msgs
-	req.Tools = toolSpecs(cfg.Tools, history)
+	req.Tools = toolSpecs(cfg.Tools)
 	return Call{Client: cfg.Model.Client, Request: req}
 }
 
@@ -106,19 +106,36 @@ func (m Message) wire() litellm.Message {
 	return litellm.Message{Role: m.Role, Blocks: m.Blocks}
 }
 
-// markCache places a cache breakpoint after the last message but the system
-// prompt, so each call of a tool loop reads the one before back from the
-// cache. Reasoning blocks cannot carry a breakpoint.
+// markCache places the cache breakpoints: after the last message, where
+// the call writes the history to the cache, and after the last message the
+// call before sent, the one before the latest response, where that call
+// wrote. A provider looks back from a breakpoint for an earlier write only
+// so far, 20 blocks on Anthropic, so a turn adding many blocks, such as many
+// parallel tool calls, would otherwise read nothing back.
 func markCache(msgs []litellm.Message, cache *litellm.CacheControl) {
 	last := len(msgs) - 1
 	if last < 0 || msgs[last].Role == litellm.RoleSystem {
 		return
 	}
-	blocks := append([]litellm.Block(nil), msgs[last].Blocks...)
-	for i := len(blocks) - 1; i >= 0; i-- {
-		if b, ok := withCache(blocks[i], cache); ok {
-			blocks[i] = b
-			msgs[last].Blocks = blocks
+	mark(msgs, last, cache)
+	for i := last; i > 0; i-- {
+		if msgs[i].Role == litellm.RoleAssistant {
+			if msgs[i-1].Role != litellm.RoleSystem {
+				mark(msgs, i-1, cache)
+			}
+			return
+		}
+	}
+}
+
+// mark places a breakpoint after msgs[i], on its last block that takes one:
+// reasoning blocks do not.
+func mark(msgs []litellm.Message, i int, cache *litellm.CacheControl) {
+	blocks := append([]litellm.Block(nil), msgs[i].Blocks...)
+	for j := len(blocks) - 1; j >= 0; j-- {
+		if b, ok := withCache(blocks[j], cache); ok {
+			blocks[j] = b
+			msgs[i].Blocks = blocks
 			return
 		}
 	}
@@ -146,44 +163,19 @@ func withCache(block litellm.Block, cache *litellm.CacheControl) (litellm.Block,
 	return block, false
 }
 
-// toolSpecs are the tools on offer: all but the deferred ones that no tool
-// reference in history names.
-func toolSpecs(tools []Tool, history []Message) []litellm.Tool {
-	var referenced map[string]bool
-	specs := make([]litellm.Tool, 0, len(tools))
-	for _, t := range tools {
-		if t.Deferred {
-			if referenced == nil {
-				referenced = referencedTools(history)
-			}
-			if !referenced[t.Name] {
-				continue
-			}
-		}
+// toolSpecs are the tools as litellm declares them; litellm offers the
+// deferred ones once the history references them.
+func toolSpecs(tools []Tool) []litellm.Tool {
+	if len(tools) == 0 {
+		return nil
+	}
+	specs := make([]litellm.Tool, len(tools))
+	for i, t := range tools {
 		schema, err := litellm.SchemaFrom(t.Schema)
 		if err != nil {
 			panic("agentcore: tool " + t.Name + ": " + err.Error())
 		}
-		specs = append(specs, litellm.Tool{Name: t.Name, Description: t.Description, Parameters: schema})
-	}
-	if len(specs) == 0 {
-		return nil
+		specs[i] = litellm.Tool{Name: t.Name, Description: t.Description, Parameters: schema, Deferred: t.Deferred}
 	}
 	return specs
-}
-
-func referencedTools(history []Message) map[string]bool {
-	names := map[string]bool{}
-	for _, m := range history {
-		result, ok := m.ToolResult()
-		if !ok {
-			continue
-		}
-		for _, b := range result.Content {
-			if ref, ok := b.(litellm.ToolReferenceBlock); ok {
-				names[ref.ToolName] = true
-			}
-		}
-	}
-	return names
 }

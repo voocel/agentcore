@@ -18,102 +18,46 @@ import (
 	"github.com/voocel/litellm"
 )
 
-// Bounds for the default verbatim tail.
-const (
-	minKeepRecentTokens = 2000
-	maxKeepRecentTokens = 20000
-)
-
-// Summarizer replaces all but the most recent messages, a quarter of the
-// history between 2k and 20k tokens, with a checkpoint summary written by the
-// conversation's own model.
+// Summarizer replaces the history with a checkpoint summary written by the
+// conversation's own model, keeping as they are only the prompts at its end
+// the model has yet to answer. Nothing else is replayed: a response kept
+// past a rewrite of what came before it is one some providers reject, as
+// Claude does reasoning bound to the history it was produced in, and the
+// deferred tools the history loaded are found again when needed.
 //
 // It first asks for the summary by extending the conversation's call for
-// the part it replaces, so the provider serves that from the prompt cache;
-// when the request no longer fits, or the model answers without the summary
-// in <summary> tags, it asks again with a plain-text transcript. A previous
-// summary is folded into the new one, and the tools the replaced part loaded
-// stay loaded.
+// the history it replaces, so the provider serves that from the prompt
+// cache; when the request no longer fits, or the model answers without the
+// summary in <summary> tags, it asks again with a plain-text transcript. A
+// previous summary is folded into the new one.
 type Summarizer struct{}
 
 // Compact implements agentcore.Compactor.
 func (Summarizer) Compact(ctx context.Context, history []agentcore.Message, call func([]agentcore.Message) agentcore.Call) (*agentcore.Compaction, error) {
-	total := 0
-	for _, m := range history {
-		total += agentcore.EstimateMessage(m)
+	cut := len(history)
+	for cut > 0 && history[cut-1].Role == litellm.RoleUser && history[cut-1].Kind != agentcore.KindSummary {
+		cut--
 	}
-	cut := cutPoint(history, min(maxKeepRecentTokens, max(minKeepRecentTokens, total/4)))
 	previous, older := splitPreviousSummary(history[:cut])
 	if len(older) == 0 {
 		return nil, nil
 	}
 
+	var used litellm.Usage
 	c := call(history[:cut])
-	summary, err := forkSummary(ctx, c)
+	summary, err := forkSummary(ctx, c, &used)
 	if err != nil {
 		return nil, err
 	}
 	if summary == "" {
-		if summary, err = standaloneSummary(ctx, c, older, previous); err != nil {
+		if summary, err = standaloneSummary(ctx, c, older, previous, &used); err != nil {
 			return nil, err
 		}
 	}
 	summary += formatFileOps(extractFileOps(older))
 
-	out := []agentcore.Message{agentcore.SummaryMessage(summary)}
-	out = append(out, toolLoads(history[:cut])...)
-	out = append(out, history[cut:]...)
-	return &agentcore.Compaction{Messages: out, Replaced: cut}, nil
-}
-
-// toolLoads returns the exchanges of msgs that loaded deferred tools: each
-// call whose result holds tool references, with a result of those
-// references alone.
-func toolLoads(msgs []agentcore.Message) []agentcore.Message {
-	calls := map[string]litellm.ToolUseBlock{}
-	var out []agentcore.Message
-	for _, m := range msgs {
-		for _, c := range m.ToolCalls() {
-			calls[c.ID] = c
-		}
-		result, ok := m.ToolResult()
-		if !ok {
-			continue
-		}
-		var refs []litellm.Block
-		for _, b := range result.Content {
-			if _, ok := b.(litellm.ToolReferenceBlock); ok {
-				refs = append(refs, b)
-			}
-		}
-		if len(refs) == 0 {
-			continue
-		}
-		out = append(out,
-			agentcore.Message{Role: litellm.RoleAssistant, Blocks: []litellm.Block{calls[result.ToolUseID]}},
-			agentcore.ToolResult(result.ToolUseID, agentcore.Result{Content: refs}),
-		)
-	}
-	return out
-}
-
-// cutPoint returns the index of the first message to keep verbatim so that
-// roughly keepTokens of recent history stay, or 0 when nothing can be
-// compacted. Tool results stay with the call that issued them: a cut landing
-// on a result retreats to the assistant message that requested it.
-func cutPoint(history []agentcore.Message, keepTokens int) int {
-	cut, kept := 0, 0
-	for i := len(history) - 1; i > 0; i-- {
-		kept += agentcore.EstimateMessage(history[i])
-		if kept >= keepTokens {
-			cut = i
-			break
-		}
-	}
-	for cut > 0 && history[cut].Role == litellm.RoleTool {
-		cut--
-	}
-	return cut
+	out := append([]agentcore.Message{agentcore.SummaryMessage(summary)}, history[cut:]...)
+	return &agentcore.Compaction{Messages: out, Replaced: cut, Usage: &agentcore.Usage{Usage: used}}, nil
 }
 
 // splitPreviousSummary separates an earlier checkpoint from the history that
