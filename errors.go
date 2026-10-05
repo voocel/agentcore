@@ -11,3 +11,6 @@ var ErrBusy = errors.New("agent is running")
 // ErrNothingToContinue refuses a run without prompts when the model has
 // nothing to answer, as when the history ends with its response.
 var ErrNothingToContinue = errors.New("nothing to continue: the history ends with a response")
+
+// ErrNoCompactor refuses to compact with a Config that has no Compactor.
+var ErrNoCompactor = errors.New("agentcore: no compactor configured")

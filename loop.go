@@ -110,8 +110,8 @@ const (
 func Run(ctx context.Context, cfg Config, history []Message, prompts ...Message) ([]Message, error) {
 	runCtx, cancel := context.WithCancelCause(ctx)
 	defer cancel(nil)
-	r := &run{ctx: runCtx, cancel: cancel, cfg: cfg, history: slices.Clone(history), toolErrors: map[string]int{}}
-	err := cfg.validate()
+	r := newRun(runCtx, cancel, cfg, history)
+	err := cfg.Validate()
 	if err == nil {
 		err = r.loop(prompts)
 	}
@@ -123,7 +123,7 @@ func Run(ctx context.Context, cfg Config, history []Message, prompts ...Message)
 	case errors.Is(err, ErrMaxTurns):
 		reason = EndMaxTurns
 	case ctx.Err() != nil:
-		reason, err = EndAborted, ctx.Err()
+		reason, err = EndAborted, context.Cause(ctx)
 	default:
 		reason = EndError
 	}
@@ -135,11 +135,30 @@ func Run(ctx context.Context, cfg Config, history []Message, prompts ...Message)
 	return r.history, err
 }
 
-// validate reports a Config a run cannot use.
-func (cfg Config) validate() error {
+// Validate reports a Config a run cannot use: a Pricing that does not fit, a
+// Model.Request already holding Messages or Tools, which a run sets, or a
+// tool without a name, with another's name, or with a schema that is not
+// JSON. Run and the runs of an Agent validate it themselves.
+func (cfg Config) Validate() error {
 	if p := cfg.Model.Pricing; p != nil {
 		if err := p.Validate(); err != nil {
 			return fmt.Errorf("agentcore: model pricing: %w", err)
+		}
+	}
+	if len(cfg.Model.Request.Messages) > 0 || len(cfg.Model.Request.Tools) > 0 {
+		return errors.New("agentcore: model request: Messages and Tools are set by the run; use Config.System and Config.Tools")
+	}
+	names := map[string]bool{}
+	for _, t := range cfg.Tools {
+		switch {
+		case t.Name == "":
+			return errors.New("agentcore: tool without a name")
+		case names[t.Name]:
+			return fmt.Errorf("agentcore: tool %q is defined twice", t.Name)
+		}
+		names[t.Name] = true
+		if _, err := litellm.SchemaFrom(t.Schema); err != nil {
+			return fmt.Errorf("agentcore: tool %q schema: %w", t.Name, err)
 		}
 	}
 	return nil
@@ -161,6 +180,10 @@ type run struct {
 	lengthRecoveries              int
 	// toolErrors counts the turns in a row each tool's calls failed.
 	toolErrors map[string]int
+}
+
+func newRun(ctx context.Context, cancel context.CancelCauseFunc, cfg Config, history []Message) *run {
+	return &run{ctx: ctx, cancel: cancel, cfg: cfg, history: slices.Clone(history), toolErrors: map[string]int{}}
 }
 
 func (r *run) emit(ev Event) error {

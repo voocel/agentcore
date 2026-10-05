@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/voocel/agentcore"
+	"github.com/voocel/litellm"
 )
 
 // call checks and runs a tool as the loop does, returning the check's or the
@@ -174,5 +175,26 @@ func TestPartialReadIsWhatWasSeen(t *testing.T) {
 	}
 	if err := call(t, write, writeArgs{FilePath: long, Content: "c\n"}); err == nil || !strings.Contains(err.Error(), "Only part") {
 		t.Fatalf("a read cut at the default limit counted as whole: %v", err)
+	}
+}
+
+func TestFileOps(t *testing.T) {
+	use := func(id, name, args string) litellm.Block {
+		return litellm.ToolUseBlock{ID: id, Name: name, Arguments: args}
+	}
+	msgs := []agentcore.Message{{Role: litellm.RoleAssistant, Blocks: []litellm.Block{
+		use("1", "read", `{"file_path":"a.go"}`),
+		use("2", "read", `{"file_path":"b.go"}`),
+		use("3", "edit", `{"file_path":"b.go"}`),
+		use("4", "write", `{"file_path":"c.go"}`),
+		use("5", "read", `{"file_path":"a.go"}`),
+		use("6", "bash", `{"command":"ls"}`),
+	}}}
+	want := "\n\n<read-files>\na.go\n</read-files>\n\n<modified-files>\nb.go\nc.go\n</modified-files>"
+	if got := FileOps(msgs); got != want {
+		t.Fatalf("FileOps = %q", got)
+	}
+	if got := FileOps(nil); got != "" {
+		t.Fatalf("FileOps(nil) = %q", got)
 	}
 }

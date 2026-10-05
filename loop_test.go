@@ -770,3 +770,38 @@ func TestValidateArgsListsEveryIssue(t *testing.T) {
 		t.Fatalf("err = %v", err)
 	}
 }
+
+// A run cancelled with a cause ends with it, as the application stopped it.
+func TestRunAbortCause(t *testing.T) {
+	stop := errors.New("stop here")
+	ctx, cancel := context.WithCancelCause(context.Background())
+	cancel(stop)
+	p := litellmtest.New(litellmtest.Text("one"))
+	_, err := Run(ctx, Config{Model: testModel(t, p)}, nil, UserText("go"))
+	if !errors.Is(err, stop) {
+		t.Fatalf("err = %v", err)
+	}
+}
+
+func TestConfigValidate(t *testing.T) {
+	p := litellmtest.New()
+	withRequest := testModel(t, p)
+	withRequest.Request.Tools = []litellm.Tool{{Name: "x"}}
+	cases := map[string]Config{
+		"request tools": {Model: withRequest},
+		"unnamed tool":  {Tools: []Tool{{}}},
+		"duplicate":     {Tools: []Tool{echoTool(), echoTool()}},
+		"bad schema":    {Tools: []Tool{{Name: "x", Schema: map[string]any{"f": func() {}}}}},
+	}
+	for name, cfg := range cases {
+		if cfg.Validate() == nil {
+			t.Errorf("%s: no error", name)
+		}
+		if _, err := Run(context.Background(), cfg, nil, UserText("go")); err == nil {
+			t.Errorf("%s: Run took it", name)
+		}
+	}
+	if err := (Config{Tools: []Tool{echoTool()}}).Validate(); err != nil {
+		t.Fatal(err)
+	}
+}

@@ -8,6 +8,7 @@ import (
 	"testing"
 
 	"github.com/voocel/agentcore"
+	"github.com/voocel/agentcore/tools"
 	"github.com/voocel/litellm"
 	"github.com/voocel/litellm/litellmtest"
 )
@@ -52,20 +53,6 @@ func callFor(t *testing.T, p litellm.Provider) func([]agentcore.Message) agentco
 	return func(h []agentcore.Message) agentcore.Call { return agentcore.BuildCall(cfg, h) }
 }
 
-func TestExtractFileOps(t *testing.T) {
-	msgs := []agentcore.Message{assistant(
-		readCall("1", `{"file_path":"a.go"}`),
-		readCall("2", `{"file_path":"b.go"}`),
-		litellm.ToolUseBlock{ID: "3", Name: "edit", Arguments: `{"file_path":"b.go"}`},
-		litellm.ToolUseBlock{ID: "4", Name: "write", Arguments: `{"file_path":"c.go"}`},
-		readCall("5", `{"file_path":"a.go"}`),
-	)}
-	read, modified := extractFileOps(msgs)
-	if strings.Join(read, ",") != "a.go" || strings.Join(modified, ",") != "b.go,c.go" {
-		t.Fatalf("read %v, modified %v", read, modified)
-	}
-}
-
 // The history is replaced by its summary, but for the prompt at its end the
 // model has yet to answer; the summary call's usage is reported.
 func TestCompactReplacesOldHistoryWithSummary(t *testing.T) {
@@ -73,7 +60,7 @@ func TestCompactReplacesOldHistoryWithSummary(t *testing.T) {
 	reply.Usage = litellm.Usage{InputTokens: 900, OutputTokens: 40}
 	p := litellmtest.New(reply)
 	msgs := history()
-	c, err := Summarizer{}.Compact(context.Background(), msgs, callFor(t, p))
+	c, err := Summarizer{Notes: tools.FileOps}.Compact(context.Background(), msgs, callFor(t, p))
 	if err != nil {
 		t.Fatal(err)
 	}

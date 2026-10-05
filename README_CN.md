@@ -199,13 +199,13 @@ cfg.Tools = append(cfg.Tools, tasks.Tools()...) // task_output（task_id、wait�
 ## 压缩
 
 ```go
-cfg.Compactor = compact.Summarizer{}
+cfg.Compactor = compact.Summarizer{Notes: tools.FileOps} // Notes is optional
 cfg.CompactAt = 100_000
 ```
 
 循环在估算历史超过 `CompactAt` 的调用之前压缩；provider 报告上下文溢出时压缩一次再重试该调用。前者失败不会结束运行，后者必须成功。压缩发出的调用按 `Retry` 重试，它们的用量放在 `Compaction.Usage`，和响应一样计价。估算以上一个响应报告的输入 token 为基准。`CompactAt` 应明显高于压缩后保留的量，否则每次调用都会再压缩。
 
-`compact.Summarizer` 把历史换成对话自己的模型写的检查点，只原样保留末尾模型尚未回答的提示。其余一概不重放：Claude 会拒绝在前文被改写之后仍保留的推理，历史加载过的延迟工具则在需要时重新搜索。它延伸对话中被替换那部分的调用，因此命中提示缓存，并要求把检查点写在 `<summary>` 标签里；请求放不下或回答没有标签时，再用纯文本记录请求一次。检查点列出被替换部分读过和改过的文件。需要别的策略就实现 `agentcore.Compactor`。
+`compact.Summarizer` 把历史换成对话自己的模型写的检查点，只原样保留末尾模型尚未回答的提示。其余一概不重放：Claude 会拒绝在前文被改写之后仍保留的推理，历史加载过的延迟工具则在需要时重新搜索。它延伸对话中被替换那部分的调用，因此命中提示缓存，并要求把检查点写在 `<summary>` 标签里；请求放不下或回答没有标签时，再用纯文本记录请求一次。设置 `Notes: tools.FileOps` 后，检查点会列出被替换部分读过和改过的文件。需要别的策略就实现 `agentcore.Compactor`。
 
 ## 子 agent
 

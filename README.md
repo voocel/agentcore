@@ -199,13 +199,13 @@ cfg.Tools = append(cfg.Tools, tasks.Tools()...) // task_output (task_id, wait, t
 ## Compaction
 
 ```go
-cfg.Compactor = compact.Summarizer{}
+cfg.Compactor = compact.Summarizer{Notes: tools.FileOps} // Notes is optional
 cfg.CompactAt = 100_000
 ```
 
 The loop compacts before a call whose history is estimated above `CompactAt`, and once when the provider reports a context overflow, then makes the call again; the first may fail without ending the run, the second may not. The calls a compaction makes are retried as `Retry` allows, and their usage, on `Compaction.Usage`, is priced as a response's. The estimate counts from the last response's reported input tokens. `CompactAt` should sit well above what a compaction keeps, or every call compacts again.
 
-`compact.Summarizer` replaces the history with a checkpoint the conversation's own model writes, keeping only the prompts at its end the model has yet to answer. Nothing else is replayed: Claude rejects reasoning kept past a rewrite of what came before it, and the deferred tools the history loaded are searched for again. It extends the conversation's call for the history it replaces, which is served from the prompt cache, and asks for the checkpoint in `<summary>` tags; when that does not fit, or the answer has no tags, it asks a second time with a plain-text transcript. The checkpoint lists the files the replaced part read and changed. Implement `agentcore.Compactor` for another strategy.
+`compact.Summarizer` replaces the history with a checkpoint the conversation's own model writes, keeping only the prompts at its end the model has yet to answer. Nothing else is replayed: Claude rejects reasoning kept past a rewrite of what came before it, and the deferred tools the history loaded are searched for again. It extends the conversation's call for the history it replaces, which is served from the prompt cache, and asks for the checkpoint in `<summary>` tags; when that does not fit, or the answer has no tags, it asks a second time with a plain-text transcript. With `Notes: tools.FileOps` the checkpoint lists the files the replaced part read and changed. Implement `agentcore.Compactor` for another strategy.
 
 ## Sub-agents
 

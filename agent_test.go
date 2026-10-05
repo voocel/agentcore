@@ -172,3 +172,13 @@ func TestAgentClearQueues(t *testing.T) {
 		t.Fatal("the queues were not cleared")
 	}
 }
+
+func TestAgentCompactWithoutCompactor(t *testing.T) {
+	a := NewAgent(Config{}, bigHistory())
+	if err := a.Compact(context.Background()); !errors.Is(err, ErrNoCompactor) {
+		t.Fatalf("err = %v", err)
+	}
+	if a.SetMessages(nil) != nil {
+		t.Fatal("the agent stayed busy")
+	}
+}

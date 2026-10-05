@@ -127,17 +127,19 @@ func (a *Agent) ClearQueues() (steering, followUp []Message) {
 // Compact has the Config's Compactor rewrite the history now, as a run
 // does when the history outgrows its CompactAt. Subscribers receive its
 // CompactionStart and CompactionEnd. It fails with ErrBusy while a run is
-// under way.
+// under way, and with ErrNoCompactor when the Config has none.
 func (a *Agent) Compact(ctx context.Context) error {
 	cfg, history, err := a.start()
 	if err != nil {
 		return err
 	}
 	defer a.finish()
+	if cfg.Compactor == nil {
+		return ErrNoCompactor
+	}
 	ctx, cancel := context.WithCancelCause(ctx)
 	defer cancel(nil)
-	r := &run{ctx: ctx, cancel: cancel, cfg: cfg, history: history}
-	_, err = r.compact()
+	_, err = newRun(ctx, cancel, cfg, history).compact()
 	return err
 }
 
@@ -149,6 +151,9 @@ func (a *Agent) start() (Config, []Message, error) {
 	defer a.mu.Unlock()
 	if a.running {
 		return Config{}, nil, ErrBusy
+	}
+	if err := a.cfg.Validate(); err != nil {
+		return Config{}, nil, err
 	}
 	a.running = true
 	cfg := a.cfg

@@ -2,8 +2,13 @@ package tools
 
 import (
 	"context"
+	"encoding/json"
+	"slices"
+	"strings"
 	"sync"
 	"time"
+
+	"github.com/voocel/agentcore"
 )
 
 // FileReadStamp records the state of a file as the model read it. The write
@@ -81,4 +86,48 @@ func stampMatches(stamp FileReadStamp, info FileInfo) bool {
 		return stamp.Version == info.Version
 	}
 	return info.ModTime.Equal(stamp.Mtime)
+}
+
+// FileOps lists, as tagged sections, the files the read, write and edit
+// calls in history touched: those only read, and those modified. It is empty
+// when there were none. A compaction appends it to its summary, so that the
+// files the replaced messages worked on survive it.
+func FileOps(history []agentcore.Message) string {
+	read, modified := map[string]bool{}, map[string]bool{}
+	for _, m := range history {
+		for _, call := range m.ToolCalls() {
+			var args struct {
+				FilePath string `json:"file_path"`
+			}
+			if json.Unmarshal([]byte(call.Arguments), &args) != nil || args.FilePath == "" {
+				continue
+			}
+			switch call.Name {
+			case "read":
+				read[args.FilePath] = true
+			case "write", "edit":
+				modified[args.FilePath] = true
+			}
+		}
+	}
+	var out string
+	if files := sorted(read, modified); len(files) > 0 {
+		out += "\n\n<read-files>\n" + strings.Join(files, "\n") + "\n</read-files>"
+	}
+	if files := sorted(modified, nil); len(files) > 0 {
+		out += "\n\n<modified-files>\n" + strings.Join(files, "\n") + "\n</modified-files>"
+	}
+	return out
+}
+
+// sorted lists the keys of set that are not in except.
+func sorted(set, except map[string]bool) []string {
+	var files []string
+	for f := range set {
+		if !except[f] {
+			files = append(files, f)
+		}
+	}
+	slices.Sort(files)
+	return files
 }

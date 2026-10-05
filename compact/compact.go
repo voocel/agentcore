@@ -10,9 +10,6 @@ package compact
 
 import (
 	"context"
-	"encoding/json"
-	"slices"
-	"strings"
 
 	"github.com/voocel/agentcore"
 	"github.com/voocel/litellm"
@@ -30,10 +27,15 @@ import (
 // cache; when the request no longer fits, or the model answers without the
 // summary in <summary> tags, it asks again with a plain-text transcript. A
 // previous summary is folded into the new one.
-type Summarizer struct{}
+type Summarizer struct {
+	// Notes, if set, returns text appended to the summary of the messages it
+	// replaces, such as the files they worked on (tools.FileOps): what the
+	// summary must carry whatever the model wrote.
+	Notes func(replaced []agentcore.Message) string
+}
 
 // Compact implements agentcore.Compactor.
-func (Summarizer) Compact(ctx context.Context, history []agentcore.Message, call func([]agentcore.Message) agentcore.Call) (*agentcore.Compaction, error) {
+func (s Summarizer) Compact(ctx context.Context, history []agentcore.Message, call func([]agentcore.Message) agentcore.Call) (*agentcore.Compaction, error) {
 	cut := len(history)
 	for cut > 0 && history[cut-1].Role == litellm.RoleUser && history[cut-1].Kind != agentcore.KindSummary {
 		cut--
@@ -54,7 +56,9 @@ func (Summarizer) Compact(ctx context.Context, history []agentcore.Message, call
 			return nil, err
 		}
 	}
-	summary += formatFileOps(extractFileOps(older))
+	if s.Notes != nil {
+		summary += s.Notes(older)
+	}
 
 	out := append([]agentcore.Message{agentcore.SummaryMessage(summary)}, history[cut:]...)
 	return &agentcore.Compaction{Messages: out, Replaced: cut, Usage: &agentcore.Usage{Usage: used}}, nil
@@ -73,58 +77,4 @@ func splitPreviousSummary(msgs []agentcore.Message) (string, []agentcore.Message
 		history = append(history, m)
 	}
 	return previous, history
-}
-
-// extractFileOps lists the files the history read without modifying, and the
-// files it modified.
-func extractFileOps(msgs []agentcore.Message) (read, modified []string) {
-	readSet := map[string]bool{}
-	modifiedSet := map[string]bool{}
-	for _, m := range msgs {
-		for _, tc := range m.ToolCalls() {
-			path := pathArg(tc.Arguments)
-			if path == "" {
-				continue
-			}
-			switch tc.Name {
-			case "read":
-				readSet[path] = true
-			case "write", "edit":
-				modifiedSet[path] = true
-			}
-		}
-	}
-	for f := range readSet {
-		if !modifiedSet[f] {
-			read = append(read, f)
-		}
-	}
-	for f := range modifiedSet {
-		modified = append(modified, f)
-	}
-	slices.Sort(read)
-	slices.Sort(modified)
-	return read, modified
-}
-
-// pathArg reads the "file_path" of read, write and edit.
-func pathArg(args string) string {
-	var obj struct {
-		FilePath string `json:"file_path"`
-	}
-	if json.Unmarshal([]byte(args), &obj) != nil {
-		return ""
-	}
-	return obj.FilePath
-}
-
-func formatFileOps(read, modified []string) string {
-	var s string
-	if len(read) > 0 {
-		s += "\n\n<read-files>\n" + strings.Join(read, "\n") + "\n</read-files>"
-	}
-	if len(modified) > 0 {
-		s += "\n\n<modified-files>\n" + strings.Join(modified, "\n") + "\n</modified-files>"
-	}
-	return s
 }
