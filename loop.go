@@ -224,9 +224,6 @@ func (r *run) loop(prompts []Message) error {
 			return err
 		}
 		r.turns++
-		if msg.Stop == StopError {
-			return errors.New("agentcore: the model ended its response with an error")
-		}
 		results, terminated, err := r.runTools(msg, bad)
 		if err != nil {
 			return err
@@ -283,8 +280,11 @@ func (r *run) steering() []Message {
 	return r.cfg.Steering()
 }
 
-// steer records the messages Steering has now.
+// steer records the messages Steering has now, unless the run is cancelled.
 func (r *run) steer() error {
+	if err := r.ctx.Err(); err != nil {
+		return err
+	}
 	for _, msg := range r.steering() {
 		if err := r.record(msg); err != nil {
 			return err
@@ -305,16 +305,16 @@ func (r *run) followUp() []Message {
 // call, a history grown past CompactAt is compacted, as far as that
 // succeeds. A call that fails on a context overflow is made again, once,
 // after compacting; one that fails for a while, as Retry allows; Steering
-// is consulted after a compaction. A response that fails for good, or is
-// cancelled, is recorded with what streamed of it, as StopError or
-// StopAborted, so every MessageStart ends with a MessageEnd or a Retry.
+// is consulted after a compaction. A response that fails for good, the
+// vendor ending it with an error included, or is cancelled, is recorded
+// with what streamed of it, as StopError or StopAborted and without its
+// calls, so every MessageStart ends with a MessageEnd or a Retry.
 func (r *run) respond() (Message, map[string]string, error) {
 	compacted := false
 	if r.cfg.Compactor != nil && r.cfg.CompactAt > 0 && Estimate(r.cfg, r.history) > r.cfg.CompactAt {
+		// A compaction failing as Emit failed, or as the run was cancelled,
+		// ends the run at steer.
 		_, err := r.compact()
-		if r.failed() != nil {
-			return Message{}, nil, err
-		}
 		compacted = err == nil
 		if err := r.steer(); err != nil {
 			return Message{}, nil, err
@@ -322,6 +322,9 @@ func (r *run) respond() (Message, map[string]string, error) {
 	}
 	for attempt := 1; ; attempt++ {
 		msg, started, err := r.call()
+		if err == nil && msg.Stop == StopError {
+			err = errors.New("agentcore: the model ended its response with an error")
+		}
 		if err == nil {
 			bad := invalidArgs(&msg)
 			return msg, bad, r.record(msg)
@@ -363,9 +366,6 @@ func (r *run) respond() (Message, map[string]string, error) {
 			if rerr := r.record(msg); rerr != nil {
 				return Message{}, nil, rerr
 			}
-		}
-		if err := r.ctx.Err(); err != nil {
-			return Message{}, nil, err
 		}
 		return Message{}, nil, err
 	}

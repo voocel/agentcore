@@ -2,8 +2,10 @@ package tools
 
 import (
 	"bufio"
+	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"os/exec"
@@ -28,7 +30,7 @@ func (w Workspace) Glob() agentcore.Tool {
 			schema.Property("pattern", schema.String("Glob pattern to match files (for example: '*.go', '**/*.js', 'src/**/*.ts')")).Required(),
 			schema.Property("path", schema.String("Directory to search in, relative or absolute (default: working directory)")),
 		),
-		Parallel: always,
+		Parallel: true,
 		Run:      textRun(t.execute),
 	}
 }
@@ -67,18 +69,16 @@ func (t *globTool) execute(ctx context.Context, args json.RawMessage) (string, e
 		return "", fmt.Errorf("glob %s: not a directory", searchDir)
 	}
 
-	if result, ok, err := t.globWithRg(ctx, a.Pattern, searchDir); err == nil && ok {
-		return result, nil
+	// The walk stands in only for an rg not installed; rg's own errors,
+	// such as on an invalid pattern, are the model's to read.
+	rg, err := exec.LookPath("rg")
+	if err != nil {
+		return t.globWithWalk(ctx, a.Pattern, searchDir)
 	}
-	return t.globWithWalk(ctx, a.Pattern, searchDir)
+	return t.globWithRg(ctx, rg, a.Pattern, searchDir)
 }
 
-func (t *globTool) globWithRg(ctx context.Context, pattern, dir string) (string, bool, error) {
-	rgPath, err := exec.LookPath("rg")
-	if err != nil {
-		return "", false, err
-	}
-
+func (t *globTool) globWithRg(ctx context.Context, rgPath, pattern, dir string) (string, error) {
 	// rg matches globs against paths relative to its working directory.
 	cmd := exec.CommandContext(ctx, rgPath,
 		"--files",
@@ -90,13 +90,14 @@ func (t *globTool) globWithRg(ctx context.Context, pattern, dir string) (string,
 		"--", ".",
 	)
 	cmd.Dir = dir
-
+	var stderr bytes.Buffer
+	cmd.Stderr = &stderr
 	stdout, err := cmd.StdoutPipe()
 	if err != nil {
-		return "", false, err
+		return "", fmt.Errorf("pipe: %w", err)
 	}
 	if err := cmd.Start(); err != nil {
-		return "", false, err
+		return "", fmt.Errorf("start rg: %w", err)
 	}
 
 	matches := make([]globMatch, 0, 64)
@@ -123,13 +124,26 @@ func (t *globTool) globWithRg(ctx context.Context, pattern, dir string) (string,
 		})
 	}
 
-	if truncated {
+	// rg is stopped once its output is no longer read.
+	scanErr := scanner.Err()
+	if truncated || scanErr != nil {
 		cmd.Process.Kill()
 	}
-	cmd.Wait()
-
-	result, err := formatGlobMatches(matches, truncated)
-	return result, true, err
+	waitErr := cmd.Wait()
+	if scanErr != nil {
+		return "", fmt.Errorf("scan rg output: %w", scanErr)
+	}
+	// The files listed stand, though rg failed to read some directories.
+	// Listing none, rg exits with 1; with another code, it failed.
+	if waitErr != nil && !truncated && len(matches) == 0 {
+		if exit, ok := errors.AsType[*exec.ExitError](waitErr); !ok || exit.ExitCode() != 1 {
+			if msg := strings.TrimSpace(stderr.String()); msg != "" {
+				return "", fmt.Errorf("glob: %s", msg)
+			}
+			return "", fmt.Errorf("glob: rg: %w", waitErr)
+		}
+	}
+	return formatGlobMatches(matches, truncated)
 }
 
 func (t *globTool) globWithWalk(ctx context.Context, pattern, dir string) (string, error) {
@@ -201,7 +215,7 @@ func formatGlobMatches(matches []globMatch, truncated bool) (string, error) {
 	}
 
 	result := strings.Join(lines, "\n")
-	tr := truncateHead(result, 0, defaultMaxBytes)
+	tr := truncateHead(result, defaultMaxLines, defaultMaxBytes)
 	if tr.Truncated {
 		return tr.Content + "\n\n[Output truncated at " + formatSize(defaultMaxBytes) + ".]", nil
 	}

@@ -157,39 +157,57 @@ func TestIndentAwareFindWholeLines(t *testing.T) {
 		{"class A:\n    def f(self):\n        return 1", "def f(self):\n    return 1\n", "    def f(self):\n        return 1"},
 	}
 	for _, c := range cases {
-		idx, n, count := indentAwareFind(c.content, c.old)
-		if count != 1 {
-			t.Errorf("%q in %q: %d matches", c.old, c.content, count)
+		matches := indentAwareMatches(c.content, c.old)
+		if len(matches) != 1 {
+			t.Errorf("%q in %q: %d matches", c.old, c.content, len(matches))
 			continue
 		}
-		if got := c.content[idx : idx+n]; got != c.want {
+		if got := c.content[matches[0].start:matches[0].end]; got != c.want {
 			t.Errorf("%q in %q: matched %q, want %q", c.old, c.content, got, c.want)
 		}
 	}
 }
 
-func TestEditIndentAwareRequiresUniqueMatch(t *testing.T) {
+// Every matching tier reports several matches as ambiguous, and with
+// replace_all replaces them all, each as it matched: the indentation-
+// insensitive tier reindents the replacement to each match.
+func TestEditSeveralMatches(t *testing.T) {
 	t.Parallel()
 
-	dir := t.TempDir()
-	path := filepath.Join(dir, "test.txt")
-	input := "func a() {\n\tif true {\n\t\tprintln(\"old\")\n\t}\n}\n\nfunc b() {\n\tif true {\n\t\tprintln(\"old\")\n\t}\n}\n"
-	if err := os.WriteFile(path, []byte(input), 0o644); err != nil {
-		t.Fatalf("write fixture: %v", err)
+	cases := []struct{ name, content, old, new, want string }{
+		{"exact", "x = 1\ny = x\n", "x", "z", "z = 1\ny = z\n"},
+		{"fuzzy", "foo  \nbar\nfoo\t\nbar", "foo\nbar", "baz", "baz\nbaz"},
+		{
+			"indentation-insensitive",
+			"func a() {\n\tif true {\n\t\tprintln(\"old\")\n\t}\n}\n\nfunc b() {\n\tfor {\n\t\tif true {\n\t\t\tprintln(\"old\")\n\t\t}\n\t}\n}\n",
+			"if true {\n\tprintln(\"old\")\n}",
+			"if true {\n\tprintln(\"new\")\n}",
+			"func a() {\n\tif true {\n\t\tprintln(\"new\")\n\t}\n}\n\nfunc b() {\n\tfor {\n\t\tif true {\n\t\t\tprintln(\"new\")\n\t\t}\n\t}\n}\n",
+		},
 	}
-
-	tool := Workspace{Dir: dir}.Edit()
-	args, err := json.Marshal(map[string]any{
-		"file_path":  "test.txt",
-		"old_string": "if true {\n\tprintln(\"old\")\n}",
-		"new_string": "if true {\n\tprintln(\"new\")\n}",
-	})
-	if err != nil {
-		t.Fatalf("marshal args: %v", err)
-	}
-
-	if _, err := tool.Run(context.Background(), args); err == nil {
-		t.Fatalf("expected ambiguity error")
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			dir := t.TempDir()
+			path := filepath.Join(dir, "f.txt")
+			if err := os.WriteFile(path, []byte(c.content), 0o644); err != nil {
+				t.Fatal(err)
+			}
+			tool := Workspace{Dir: dir}.Edit()
+			args := editArgs{FilePath: "f.txt", OldString: c.old, NewString: c.new}
+			if _, err := tool.Run(context.Background(), mustJSON(t, args)); err == nil || !strings.Contains(err.Error(), "found 2 occurrences") {
+				t.Fatalf("ambiguous edit: %v", err)
+			}
+			if got, _ := os.ReadFile(path); string(got) != c.content {
+				t.Fatalf("ambiguous edit changed the file to %q", got)
+			}
+			args.ReplaceAll = true
+			if _, err := tool.Run(context.Background(), mustJSON(t, args)); err != nil {
+				t.Fatal(err)
+			}
+			if got, _ := os.ReadFile(path); string(got) != c.want {
+				t.Fatalf("replace_all:\nwant %q\ngot  %q", c.want, got)
+			}
+		})
 	}
 }
 

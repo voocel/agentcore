@@ -27,7 +27,7 @@ func TestLifecycle(t *testing.T) {
 			return errors.New("lost the caller's values")
 		}
 		fmt.Fprint(tk.Output, "hello")
-		tk.Update(func(e *Entry) { e.PID = 42 })
+		tk.Update(func(e *Entry) { e.Description = "updated" })
 		return nil
 	})
 	if err != nil || done.ID != "shell-1" || done.Status != Running {
@@ -63,8 +63,8 @@ func TestLifecycle(t *testing.T) {
 	}
 
 	e, _ := rt.Get(done.ID)
-	if data, _ := os.ReadFile(e.OutputFile); string(data) != "hello" || e.PID != 42 {
-		t.Fatalf("output %q, pid %d", data, e.PID)
+	if data, _ := os.ReadFile(e.OutputFile); string(data) != "hello" || e.Description != "updated" {
+		t.Fatalf("output %q, description %q", data, e.Description)
 	}
 	if e, _ := rt.Get(stopped.ID); e.Status != Killed || e.Error != "" || !strings.HasSuffix(e.OutputFile, ".jsonl") {
 		t.Fatalf("stopped: %+v", e)

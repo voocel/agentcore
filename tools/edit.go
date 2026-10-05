@@ -1,11 +1,13 @@
 package tools
 
 import (
+	"cmp"
 	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"os"
+	"slices"
 	"strconv"
 	"strings"
 	"unicode"
@@ -100,9 +102,10 @@ func (t *editTool) validate(ctx context.Context, args json.RawMessage) error {
 	if !ok {
 		return errors.New("File has not been read yet. Read it first before editing.")
 	}
-	// Compare against the content token / mtime recorded at read time, not just
-	// "after ReadAt". Catches mtime regressions too (e.g. git checkout of an
-	// older version), and unsaved-buffer changes when the backend sets Version.
+	// The content token or mtime must equal the one recorded at read time,
+	// not just be no later: that catches mtime regressions too (e.g. git
+	// checkout of an older version), and unsaved-buffer changes when the
+	// backend sets Version.
 	if !stampMatches(stamp, info) {
 		return errors.New("File has been modified since read, either by the user or by a linter. Read it again before attempting to edit it.")
 	}
@@ -121,63 +124,45 @@ func (t *editTool) parseAndMatch(ctx context.Context, args json.RawMessage) (*ed
 	}
 
 	data, err := t.fs.ReadFile(ctx, a.FilePath)
-	if err != nil {
+	if os.IsNotExist(err) {
 		return nil, fmt.Errorf("file not found: %s", a.FilePath)
 	}
+	if err != nil {
+		return nil, fmt.Errorf("read %s: %w", a.FilePath, err)
+	}
 
-	raw := string(data)
-	bom, raw := stripBOM(raw)
-
+	bom, raw := stripBOM(string(data))
 	originalEnding := detectLineEnding(raw)
 	content := normalizeToLF(raw)
 	oldText := normalizeToLF(a.OldString)
 	newText := normalizeToLF(a.NewString)
-	multiline := strings.Contains(oldText, "\n")
 
-	// Matching chain: exact/fuzzy → indentAware
-	idx, matchLen := fuzzyFind(content, oldText)
-	needsReindent := false
-	if idx < 0 && multiline {
-		var count int
-		idx, matchLen, count = indentAwareFind(content, oldText)
-		if count > 1 && !a.ReplaceAll {
-			return nil, fmt.Errorf("found %d indentation-insensitive occurrences of the text in %s. Provide more context or use replace_all=true", count, a.FilePath)
-		}
-		if idx >= 0 {
-			needsReindent = true
-		}
-	}
-
-	if idx < 0 {
+	matches, reindent := findMatches(content, oldText)
+	switch {
+	case len(matches) == 0:
 		if hints := formatEditCandidates(content, oldText); hints != "" {
 			return nil, fmt.Errorf("could not find the exact text in %s. The old text must match exactly including all whitespace and newlines.\n\nPossible old_string candidates (copy one exactly):\n%s", a.FilePath, hints)
 		}
 		return nil, fmt.Errorf("could not find the exact text in %s. The old text must match exactly including all whitespace and newlines", a.FilePath)
+	case len(matches) > 1 && !a.ReplaceAll:
+		return nil, fmt.Errorf("found %d occurrences of the text in %s. Use replace_all=true to replace all, or provide more context to make the match unique", len(matches), a.FilePath)
 	}
 
-	matchedText := content[idx : idx+matchLen]
-	replacement := newText
-	if needsReindent {
-		replacement = reindentReplacement(newText, oldText, matchedText)
-	}
-
-	// Apply replacement
-	var newContent string
-	if a.ReplaceAll {
-		newContent = strings.ReplaceAll(content, matchedText, replacement)
-	} else {
-		count := strings.Count(content, matchedText)
-		if count > 1 {
-			return nil, fmt.Errorf("found %d occurrences of the text in %s. Use replace_all=true to replace all, or provide more context to make the match unique", count, a.FilePath)
+	var b strings.Builder
+	end := 0
+	for _, m := range matches {
+		replacement := newText
+		if reindent {
+			replacement = reindentReplacement(newText, oldText, content[m.start:m.end])
 		}
-		newContent = content[:idx] + replacement + content[idx+matchLen:]
+		b.WriteString(content[end:m.start])
+		b.WriteString(replacement)
+		end = m.end
 	}
-
-	if content == newContent {
-		if replacement == matchedText {
-			return nil, fmt.Errorf("old_string and new_string are identical in %s. Provide a new_string that is different from the matched text", a.FilePath)
-		}
-		return nil, fmt.Errorf("no changes made to %s. The replacement produced identical content (likely a whitespace or line-ending difference was normalized away)", a.FilePath)
+	b.WriteString(content[end:])
+	newContent := b.String()
+	if newContent == content {
+		return nil, fmt.Errorf("old_string and new_string are identical in %s. Provide a new_string that is different from the matched text", a.FilePath)
 	}
 
 	return &editResult{
@@ -275,138 +260,109 @@ func normalizeRuneForFuzzy(r rune) rune {
 	return r
 }
 
-// normalizeForFuzzy strips trailing whitespace per line and normalizes
-// smart quotes, dashes, Unicode spaces to ASCII equivalents.
-func normalizeForFuzzy(text string) string {
-	lines := strings.Split(text, "\n")
-	for i, line := range lines {
-		line = strings.TrimRightFunc(line, unicode.IsSpace)
-		lines[i] = strings.Map(normalizeRuneForFuzzy, line)
+// span is the bytes of content a match of old_string covers.
+type span struct{ start, end int }
+
+// findMatches returns the matches of oldText in content, in order and not
+// overlapping, by the first of these that finds any: exact; fuzzy; and, for
+// text of several lines, indentation-insensitive, whose matches take the
+// replacement reindented to theirs.
+func findMatches(content, oldText string) (matches []span, reindent bool) {
+	if m := exactMatches(content, oldText); len(m) > 0 {
+		return m, false
 	}
-	return strings.Join(lines, "\n")
+	if m := fuzzyMatches(content, oldText); len(m) > 0 {
+		return m, false
+	}
+	if strings.Contains(oldText, "\n") {
+		return indentAwareMatches(content, oldText), true
+	}
+	return nil, false
 }
 
-type fuzzyNormalized struct {
-	runes      []rune
-	runeToByte []int
-}
-
-func normalizeForFuzzyWithMap(text string) fuzzyNormalized {
-	lines := strings.Split(text, "\n")
-	outRunes := make([]rune, 0, len(text))
-	runeToByte := make([]int, 0, len(text)+1)
-
-	globalByte := 0
-	for li, line := range lines {
-		trimmed := strings.TrimRightFunc(line, unicode.IsSpace)
-		for relByte, r := range trimmed {
-			outRunes = append(outRunes, normalizeRuneForFuzzy(r))
-			runeToByte = append(runeToByte, globalByte+relByte)
+func exactMatches(content, oldText string) []span {
+	var out []span
+	for at := 0; ; {
+		i := strings.Index(content[at:], oldText)
+		if i < 0 {
+			return out
 		}
-		if li < len(lines)-1 {
-			outRunes = append(outRunes, '\n')
-			runeToByte = append(runeToByte, globalByte+len(line))
-		}
-		globalByte += len(line)
-		if li < len(lines)-1 {
-			globalByte++
-		}
-	}
-
-	runeToByte = append(runeToByte, len(text))
-	return fuzzyNormalized{
-		runes:      outRunes,
-		runeToByte: runeToByte,
+		at += i
+		out = append(out, span{at, at + len(oldText)})
+		at += len(oldText)
 	}
 }
 
-func indexRuneSlice(haystack, needle []rune) int {
+// fuzzyMatches matches oldText ignoring the trailing whitespace of lines and
+// the look of quotes, dashes and spaces. The spans cover the bytes of
+// content as they are.
+func fuzzyMatches(content, oldText string) []span {
+	runes, offsets := normalizeForFuzzy(content)
+	needle, _ := normalizeForFuzzy(oldText)
 	if len(needle) == 0 {
-		return 0
+		return nil
 	}
-	if len(needle) > len(haystack) {
-		return -1
-	}
-outer:
-	for i := 0; i+len(needle) <= len(haystack); i++ {
-		for j := 0; j < len(needle); j++ {
-			if haystack[i+j] != needle[j] {
-				continue outer
-			}
+	var out []span
+	for i := 0; i+len(needle) <= len(runes); {
+		if !slices.Equal(runes[i:i+len(needle)], needle) {
+			i++
+			continue
 		}
-		return i
+		out = append(out, span{offsets[i], offsets[i+len(needle)]})
+		i += len(needle)
 	}
-	return -1
+	return out
 }
 
-// fuzzyFind tries exact match first, then fuzzy match.
-// Fuzzy matching is only used for locating the replacement range.
-// The returned index/length always point to the original content bytes.
-func fuzzyFind(content, oldText string) (idx, matchLen int) {
-	if i := strings.Index(content, oldText); i >= 0 {
-		return i, len(oldText)
+// normalizeForFuzzy strips the trailing whitespace of each line of text and
+// normalizes smart quotes, dashes and Unicode spaces to ASCII. offsets holds
+// the byte of text each rune comes from, and then the end of text.
+func normalizeForFuzzy(text string) (runes []rune, offsets []int) {
+	lines := strings.Split(text, "\n")
+	runes = make([]rune, 0, len(text))
+	offsets = make([]int, 0, len(text)+1)
+	start := 0
+	for i, line := range lines {
+		for j, r := range strings.TrimRightFunc(line, unicode.IsSpace) {
+			runes = append(runes, normalizeRuneForFuzzy(r))
+			offsets = append(offsets, start+j)
+		}
+		if i < len(lines)-1 {
+			runes = append(runes, '\n')
+			offsets = append(offsets, start+len(line))
+		}
+		start += len(line) + 1
 	}
-
-	normContent := normalizeForFuzzyWithMap(content)
-	fuzzyOld := normalizeForFuzzy(oldText)
-	oldRunes := []rune(fuzzyOld)
-	runeIdx := indexRuneSlice(normContent.runes, oldRunes)
-	if runeIdx < 0 {
-		return -1, 0
-	}
-
-	if runeIdx+len(oldRunes) > len(normContent.runeToByte)-1 {
-		return -1, 0
-	}
-	startByte := normContent.runeToByte[runeIdx]
-	endByte := normContent.runeToByte[runeIdx+len(oldRunes)]
-	if startByte < 0 || endByte < startByte || endByte > len(content) {
-		return -1, 0
-	}
-	return startByte, endByte - startByte
+	return runes, append(offsets, len(text))
 }
 
-// indentAwareFind matches oldText as whole lines, each with the newline that
-// ends it; a final newline in oldText ends its last line.
-func indentAwareFind(content, oldText string) (idx, matchLen, count int) {
+// indentAwareMatches matches oldText as whole lines, each with the newline
+// that ends it, ignoring their common indentation; a final newline in
+// oldText ends its last line.
+func indentAwareMatches(content, oldText string) []span {
 	oldLines := strings.Split(strings.TrimSuffix(oldText, "\n"), "\n")
 	contentLines := strings.Split(content, "\n")
-	if len(oldLines) > len(contentLines) {
-		return -1, 0, 0
-	}
-
 	target := normalizeLinesForIndentAware(oldLines)
 	lineStarts := lineStartOffsets(content)
 
-	var matches []struct{ start, end int }
-	for i := 0; i+len(oldLines) <= len(contentLines); i++ {
-		window := contentLines[i : i+len(oldLines)]
-		if normalizeLinesForIndentAware(window) != target {
+	var out []span
+	for i := 0; i+len(oldLines) <= len(contentLines); {
+		if normalizeLinesForIndentAware(contentLines[i:i+len(oldLines)]) != target {
+			i++
 			continue
 		}
 		last := i + len(oldLines) - 1
-		matches = append(matches, struct{ start, end int }{
-			start: lineStarts[i],
-			end:   min(lineStarts[last]+len(contentLines[last])+1, len(content)),
-		})
+		out = append(out, span{lineStarts[i], min(lineStarts[last]+len(contentLines[last])+1, len(content))})
+		i += len(oldLines)
 	}
-
-	if len(matches) == 0 {
-		return -1, 0, 0
-	}
-	if len(matches) > 1 {
-		return -1, 0, len(matches)
-	}
-	m := matches[0]
-	return m.start, m.end - m.start, 1
+	return out
 }
 
 func normalizeLinesForIndentAware(lines []string) string {
 	processed := make([]string, len(lines))
 	minIndent := -1
 	for i, line := range lines {
-		line = strings.TrimRightFunc(line, unicode.IsSpace)
-		line = strings.Map(normalizeRuneForFuzzy, line)
+		line = strings.Map(normalizeRuneForFuzzy, strings.TrimRightFunc(line, unicode.IsSpace))
 		processed[i] = line
 
 		trimmed := strings.TrimLeft(line, " \t")
@@ -627,11 +583,11 @@ func scoreCandidateBlock(candidateLines, targetLines []string) int {
 		score += scoreCandidateLine(candidateLines[i], targetLines[i])
 	}
 
-	if trimmedLine(candidateLines[0]) == trimmedLine(targetLines[0]) {
+	if normalizeSearchText(candidateLines[0]) == normalizeSearchText(targetLines[0]) {
 		score += candidateSimilarityScale / 2
 	}
 	last := len(targetLines) - 1
-	if trimmedLine(candidateLines[last]) == trimmedLine(targetLines[last]) {
+	if normalizeSearchText(candidateLines[last]) == normalizeSearchText(targetLines[last]) {
 		score += candidateSimilarityScale / 2
 	}
 
@@ -664,12 +620,11 @@ func scoreCandidateLine(candidate, target string) int {
 }
 
 func normalizeSearchText(text string) string {
-	text = strings.Map(normalizeRuneForFuzzy, text)
-	return strings.TrimSpace(text)
+	return strings.TrimSpace(strings.Map(normalizeRuneForFuzzy, text))
 }
 
 func collapseWhitespace(text string) string {
-	return strings.Join(strings.Fields(normalizeSearchText(text)), " ")
+	return strings.Join(strings.Fields(text), " ")
 }
 
 type runeBigram struct {
@@ -701,30 +656,11 @@ func runeBigramSimilarity(a, b string) int {
 	return overlap * 2 * candidateSimilarityScale / (len(ar) + len(br) - 2)
 }
 
-func trimmedLine(text string) string {
-	return strings.TrimSpace(strings.Map(normalizeRuneForFuzzy, text))
-}
-
+// topEditCandidates returns the three best candidates. They come in line
+// order, which the sort keeps among those scored alike.
 func topEditCandidates(candidates []editCandidate) []editCandidate {
-	if len(candidates) == 0 {
-		return nil
-	}
-
-	for i := 0; i < len(candidates); i++ {
-		best := i
-		for j := i + 1; j < len(candidates); j++ {
-			if candidates[j].score > candidates[best].score ||
-				(candidates[j].score == candidates[best].score && candidates[j].startLine < candidates[best].startLine) {
-				best = j
-			}
-		}
-		candidates[i], candidates[best] = candidates[best], candidates[i]
-	}
-
-	if len(candidates) > 3 {
-		candidates = candidates[:3]
-	}
-	return candidates
+	slices.SortStableFunc(candidates, func(a, b editCandidate) int { return cmp.Compare(b.score, a.score) })
+	return candidates[:min(len(candidates), 3)]
 }
 
 func lineStartOffsets(text string) []int {

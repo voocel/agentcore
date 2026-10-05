@@ -14,7 +14,6 @@ import (
 	"path/filepath"
 	"sort"
 	"strings"
-	"time"
 
 	_ "image/gif"
 
@@ -52,7 +51,7 @@ func (w Workspace) Read() agentcore.Tool {
 			schema.Property("offset", schema.Int("The line number to start reading from. Only provide if the file is too large to read at once")),
 			schema.Property("limit", schema.Int("The number of lines to read. Only provide if the file is too large to read at once")),
 		),
-		Parallel: always,
+		Parallel: true,
 		Run:      t.run,
 	}
 }
@@ -156,7 +155,6 @@ func (t *readTool) recordRead(a resolvedRead, partial bool) {
 		return
 	}
 	t.w.Files.Set(a.path, FileReadStamp{
-		ReadAt:  time.Now(),
 		Mtime:   a.info.ModTime,
 		Version: a.info.Version,
 		Partial: partial,
@@ -316,11 +314,10 @@ func (t *readTool) readTextFile(ctx context.Context, a resolvedRead) (string, bo
 		if tl, truncated := truncateLine(line, readMaxLineLen); truncated {
 			line = tl
 		}
+		// A line cut to readMaxLineLen fits defaultMaxBytes: the first one
+		// read always does.
 		rendered := fmt.Sprintf("%d\t%s\n", totalLines, line)
 		if written+len(rendered) > defaultMaxBytes {
-			if readLines == 0 {
-				return fmt.Sprintf("[File %s: first line exceeds %s limit. Use offset/limit to read in chunks.]", a.path, formatSize(defaultMaxBytes)), true, nil
-			}
 			truncatedByBytes = true
 			hasMore = true
 			break

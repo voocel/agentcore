@@ -107,19 +107,15 @@ func extractFileOps(msgs []agentcore.Message) (read, modified []string) {
 	return read, modified
 }
 
-// pathArg reads "file_path" (edit/read/write), falling back to "path".
+// pathArg reads the "file_path" of read, write and edit.
 func pathArg(args string) string {
 	var obj struct {
 		FilePath string `json:"file_path"`
-		Path     string `json:"path"`
 	}
 	if json.Unmarshal([]byte(args), &obj) != nil {
 		return ""
 	}
-	if obj.FilePath != "" {
-		return obj.FilePath
-	}
-	return obj.Path
+	return obj.FilePath
 }
 
 func formatFileOps(read, modified []string) string {

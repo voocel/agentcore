@@ -1,6 +1,7 @@
 package tools
 
 import (
+	"cmp"
 	"context"
 	"encoding/json"
 	"fmt"
@@ -57,7 +58,7 @@ func Defer(tools []agentcore.Tool) []agentcore.Tool {
 			"required":             []string{"query"},
 			"additionalProperties": false,
 		},
-		Parallel: always,
+		Parallel: true,
 		Run:      t.run,
 	}
 	return append([]agentcore.Tool{search}, out...)
@@ -143,19 +144,11 @@ func (t *toolSearchTool) search(query string, maxResults int) []string {
 		}
 	}
 
-	// Sort by score descending (simple insertion sort — small N).
-	for i := 1; i < len(results); i++ {
-		for j := i; j > 0 && results[j].score > results[j-1].score; j-- {
-			results[j], results[j-1] = results[j-1], results[j]
-		}
-	}
-
+	// By score; entries scored alike keep their order.
+	slices.SortStableFunc(results, func(a, b scored) int { return cmp.Compare(b.score, a.score) })
 	matched := make([]string, 0, min(maxResults, len(results)))
-	for i := range results {
-		if i >= maxResults {
-			break
-		}
-		matched = append(matched, results[i].name)
+	for _, r := range results[:min(maxResults, len(results))] {
+		matched = append(matched, r.name)
 	}
 	return matched
 }

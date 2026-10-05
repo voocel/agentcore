@@ -30,9 +30,6 @@ var unicodeSpaces = []rune{
 	'\u3000', // IDEOGRAPHIC SPACE
 }
 
-// always is the Parallel of tools whose calls may always run in parallel.
-func always(json.RawMessage) bool { return true }
-
 // textRun returns a Tool.Run of execute, which returns text.
 func textRun(execute func(context.Context, json.RawMessage) (string, error)) func(context.Context, json.RawMessage) (agentcore.Result, error) {
 	return func(ctx context.Context, args json.RawMessage) (agentcore.Result, error) {
@@ -58,17 +55,12 @@ var skipDirs = map[string]bool{
 	".venv":        true,
 }
 
-// TruncationResult holds detailed metadata about a truncation operation.
-type TruncationResult struct {
-	Content               string
-	Truncated             bool
-	TruncatedBy           string // "lines", "bytes", or ""
-	TotalLines            int
-	TotalBytes            int
-	OutputLines           int
-	OutputBytes           int
-	FirstLineExceedsLimit bool // truncateHead: first line alone exceeds byte limit
-	LastLinePartial       bool // truncateTail: final line was byte-sliced
+// truncation is text cut to a number of lines and bytes.
+type truncation struct {
+	Content   string
+	Truncated bool
+	// OutputLines is how many lines Content holds.
+	OutputLines int
 }
 
 // ExpandPath normalizes a user-provided path:
@@ -144,101 +136,41 @@ func IsSkipDir(name string) bool {
 	return skipDirs[name]
 }
 
-// truncateHead keeps the first N lines/bytes (for file reads).
-// Never returns partial lines unless FirstLineExceedsLimit is true (returns empty).
-func truncateHead(content string, maxLines, maxBytes int) TruncationResult {
-	if maxLines <= 0 {
-		maxLines = defaultMaxLines
-	}
-	if maxBytes <= 0 {
-		maxBytes = defaultMaxBytes
-	}
-
+// truncateHead keeps the first whole lines of content, at most maxLines of
+// them and maxBytes; none when the first line alone exceeds maxBytes.
+func truncateHead(content string, maxLines, maxBytes int) truncation {
 	lines := strings.Split(content, "\n")
-	totalLines := len(lines)
-	totalBytes := len(content)
-
-	if totalLines <= maxLines && totalBytes <= maxBytes {
-		return TruncationResult{
-			Content:     content,
-			TotalLines:  totalLines,
-			TotalBytes:  totalBytes,
-			OutputLines: totalLines,
-			OutputBytes: totalBytes,
-		}
-	}
-
-	if len(lines[0]) > maxBytes {
-		return TruncationResult{
-			Truncated:             true,
-			TruncatedBy:           "bytes",
-			TotalLines:            totalLines,
-			TotalBytes:            totalBytes,
-			FirstLineExceedsLimit: true,
-		}
+	if len(lines) <= maxLines && len(content) <= maxBytes {
+		return truncation{Content: content, OutputLines: len(lines)}
 	}
 
 	var kept []string
 	byteCount := 0
-	truncatedBy := "lines"
-
 	for i, line := range lines {
 		lineBytes := len(line)
 		if i > 0 {
 			lineBytes++
 		}
-		if byteCount+lineBytes > maxBytes {
-			truncatedBy = "bytes"
-			break
-		}
-		if len(kept) >= maxLines {
+		if byteCount+lineBytes > maxBytes || len(kept) >= maxLines {
 			break
 		}
 		kept = append(kept, line)
 		byteCount += lineBytes
 	}
-
-	output := strings.Join(kept, "\n")
-	return TruncationResult{
-		Content:     output,
-		Truncated:   true,
-		TruncatedBy: truncatedBy,
-		TotalLines:  totalLines,
-		TotalBytes:  totalBytes,
-		OutputLines: len(kept),
-		OutputBytes: len(output),
-	}
+	return truncation{Content: strings.Join(kept, "\n"), Truncated: true, OutputLines: len(kept)}
 }
 
-// truncateTail keeps the last N lines/bytes (for bash output).
-// If the last line alone exceeds maxBytes, takes a byte-slice from the end
-// with UTF-8 boundary safety. Sets LastLinePartial in that case.
-func truncateTail(content string, maxLines, maxBytes int) TruncationResult {
-	if maxLines <= 0 {
-		maxLines = defaultMaxLines
-	}
-	if maxBytes <= 0 {
-		maxBytes = defaultMaxBytes
-	}
-
+// truncateTail keeps the last whole lines of content, at most maxLines of
+// them and maxBytes. When the last line alone exceeds maxBytes, it keeps
+// the end of that line, from a UTF-8 character boundary.
+func truncateTail(content string, maxLines, maxBytes int) truncation {
 	lines := strings.Split(content, "\n")
-	totalLines := len(lines)
-	totalBytes := len(content)
-
-	if totalLines <= maxLines && totalBytes <= maxBytes {
-		return TruncationResult{
-			Content:     content,
-			TotalLines:  totalLines,
-			TotalBytes:  totalBytes,
-			OutputLines: totalLines,
-			OutputBytes: totalBytes,
-		}
+	if len(lines) <= maxLines && len(content) <= maxBytes {
+		return truncation{Content: content, OutputLines: len(lines)}
 	}
 
 	var kept []string
 	byteCount := 0
-	truncatedBy := "lines"
-
 	for i := len(lines) - 1; i >= 0 && len(kept) < maxLines; i-- {
 		line := lines[i]
 		lineBytes := len(line)
@@ -246,38 +178,15 @@ func truncateTail(content string, maxLines, maxBytes int) TruncationResult {
 			lineBytes++
 		}
 		if byteCount+lineBytes > maxBytes {
-			truncatedBy = "bytes"
 			break
 		}
 		kept = append([]string{line}, kept...)
 		byteCount += lineBytes
 	}
-
-	if len(kept) == 0 && len(lines) > 0 {
-		last := lines[len(lines)-1]
-		sliced := truncateBytesFromEnd(last, maxBytes)
-		return TruncationResult{
-			Content:         sliced,
-			Truncated:       true,
-			TruncatedBy:     "bytes",
-			TotalLines:      totalLines,
-			TotalBytes:      totalBytes,
-			OutputLines:     1,
-			OutputBytes:     len(sliced),
-			LastLinePartial: true,
-		}
+	if len(kept) == 0 {
+		return truncation{Content: truncateBytesFromEnd(lines[len(lines)-1], maxBytes), Truncated: true, OutputLines: 1}
 	}
-
-	output := strings.Join(kept, "\n")
-	return TruncationResult{
-		Content:     output,
-		Truncated:   true,
-		TruncatedBy: truncatedBy,
-		TotalLines:  totalLines,
-		TotalBytes:  totalBytes,
-		OutputLines: len(kept),
-		OutputBytes: len(output),
-	}
+	return truncation{Content: strings.Join(kept, "\n"), Truncated: true, OutputLines: len(kept)}
 }
 
 // truncateBytesFromEnd returns the last maxBytes bytes of s,

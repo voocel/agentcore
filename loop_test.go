@@ -501,8 +501,7 @@ func TestRunParallelTools(t *testing.T) {
 			return TextResult(name), nil
 		}
 	}
-	always := func(json.RawMessage) bool { return true }
-	read := Tool{Name: "read", Parallel: always, Run: track("read")}
+	read := Tool{Name: "read", Parallel: true, Run: track("read")}
 	write := Tool{Name: "write", Run: track("write")}
 	history, err := Run(context.Background(), Config{Model: testModel(t, p), Tools: []Tool{read, write}, MaxToolConcurrency: 4}, nil, UserText("go"))
 	if err != nil {
@@ -643,22 +642,32 @@ func TestRunTerminateTakesQueues(t *testing.T) {
 	}
 }
 
-// A response that fails for good is recorded with what streamed of it, so
-// its MessageStart ends; it is not sent to the model again.
+// A response that fails for good, whether its stream broke off or the
+// vendor ended it with an error, is recorded with what streamed of it, so
+// its MessageStart ends, without its calls, which do not run; it is not
+// sent to the model again.
 func TestRunFailedResponseIsRecorded(t *testing.T) {
 	broken := litellm.NewError("test", litellm.ErrorTypeProvider, "bad gateway", nil)
-	p := litellmtest.New(litellmtest.Reply{Blocks: []litellm.Block{litellm.Text("par"), call("c1", "echo", `{"text":"x"}`)}, StreamErr: broken})
-	rec := &recorder{}
-	history, err := Run(context.Background(), Config{Model: testModel(t, p), Tools: []Tool{echoTool()}, Emit: rec.emit}, nil, UserText("go"))
-	if !errors.Is(err, broken) {
-		t.Fatalf("err = %v", err)
-	}
-	last := history[len(history)-1]
-	if last.Stop != StopError || last.Text() != "par" || len(last.ToolCalls()) != 0 || len(of[MessageEnd](rec)) != 2 {
-		t.Fatalf("history = %#v", history)
-	}
-	if awaitsResponse(history) != true {
-		t.Fatal("the failed response counts as an answer")
+	blocks := []litellm.Block{litellm.Text("par"), call("c1", "echo", `{"text":"x"}`)}
+	for name, reply := range map[string]litellmtest.Reply{
+		"stream broke off": {Blocks: blocks, StreamErr: broken},
+		"vendor error":     {Blocks: blocks, FinishReason: litellm.FinishReasonError},
+	} {
+		t.Run(name, func(t *testing.T) {
+			p := litellmtest.New(reply)
+			rec := &recorder{}
+			history, err := Run(context.Background(), Config{Model: testModel(t, p), Tools: []Tool{echoTool()}, Emit: rec.emit}, nil, UserText("go"))
+			if err == nil || reply.StreamErr != nil && !errors.Is(err, broken) {
+				t.Fatalf("err = %v", err)
+			}
+			last := history[len(history)-1]
+			if last.Stop != StopError || last.Text() != "par" || len(last.ToolCalls()) != 0 || len(of[MessageEnd](rec)) != 2 || len(of[ToolStart](rec)) != 0 {
+				t.Fatalf("history = %#v", history)
+			}
+			if !awaitsResponse(history) {
+				t.Fatal("the failed response counts as an answer")
+			}
+		})
 	}
 }
 
@@ -739,5 +748,25 @@ func TestRunValidatesAgainstTheWireSchema(t *testing.T) {
 	bad := history[3].Blocks[0].(litellm.ToolResultBlock)
 	if ok.IsError || !bad.IsError || !strings.Contains(history[3].Text(), "text") {
 		t.Fatalf("results %q, %q", history[2].Text(), history[3].Text())
+	}
+}
+
+// The model reads every issue of its arguments at once, missing parameters
+// first.
+func TestValidateArgsListsEveryIssue(t *testing.T) {
+	schema := map[string]any{
+		"type":                 "object",
+		"properties":           map[string]any{"mode": map[string]any{"enum": []string{"a", "b"}}, "tags": map[string]any{"type": "array"}},
+		"required":             []string{"path"},
+		"additionalProperties": false,
+	}
+	err := validateArgs("t", schema, json.RawMessage(`{"mode":"c","tags":"[\"x\"]","extra":1}`))
+	want := "InputValidationError: t failed due to the following issues:\n" +
+		"The required parameter `path` is missing\n" +
+		"The parameter `tags` type is expected as `array` but provided as `string`. Looks like a JSON-encoded array — pass the value directly (e.g. [\"a\",\"b\"]), not wrapped in quotes.\n" +
+		"The parameter `mode` must be one of [\"a\", \"b\"] but provided as \"c\"\n" +
+		"The parameter `extra` is not allowed"
+	if err == nil || err.Error() != want {
+		t.Fatalf("err = %v", err)
 	}
 }

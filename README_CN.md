@@ -104,7 +104,7 @@ cancel()                                                     // 结束运行
 
 只追加 `MessageEnd` 的存储恢复出来的是压缩前的历史：`Compaction.Messages` 是完整的新历史，`Replaced` 是它替代了旧历史中的多少条。`NewAgent` 会用订阅者、`Steer` 和 `FollowUp` 替换 `Config.Emit`、`Steering` 和 `FollowUp`。
 
-取消 ctx 即结束运行。运行进行中时 `Prompt` 返回 `ErrBusy`。`Continue` 就现有历史作答（如运行失败之后），历史以响应结尾时返回 `ErrNothingToContinue`。`Compact` 按需压缩，`Messages` 和 `SetMessages` 读取和替换历史。每个订阅者都会收到 `RunEnd`，即使前面有订阅者失败。
+取消 ctx 即结束运行。运行进行中时 `Prompt` 返回 `ErrBusy`。不带提示词时，它就现有历史作答（如运行失败之后），历史以响应结尾时返回 `ErrNothingToContinue`。`Compact` 按需压缩，`Messages` 和 `SetMessages` 读取和替换历史。每个订阅者都会收到 `RunEnd`，即使前面有订阅者失败。
 
 ## 事件
 
@@ -143,7 +143,7 @@ weather := agentcore.NewTool("weather", "Current weather of a city",
 
 - 调用前按 `Schema` 校验参数；不符合的地方会告诉模型。
 - `Check` 在审批和执行前检查调用，并可返回给人看的预览，如 `edit` 和 `write` 返回的 diff，见 `ToolCall.Preview`。
-- `Parallel` 允许调用与同一轮的其他并行调用一起运行，上限为 `MaxToolConcurrency`。
+- `Parallel` 工具的调用与同一轮的其他并行调用一起运行，上限为 `MaxToolConcurrency`；其他调用单独运行。
 - `Deferred` 工具只在历史中有工具引用点名之后才提供给模型，`tool_search` 返回的就是这种引用（见 `tools.Defer`）。Anthropic 从第一次调用起就收到全部工具，延迟的标为 `defer_loading`，因此一次对话的工具列表始终不变；见 `litellm.Tool`。
 - `Result` 装的是 litellm 块（文本、图片、工具引用），`Result.Text` 取其文本。`Terminate` 在本轮记录完成后结束运行。
 - 运行中的工具用 `agentcore.ReportProgress(ctx, v)` 报告进度，以 `ToolUpdate` 送达。`bash` 以字符串报告每行输出，`subagent` 报告 `subagent.Progress`。

@@ -261,5 +261,22 @@ func TestRunCompactionFailures(t *testing.T) {
 	if _, err := Run(context.Background(), Config{Model: testModel(t, p), Compactor: &summarizer{errs: []error{boom}}}, bigHistory()); !errors.Is(err, boom) {
 		t.Fatalf("failed compaction on overflow: %v", err)
 	}
+}
 
+// A run cancelled while it compacts ends there: Steering is not consulted
+// again, nor the model called.
+func TestRunCancelledDuringCompaction(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	steered := 0
+	steer := func() []Message {
+		steered++
+		return nil
+	}
+	p := litellmtest.New(litellmtest.Text("unreached"))
+	s := &summarizer{during: cancel, errs: []error{context.Canceled}}
+	_, err := Run(ctx, Config{Model: testModel(t, p), Compactor: s, CompactAt: 500, Steering: steer}, bigHistory())
+	if !errors.Is(err, context.Canceled) || steered != 1 || len(p.Requests()) != 0 {
+		t.Fatalf("err %v, Steering consulted %d times, %d requests", err, steered, len(p.Requests()))
+	}
 }

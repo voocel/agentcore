@@ -137,9 +137,10 @@ func (t *writeTool) validate(ctx context.Context, args json.RawMessage) error {
 	if stamp.Partial {
 		return errors.New("Only part of the file has been read (offset/limit). Read the whole file before overwriting it, or use edit to change part of it.")
 	}
-	// Compare against the content token / mtime recorded at read time, not just
-	// "after ReadAt". Catches mtime regressions too (e.g. git checkout of an
-	// older version), and unsaved-buffer changes when the backend sets Version.
+	// The content token or mtime must equal the one recorded at read time,
+	// not just be no later: that catches mtime regressions too (e.g. git
+	// checkout of an older version), and unsaved-buffer changes when the
+	// backend sets Version.
 	if !stampMatches(stamp, info) {
 		return errors.New("File has been modified since read, either by the user or by a linter. Read it again before attempting to write it.")
 	}

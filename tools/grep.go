@@ -11,6 +11,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"regexp"
+	"strconv"
 	"strings"
 
 	"github.com/voocel/agentcore"
@@ -26,7 +27,7 @@ func (w Workspace) Grep() agentcore.Tool {
 		Label:       "Search Content",
 		Description: "Fast content search across files. Supports regex patterns by default, or exact text with literal=true. Use glob to narrow which files are searched. Returns relative file paths, line numbers, and matching lines (default limit: 100). Use bash only when you need shell-specific pipelines, counting, or custom post-processing.",
 		Schema:      grepSchema(),
-		Parallel:    always,
+		Parallel:    true,
 		Run:         textRun(t.execute),
 	}
 }
@@ -61,6 +62,9 @@ const (
 	grepDefaultLimit = 100
 	grepMaxLineLen   = 500
 	grepMaxBytes     = 50 * 1024
+	// rgMaxColumns bounds the bytes of a line rg prints, well above what
+	// grepMaxLineLen keeps of it.
+	rgMaxColumns = 16 * 1024
 )
 
 // rgMatchLineRe matches rg output lines that are actual matches (colon after line number),
@@ -81,25 +85,22 @@ func (t *grepTool) execute(ctx context.Context, args json.RawMessage) (string, e
 	}
 
 	searchPath := ResolvePath(t.w.dir(ctx), a.Path)
-
-	// Try ripgrep first
-	if result, err := t.grepWithRg(ctx, a, searchPath); err == nil {
-		return result, nil
+	// The Go search stands in only for an rg not installed: its regexp
+	// dialect differs, and it reads no .gitignore. rg's own errors, such as
+	// on an invalid pattern, are the model's to read.
+	rg, err := exec.LookPath("rg")
+	if err != nil {
+		return t.grepWithGo(ctx, a, searchPath)
 	}
-
-	// Fallback to Go implementation
-	return t.grepWithGo(ctx, a, searchPath)
+	return t.grepWithRg(ctx, rg, a, searchPath)
 }
 
 // grepWithRg uses ripgrep with streaming output.
 // Kills the process once the match limit is reached.
-func (t *grepTool) grepWithRg(ctx context.Context, a grepArgs, searchPath string) (string, error) {
-	rgPath, err := exec.LookPath("rg")
-	if err != nil {
-		return "", err
-	}
-
-	cmdArgs := []string{"--line-number", "--no-heading", "--color", "never"}
+func (t *grepTool) grepWithRg(ctx context.Context, rgPath string, a grepArgs, searchPath string) (string, error) {
+	// rg cuts a line longer than rgMaxColumns, so that no output line
+	// outgrows the scanner's buffer.
+	cmdArgs := []string{"--line-number", "--no-heading", "--color", "never", "--max-columns", strconv.Itoa(rgMaxColumns), "--max-columns-preview"}
 
 	if a.IgnoreCase {
 		cmdArgs = append(cmdArgs, "--ignore-case")
@@ -207,7 +208,7 @@ func (t *grepTool) grepWithRg(ctx context.Context, a grepArgs, searchPath string
 	result = appendGrepNotices(result, a.Limit, hitLimit, exitCode == 2)
 
 	// Apply byte truncation
-	tr := truncateHead(result, 0, grepMaxBytes)
+	tr := truncateHead(result, defaultMaxLines, grepMaxBytes)
 	if tr.Truncated {
 		return tr.Content + "\n\n[Output truncated.]", nil
 	}

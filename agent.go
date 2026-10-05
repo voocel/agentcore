@@ -81,16 +81,20 @@ func (a *Agent) Subscribe(fn func(Event) error) (unsubscribe func()) {
 }
 
 // Prompt runs the history with prompts added, and returns when the run
-// ends, with its error. It fails with ErrBusy while a run is under way; use
-// Steer or FollowUp then.
+// ends, with its error. Without prompts, it answers the history as it is,
+// such as after a run failed; see Run for when there is nothing to answer.
+// It fails with ErrBusy while a run is under way; use Steer or FollowUp
+// then.
 func (a *Agent) Prompt(ctx context.Context, prompts ...Message) error {
-	return a.run(ctx, prompts)
-}
-
-// Continue runs the history as it is, such as after a run failed; see Run
-// for when there is nothing to continue.
-func (a *Agent) Continue(ctx context.Context) error {
-	return a.run(ctx, nil)
+	cfg, history, err := a.start()
+	if err != nil {
+		return err
+	}
+	defer a.finish()
+	cfg.Steering = func() []Message { return a.take(&a.steering) }
+	cfg.FollowUp = func() []Message { return a.take(&a.followUp) }
+	_, err = Run(ctx, cfg, history, prompts...)
+	return err
 }
 
 // Steer delivers msgs before the next model call of the run under way, or
@@ -129,23 +133,11 @@ func (a *Agent) Compact(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
-	defer a.finish(nil)
+	defer a.finish()
 	ctx, cancel := context.WithCancelCause(ctx)
 	defer cancel(nil)
 	r := &run{ctx: ctx, cancel: cancel, cfg: cfg, history: history}
 	_, err = r.compact()
-	return err
-}
-
-func (a *Agent) run(ctx context.Context, prompts []Message) error {
-	cfg, history, err := a.start()
-	if err != nil {
-		return err
-	}
-	cfg.Steering = func() []Message { return a.take(&a.steering) }
-	cfg.FollowUp = func() []Message { return a.take(&a.followUp) }
-	history, err = Run(ctx, cfg, history, prompts...)
-	a.finish(history)
 	return err
 }
 
@@ -164,14 +156,10 @@ func (a *Agent) start() (Config, []Message, error) {
 	return cfg, slices.Clone(a.history), nil
 }
 
-// finish releases the Agent, its history the one the run ended with, if
-// given.
-func (a *Agent) finish(history []Message) {
+// finish releases the Agent.
+func (a *Agent) finish() {
 	a.mu.Lock()
 	defer a.mu.Unlock()
-	if history != nil {
-		a.history = history
-	}
 	a.running = false
 }
 

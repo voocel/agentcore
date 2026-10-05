@@ -54,11 +54,11 @@ func callFor(t *testing.T, p litellm.Provider) func([]agentcore.Message) agentco
 
 func TestExtractFileOps(t *testing.T) {
 	msgs := []agentcore.Message{assistant(
-		readCall("1", `{"path":"a.go"}`),
-		readCall("2", `{"path":"b.go"}`),
-		litellm.ToolUseBlock{ID: "3", Name: "edit", Arguments: `{"path":"b.go"}`},
-		litellm.ToolUseBlock{ID: "4", Name: "write", Arguments: `{"path":"c.go"}`},
-		readCall("5", `{"path":"a.go"}`),
+		readCall("1", `{"file_path":"a.go"}`),
+		readCall("2", `{"file_path":"b.go"}`),
+		litellm.ToolUseBlock{ID: "3", Name: "edit", Arguments: `{"file_path":"b.go"}`},
+		litellm.ToolUseBlock{ID: "4", Name: "write", Arguments: `{"file_path":"c.go"}`},
+		readCall("5", `{"file_path":"a.go"}`),
 	)}
 	read, modified := extractFileOps(msgs)
 	if strings.Join(read, ",") != "a.go" || strings.Join(modified, ",") != "b.go,c.go" {

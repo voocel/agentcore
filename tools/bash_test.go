@@ -2,6 +2,7 @@ package tools
 
 import (
 	"context"
+	"io"
 	"os"
 	"path"
 	"path/filepath"
@@ -115,7 +116,7 @@ func TestBashBackground(t *testing.T) {
 		t.Fatalf("output %q", data)
 	}
 	time.Sleep(100 * time.Millisecond)
-	if e, _ := rt.Get("shell-2"); e.Status != task.Running || e.PID == 0 {
+	if e, _ := rt.Get("shell-2"); e.Status != task.Running {
 		t.Fatalf("shell-2 = %+v", e)
 	}
 	rt.StopAll()
@@ -125,5 +126,20 @@ func TestBashBackground(t *testing.T) {
 	}
 	if len(notes) != 2 {
 		t.Fatalf("%d notifications", len(notes))
+	}
+}
+
+// Output without newlines is reported in pieces, so that it is not held in
+// memory whole.
+func TestReadLinesBoundsALongLine(t *testing.T) {
+	t.Parallel()
+	data := strings.Repeat("a", 10*defaultMaxBytes)
+	longest, total := 0, 0
+	err := readLines(strings.NewReader(data), io.Discard, func(line string) {
+		longest = max(longest, len(line))
+		total += len(line)
+	})
+	if err != nil || total != len(data) || longest > 2*defaultMaxBytes {
+		t.Fatalf("err %v, %d of %d bytes reported, the longest line %d", err, total, len(data), longest)
 	}
 }

@@ -130,7 +130,6 @@ func (t *bashTool) background(ctx context.Context, a bashArgs, shell string, arg
 			if err := cmd.Start(); err != nil {
 				return fmt.Errorf("start command: %w", err)
 			}
-			tk.Update(func(e *task.Entry) { e.PID = cmd.Process.Pid })
 			err := cmd.Wait()
 			if exitErr, ok := errors.AsType[*exec.ExitError](err); ok {
 				tk.Update(func(e *task.Entry) { e.ExitCode = exitErr.ExitCode() })
@@ -218,7 +217,9 @@ func foreground(ctx context.Context, shell string, argv []string, dir string, ti
 	return text, nil
 }
 
-// readLines copies r to w, calling line with each line as it comes.
+// readLines copies r to w, calling line with each line as it comes. A line
+// longer than defaultMaxBytes comes in pieces of about that size, so that
+// output without newlines is not held in memory whole.
 func readLines(r io.Reader, w io.Writer, line func(string)) error {
 	var pending []byte
 	buf := make([]byte, 32*1024)
@@ -233,6 +234,10 @@ func readLines(r io.Reader, w io.Writer, line func(string)) error {
 			}
 			line(string(pending[:i]))
 			pending = pending[i+1:]
+		}
+		if len(pending) >= defaultMaxBytes {
+			line(string(pending))
+			pending = nil
 		}
 		if err != nil {
 			if len(pending) > 0 {

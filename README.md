@@ -104,7 +104,7 @@ cancel()                                                     // ends the run
 
 A store that appends `MessageEnd` alone restores the history from before its compactions: `Compaction.Messages` is the whole new history, and `Replaced` how many messages of the old one it stands in for. `NewAgent` replaces `Config.Emit`, `Steering` and `FollowUp` with the subscribers, `Steer` and `FollowUp`.
 
-A run ends when its context is cancelled. `Prompt` fails with `ErrBusy` while a run is under way. `Continue` answers the history as it stands, such as after a failed run, and fails with `ErrNothingToContinue` when it ends with a response. `Compact` compacts it on demand, `Messages` and `SetMessages` read and replace it. Every subscriber receives the `RunEnd`, even after one failed.
+A run ends when its context is cancelled. `Prompt` fails with `ErrBusy` while a run is under way. Without prompts, it answers the history as it stands, such as after a failed run, and fails with `ErrNothingToContinue` when it ends with a response. `Compact` compacts it on demand, `Messages` and `SetMessages` read and replace it. Every subscriber receives the `RunEnd`, even after one failed.
 
 ## Events
 
@@ -143,7 +143,7 @@ weather := agentcore.NewTool("weather", "Current weather of a city",
 
 - Arguments are validated against `Schema` before a call runs; the model reads what does not fit.
 - `Check` vets a call before it is approved and may return a preview for people, such as the diff `edit` and `write` return, found on `ToolCall.Preview`.
-- `Parallel` lets calls run alongside the other parallel calls of their turn, up to `MaxToolConcurrency`.
+- `Parallel` tools run their calls alongside the other parallel calls of their turn, up to `MaxToolConcurrency`; any other call runs alone.
 - `Deferred` tools are offered only once a tool reference in the history names them, as `tool_search` returns (see `tools.Defer`). Anthropic receives them all from the first call, marked `defer_loading`, so the tools of a conversation never change; see `litellm.Tool`.
 - A `Result` holds litellm blocks (text, images, tool references); `Result.Text` is its text. `Terminate` ends the run once the turn is recorded.
 - A running tool reports progress with `agentcore.ReportProgress(ctx, v)`; it arrives as `ToolUpdate`. `bash` reports lines of output as strings, `subagent` reports `subagent.Progress`.

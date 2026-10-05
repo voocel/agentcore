@@ -62,7 +62,6 @@ type Entry struct {
 
 	// A shell command.
 	Command  string
-	PID      int
 	ExitCode int
 
 	// A sub-agent.

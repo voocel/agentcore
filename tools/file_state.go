@@ -6,8 +6,8 @@ import (
 	"time"
 )
 
-// FileReadStamp records when a file was read and its mtime at that moment.
-// Write and edit tools consult these stamps via their Validator to enforce:
+// FileReadStamp records the state of a file as the model read it. The write
+// and edit tools consult these stamps in their Check and Run to enforce:
 //
 //   - read-before-write: a file must be read before it is overwritten.
 //   - no-stale-write: the file must not have been modified externally
@@ -25,7 +25,6 @@ import (
 // FileInfo.Version). It is empty for the OS backend; Write/Edit
 // fall back to comparing Mtime when either side's Version is empty.
 type FileReadStamp struct {
-	ReadAt  time.Time
 	Mtime   time.Time
 	Version string
 	Partial bool
@@ -69,15 +68,14 @@ func (s *FileReadState) recordWrite(ctx context.Context, fs FS, path string, who
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	s.m[path] = FileReadStamp{ReadAt: time.Now(), Mtime: info.ModTime, Version: info.Version, Partial: !whole && s.m[path].Partial}
+	s.m[path] = FileReadStamp{Mtime: info.ModTime, Version: info.Version, Partial: !whole && s.m[path].Partial}
 }
 
 // stampMatches reports whether the file described by info is unchanged since
 // the read recorded in stamp. When both sides carry a non-empty Version
-// (a backend content token), it compares Version; otherwise it falls back to
-// mtime equality — so the OS backend (Version always empty) keeps its existing
-// behaviour, while backends serving unsaved buffers get content-accurate
-// stale-write detection.
+// (a backend content token), it compares Version, so that a backend serving
+// unsaved buffers detects a change of their content; otherwise, as for the
+// OS backend, whose Version is always empty, it compares mtimes.
 func stampMatches(stamp FileReadStamp, info FileInfo) bool {
 	if stamp.Version != "" && info.Version != "" {
 		return stamp.Version == info.Version

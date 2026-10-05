@@ -27,7 +27,7 @@ func (w Workspace) Ls() agentcore.Tool {
 			schema.Property("depth", schema.Int("Recursion depth (default: 1, max: 5)")),
 			schema.Property("ignore", schema.Array("Optional file or directory patterns to ignore (for example: tmp/, *.log, dist)", schema.String("Ignore pattern"))),
 		),
-		Parallel: always,
+		Parallel: true,
 		Run:      textRun(t.execute),
 	}
 }
@@ -48,11 +48,8 @@ type ignoreMatcher struct {
 
 const lsDefaultLimit = 500
 
+// lsDefaultIgnorePatterns are hidden, as are skipDirs.
 var lsDefaultIgnorePatterns = []string{
-	".git/",
-	"node_modules/",
-	"__pycache__/",
-	".venv/",
 	"dist/",
 	"build/",
 	"target/",
@@ -110,54 +107,37 @@ func (t *lsTool) execute(ctx context.Context, args json.RawMessage) (string, err
 		result += fmt.Sprintf("\n\n[Listing truncated at %d entries. List a subdirectory, a smaller depth, or ignore more.]", maxEntries)
 	}
 
-	tr := truncateHead(result, 0, defaultMaxBytes)
+	tr := truncateHead(result, defaultMaxLines, defaultMaxBytes)
 	if tr.Truncated {
 		return tr.Content + "\n\n[Output truncated at " + formatSize(defaultMaxBytes) + ".]", nil
 	}
 	return result, nil
 }
 
+// newIgnoreMatcher returns the matcher of patterns. The trailing slash of a
+// directory's is dropped: the pattern hides a file of that name too.
 func newIgnoreMatcher(patterns []string) ignoreMatcher {
 	out := make([]string, 0, len(patterns))
 	for _, p := range patterns {
-		p = strings.TrimSpace(filepath.ToSlash(p))
-		if p == "" {
-			continue
+		if p = strings.TrimSuffix(strings.TrimSpace(filepath.ToSlash(p)), "/"); p != "" {
+			out = append(out, p)
 		}
-		out = append(out, p)
 	}
 	return ignoreMatcher{patterns: out}
 }
 
-func (m ignoreMatcher) Match(rel string, isDir bool) bool {
-	if len(m.patterns) == 0 {
-		return false
-	}
-
-	rel = filepath.ToSlash(rel)
+// Match reports whether a pattern matches rel, a slash-separated path, a
+// directory above it, or its name.
+func (m ignoreMatcher) Match(rel string) bool {
 	base := path.Base(rel)
 	for _, pattern := range m.patterns {
-		trimmed := strings.TrimSuffix(pattern, "/")
-		if trimmed == "" {
-			continue
-		}
-
-		if rel == trimmed || strings.HasPrefix(rel, trimmed+"/") {
+		if rel == pattern || strings.HasPrefix(rel, pattern+"/") {
 			return true
 		}
 		if ok, _ := path.Match(pattern, rel); ok {
 			return true
 		}
-		if ok, _ := path.Match(trimmed, rel); ok {
-			return true
-		}
 		if ok, _ := path.Match(pattern, base); ok {
-			return true
-		}
-		if ok, _ := path.Match(trimmed, base); ok {
-			return true
-		}
-		if isDir && strings.HasSuffix(pattern, "/") && (rel == trimmed || strings.HasPrefix(rel, trimmed+"/")) {
 			return true
 		}
 	}
@@ -189,13 +169,13 @@ func renderTree(ctx context.Context, root, dir string, current, maxDepth, maxEnt
 	var visible []visibleEntry
 	for _, e := range dirEntries {
 		name := e.Name()
-		isDir := e.IsDir()
-		if isDir && IsSkipDir(name) {
+		// Files of skipDirs' names too, such as the .git file of a worktree.
+		if IsSkipDir(name) {
 			continue
 		}
 		childPath := filepath.Join(dir, name)
 		rel, _ := filepath.Rel(root, childPath)
-		if matcher.Match(filepath.ToSlash(rel), isDir) {
+		if matcher.Match(filepath.ToSlash(rel)) {
 			continue
 		}
 		visible = append(visible, visibleEntry{entry: e, path: childPath})

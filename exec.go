@@ -59,8 +59,7 @@ func (r *run) runTools(msg Message, bad map[string]string) ([]Message, bool, err
 	parallel := make([]bool, len(uses))
 	for i, use := range uses {
 		calls[i] = ToolCall{ID: use.ID, Name: use.Name, Args: json.RawMessage(use.Arguments), Tool: r.tool(use.Name)}
-		t := calls[i].Tool
-		parallel[i] = t != nil && t.Parallel != nil && bad[use.ID] == "" && t.Parallel(calls[i].Args)
+		parallel[i] = calls[i].Tool != nil && calls[i].Tool.Parallel
 	}
 
 	results := make([]Result, len(calls))

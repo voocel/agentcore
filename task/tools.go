@@ -2,7 +2,6 @@ package task
 
 import (
 	"context"
-	"encoding/json"
 	"fmt"
 	"io"
 	"os"
@@ -34,7 +33,7 @@ func (r *Runtime) Tools() []agentcore.Tool {
 		r.output,
 	)
 	output.Label = "Task Output"
-	output.Parallel = func(json.RawMessage) bool { return true }
+	output.Parallel = true
 
 	stop := agentcore.NewTool("task_stop",
 		"Stop a running background task.",

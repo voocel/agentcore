@@ -22,9 +22,9 @@ type Tool struct {
 	// litellm.ToolReferenceBlock in the history names them, as a tool search
 	// returns; until then they cost no context. See litellm.Tool.
 	Deferred bool
-	// Parallel reports whether a call may run alongside the other parallel
-	// calls of its turn; nil means never.
-	Parallel func(args json.RawMessage) bool
+	// Parallel lets the tool's calls run alongside the other parallel calls
+	// of their turn; any other call runs alone.
+	Parallel bool
 	// Check, if set, vets a call before it is approved and run, such as that
 	// a file was read before it is edited, and may preview for people what
 	// the call will do, such as a diff to approve. An error fails the call.
