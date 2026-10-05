@@ -172,16 +172,18 @@ func (t *writeTool) execute(ctx context.Context, args json.RawMessage) (agentcor
 	return agentcore.TextResult(fmt.Sprintf("%s %s (%d bytes).", action, state.path, len(state.contentNew))), nil
 }
 
-// writePreview returns the first maxLines lines of content with line numbers prefixed by "+".
+// writePreview returns the first maxLines lines of content with line numbers
+// prefixed by "+". Lines are counted as generateDiff counts them: a final
+// newline ends the last line rather than starting another.
 func writePreview(content string, maxLines int) string {
-	lines := strings.Split(content, "\n")
+	lines := diffLines(content)
 	total := len(lines)
 	n := min(maxLines, total)
 
 	lineNumWidth := len(fmt.Sprintf("%d", total))
 	var sb strings.Builder
-	for i := 0; i < n; i++ {
-		fmt.Fprintf(&sb, "+%*d %s\n", lineNumWidth, i+1, lines[i])
+	for i := range n {
+		fmt.Fprintf(&sb, "+%*d %s\n", lineNumWidth, i+1, strings.TrimSuffix(lines[i], "\n"))
 	}
 	if total > n {
 		fmt.Fprintf(&sb, " %*s ... +%d more lines\n", lineNumWidth, "", total-n)
@@ -191,7 +193,7 @@ func writePreview(content string, maxLines int) string {
 
 func keepFirstNLines(s string, n int) string {
 	idx := 0
-	for i := 0; i < n; i++ {
+	for range n {
 		pos := strings.IndexByte(s[idx:], '\n')
 		if pos < 0 {
 			return s

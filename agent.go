@@ -68,6 +68,10 @@ func (a *Agent) SetMessages(history []Message) error {
 // stops the run, as one Emit returns does, and later subscribers do not
 // receive the event: storing messages on MessageEnd keeps them out of the
 // history when that fails. Every subscriber receives the RunEnd.
+//
+// An event takes effect on the history only once every subscriber took it,
+// so Messages, called by a subscriber, does not yet include the message of
+// the MessageEnd it is handling.
 func (a *Agent) Subscribe(fn func(Event) error) (unsubscribe func()) {
 	s := &subscriber{fn}
 	a.mu.Lock()
