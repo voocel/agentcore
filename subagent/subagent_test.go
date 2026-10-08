@@ -63,9 +63,12 @@ func TestSingle(t *testing.T) {
 	if err != nil || text(res) != "found it" {
 		t.Fatalf("result %q, err %v", text(res), err)
 	}
-	want := Spawn{Agent: "explore", ID: "explore#1", Mode: ModeSingle, Model: "fast"}
-	if len(spawns) != 1 || spawns[0] != want {
+	if len(spawns) != 1 || !strings.HasPrefix(spawns[0].ID, "explore#") {
 		t.Fatalf("spawns = %+v", spawns)
+	}
+	want := Spawn{Agent: "explore", ID: spawns[0].ID, Mode: ModeSingle, Model: "fast"}
+	if spawns[0] != want {
+		t.Fatalf("spawn = %+v, want %+v", spawns[0], want)
 	}
 	if got := (agentcore.Message{Blocks: p.Requests()[0].Messages[0].Blocks}).Text(); got != "find the bug" {
 		t.Fatalf("the agent got %q", got)
@@ -260,8 +263,12 @@ func TestParallelOrderAndLimit(t *testing.T) {
 	if _, err := call(t, context.Background(), tool, `{"tasks":[`+strings.Join(tasks, ",")+`]}`); err != nil {
 		t.Fatal(err)
 	}
+	var first int
+	if _, err := fmt.Sscanf(spawns[0].ID, "a#%d", &first); err != nil {
+		t.Fatal(err)
+	}
 	for i, s := range spawns {
-		if want := fmt.Sprintf("a#%d", i+1); s.ID != want {
+		if want := fmt.Sprintf("a#%d", first+i); s.ID != want {
 			t.Fatalf("spawn %d is %s, want %s", i, s.ID, want)
 		}
 	}
@@ -311,6 +318,20 @@ func TestBackground(t *testing.T) {
 	var last agentcore.Message
 	if len(lines) != 2 || json.Unmarshal([]byte(lines[1]), &last) != nil || last.Text() != "report" {
 		t.Fatalf("output = %q", data)
+	}
+}
+
+// A tool built again, as when the agents reload, goes on numbering its runs.
+func TestRunIDsStayApartAcrossTools(t *testing.T) {
+	var spawns []Spawn
+	p := litellmtest.New(litellmtest.Text("a"), litellmtest.Text("b"))
+	for range 2 {
+		if _, err := call(t, context.Background(), New(nil, agent(t, "explore", p, &spawns)), `{"agent":"explore","task":"look"}`); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if len(spawns) != 2 || spawns[0].ID == spawns[1].ID {
+		t.Fatalf("spawns = %+v", spawns)
 	}
 }
 

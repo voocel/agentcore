@@ -48,7 +48,7 @@ type Agent struct {
 // Spawn is a run of an agent.
 type Spawn struct {
 	Agent string
-	// ID tells the run from the tool's other runs, as "explore#3".
+	// ID tells the run from every other run in the process, as "explore#3".
 	ID   string
 	Mode Mode
 	// Model is the model the call asked for, or "" for the agent's own.
@@ -92,8 +92,11 @@ type delegator struct {
 	agents map[string]Agent
 	names  []string
 	tasks  *task.Runtime
-	seq    atomic.Int64
 }
+
+// spawned numbers the runs of the process, so a tool built again, as when
+// the agents reload, never repeats an ID.
+var spawned atomic.Int64
 
 // New returns the subagent tool, which delegates to agents. With tasks, the
 // model may also run an agent in the background, as a task of tasks.
@@ -318,7 +321,7 @@ func (d *delegator) prepare(ctx context.Context, agent, model string, mode Mode)
 	if depth > MaxDepth {
 		return nil, fmt.Errorf("agent nesting depth %d exceeds the maximum of %d", depth, MaxDepth)
 	}
-	s := Spawn{Agent: agent, ID: fmt.Sprintf("%s#%d", agent, d.seq.Add(1)), Mode: mode, Model: model}
+	s := Spawn{Agent: agent, ID: fmt.Sprintf("%s#%d", agent, spawned.Add(1)), Mode: mode, Model: model}
 	cfg, err := a.Config(s)
 	if err != nil {
 		return nil, err
