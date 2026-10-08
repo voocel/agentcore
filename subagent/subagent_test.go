@@ -302,8 +302,8 @@ func TestBackground(t *testing.T) {
 	if note.Kind != task.KindNotification || !strings.Contains(note.Text(), "<result>report</result>") {
 		t.Fatalf("notification = %q", note.Text())
 	}
-	if spawns[0].Mode != ModeBackground {
-		t.Fatalf("spawn = %+v", spawns[0])
+	if spawns[0].Mode != ModeBackground || e.Run != spawns[0].ID {
+		t.Fatalf("spawn = %+v, entry run %q", spawns[0], e.Run)
 	}
 	// The output is the run's messages, one JSON line each.
 	data, _ := os.ReadFile(e.OutputFile)

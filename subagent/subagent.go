@@ -268,7 +268,7 @@ func (d *delegator) background(ctx context.Context, p params) (agentcore.Result,
 	if description == "" {
 		description = truncate(p.Task, 80)
 	}
-	e, err := d.tasks.Start(ctx, task.Entry{Type: task.TypeSubAgent, Agent: p.Agent, Prompt: p.Task, Description: description},
+	e, err := d.tasks.Start(ctx, task.Entry{Type: task.TypeSubAgent, Agent: p.Agent, Run: r.ID, Prompt: p.Task, Description: description},
 		func(ctx context.Context, t *task.Task) error {
 			output, err := runTask(ctx, t, r, p.Task)
 			t.Update(func(e *task.Entry) { e.Result = output })

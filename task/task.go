@@ -66,6 +66,7 @@ type Entry struct {
 
 	// A sub-agent.
 	Agent     string
+	Run       string // the run's Spawn.ID, as "explore#3"
 	Prompt    string
 	Result    string // the agent's last response
 	ToolCount int
