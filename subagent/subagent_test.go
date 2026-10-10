@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"github.com/voocel/agentcore"
+	"github.com/voocel/agentcore/schema"
 	"github.com/voocel/agentcore/task"
 	"github.com/voocel/litellm"
 	"github.com/voocel/litellm/litellmtest"
@@ -79,6 +80,57 @@ func TestSingle(t *testing.T) {
 	}
 	if _, ok := progress[len(progress)-1].Event.(agentcore.RunEnd); !ok {
 		t.Fatalf("last progress = %#v", progress[len(progress)-1].Event)
+	}
+}
+
+// WrapRun wraps each run: the run works in the context it returns, and its
+// end learns the run's output and error.
+func TestWrapRun(t *testing.T) {
+	type key struct{}
+	type ended struct {
+		spawn          Spawn
+		prompt, output string
+		err            error
+	}
+	var (
+		mu     sync.Mutex
+		got    []ended
+		inside []any // what the runs' tool calls found in their context
+	)
+	look := agentcore.NewTool("look", "Look around", schema.Object(), func(ctx context.Context, _ struct{}) (agentcore.Result, error) {
+		mu.Lock()
+		defer mu.Unlock()
+		inside = append(inside, ctx.Value(key{}))
+		return agentcore.TextResult("seen"), nil
+	})
+	m := model(t, litellmtest.New(
+		litellmtest.Respond(litellm.ToolUseBlock{ID: "l1", Name: "look", Arguments: "{}"}), litellmtest.Text("found it"),
+		litellmtest.Text("and this"),
+	))
+	tool := New(nil, Agent{
+		Name: "explore",
+		Config: func(Spawn) (agentcore.Config, error) {
+			return agentcore.Config{Model: m, Tools: []agentcore.Tool{look}}, nil
+		},
+		WrapRun: func(ctx context.Context, s Spawn, prompt string) (context.Context, func(string, error)) {
+			return context.WithValue(ctx, key{}, s.ID), func(output string, err error) {
+				mu.Lock()
+				defer mu.Unlock()
+				got = append(got, ended{s, prompt, output, err})
+			}
+		},
+	})
+	if _, err := call(t, context.Background(), tool, `{"chain":[{"agent":"explore","task":"find it"},{"agent":"explore","task":"then {previous}"}]}`); err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 2 || got[0].prompt != "find it" || got[0].output != "found it" || got[1].prompt != "then found it" || got[1].output != "and this" || got[0].err != nil {
+		t.Fatalf("ended %+v", got)
+	}
+	if got[0].spawn.Agent != "explore" || got[0].spawn.Mode != ModeChain || got[0].spawn.ID == got[1].spawn.ID {
+		t.Fatalf("spawns %+v %+v", got[0].spawn, got[1].spawn)
+	}
+	if len(inside) != 1 || inside[0] != got[0].spawn.ID {
+		t.Fatalf("the run's tool call found %v in its context, want %s", inside, got[0].spawn.ID)
 	}
 }
 

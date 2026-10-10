@@ -43,6 +43,10 @@ type Agent struct {
 	// it as Progress. The runs of a parallel call work at once: the Emits
 	// of their Configs are called concurrently.
 	Config func(Spawn) (agentcore.Config, error)
+	// WrapRun, if set, wraps each run of the agent, as tracing does: it
+	// returns the context the run works in, and a callback for the text of
+	// the run's last response and its error.
+	WrapRun func(ctx context.Context, s Spawn, prompt string) (context.Context, func(output string, err error))
 }
 
 // Spawn is a run of an agent.
@@ -307,6 +311,7 @@ func runTask(ctx context.Context, t *task.Task, r *run, prompt string) (string, 
 type run struct {
 	Spawn
 	cfg   agentcore.Config
+	wrap  func(context.Context, Spawn, string) (context.Context, func(string, error))
 	depth int
 }
 
@@ -326,13 +331,18 @@ func (d *delegator) prepare(ctx context.Context, agent, model string, mode Mode)
 	if err != nil {
 		return nil, err
 	}
-	return &run{Spawn: s, cfg: cfg, depth: depth}, nil
+	return &run{Spawn: s, cfg: cfg, wrap: a.WrapRun, depth: depth}, nil
 }
 
 // execute runs r on prompt and returns its last response's text, also when
 // the run failed. The run's events go to its Emit, then to observe; an
 // error from either stops it.
-func (r *run) execute(ctx context.Context, prompt string, observe func(agentcore.Event) error) (string, error) {
+func (r *run) execute(ctx context.Context, prompt string, observe func(agentcore.Event) error) (output string, err error) {
+	if r.wrap != nil {
+		var end func(string, error)
+		ctx, end = r.wrap(ctx, r.Spawn, prompt)
+		defer func() { end(output, err) }()
+	}
 	cfg := r.cfg
 	emit := cfg.Emit
 	cfg.Emit = func(ev agentcore.Event) error {
