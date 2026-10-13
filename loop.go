@@ -346,7 +346,9 @@ func (r *run) respond() (Message, map[string]string, error) {
 	for attempt := 1; ; attempt++ {
 		msg, started, err := r.call()
 		if err == nil && msg.Stop == StopError {
-			err = errors.New("agentcore: the model ended its response with an error")
+			// Mostly one that passes, as an overloaded server or a tool call
+			// the model malformed.
+			err = &litellm.Error{Type: litellm.ErrorTypeProvider, Provider: msg.Provider, Message: "the model ended its response with an error", Temporary: true}
 		}
 		if err == nil {
 			bad := invalidArgs(&msg)

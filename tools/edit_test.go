@@ -365,6 +365,59 @@ func TestEditRefusesGuesses(t *testing.T) {
 	}
 }
 
+// An edit changes only the bytes it matched: line endings elsewhere, a lone
+// CR or mixed ones included, stay, and new lines take the ending of the line
+// they replace.
+func TestEditKeepsTheRestOfTheFile(t *testing.T) {
+	cases := []struct {
+		name, content, old, new, want string
+	}{
+		{"lone CR", "log = \"x\ry\"\nb = 1\n", "b = 1", "b = 2", "log = \"x\ry\"\nb = 2\n"},
+		{"mixed endings", "one\r\ntwo\nthree\n", "three", "3a\n3b", "one\r\ntwo\n3a\n3b\n"},
+		{"CRLF lines", "a\r\nb\r\nc\r\n", "a\nb\n", "a\nx\nb\n", "a\r\nx\r\nb\r\nc\r\n"},
+		{"CRLF last line", "a\r\nb", "b", "b\nc", "a\r\nb\r\nc"},
+		{"fuzzy over CRLF", "if x {   \r\n\ty()\r\n}\r\n", "if x {\n\ty()", "if x {\n\tz()", "if x {\r\n\tz()\r\n}\r\n"},
+		{"not UTF-8 elsewhere", "caf\xe9 = 1\nx = 2\n", "x = 2", "x = 3", "caf\xe9 = 1\nx = 3\n"},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			dir := t.TempDir()
+			path := filepath.Join(dir, "f.txt")
+			if err := os.WriteFile(path, []byte(c.content), 0o644); err != nil {
+				t.Fatal(err)
+			}
+			args := mustJSON(t, editArgs{FilePath: "f.txt", OldString: c.old, NewString: c.new})
+			if _, err := (Workspace{Dir: dir}).Edit().Run(context.Background(), args); err != nil {
+				t.Fatal(err)
+			}
+			if got, _ := os.ReadFile(path); string(got) != c.want {
+				t.Fatalf("file = %q, want %q", got, c.want)
+			}
+		})
+	}
+}
+
+// Bytes that are not UTF-8 reach the model as U+FFFD, which must not match
+// them: the edit would write U+FFFD in their place.
+func TestEditLeavesBytesThatAreNotUTF8(t *testing.T) {
+	for _, content := range []string{"caf\xe9 = 1\n", "\xd6\xd0\xce\xc4  \n"} {
+		dir := t.TempDir()
+		path := filepath.Join(dir, "f.txt")
+		if err := os.WriteFile(path, []byte(content), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		shown := strings.ToValidUTF8(strings.TrimSpace(content), "\uFFFD")
+		args := mustJSON(t, editArgs{FilePath: "f.txt", OldString: shown, NewString: "x"})
+		_, err := (Workspace{Dir: dir}).Edit().Run(context.Background(), args)
+		if err == nil || !strings.Contains(err.Error(), "not UTF-8") {
+			t.Fatalf("err = %v", err)
+		}
+		if got, _ := os.ReadFile(path); string(got) != content {
+			t.Fatalf("file changed to %q", got)
+		}
+	}
+}
+
 func TestGenerateDiff(t *testing.T) {
 	cases := []struct{ name, old, new, want string }{
 		{"change", "a\nb\nc\n", "a\nX\nc\n", " 1 a\n-2 b\n+2 X\n 3 c\n"},

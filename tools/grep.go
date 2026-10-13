@@ -99,8 +99,9 @@ func (t *grepTool) execute(ctx context.Context, args json.RawMessage) (string, e
 // Kills the process once the match limit is reached.
 func (t *grepTool) grepWithRg(ctx context.Context, rgPath string, a grepArgs, searchPath string) (string, error) {
 	// rg cuts a line longer than rgMaxColumns, so that no output line
-	// outgrows the scanner's buffer.
-	cmdArgs := []string{"--line-number", "--no-heading", "--color", "never", "--max-columns", strconv.Itoa(rgMaxColumns), "--max-columns-preview"}
+	// outgrows the scanner's buffer. Lines name their file even when one is
+	// searched, which tells a match from a context line.
+	cmdArgs := []string{"--line-number", "--with-filename", "--no-heading", "--color", "never", "--max-columns", strconv.Itoa(rgMaxColumns), "--max-columns-preview"}
 
 	if a.IgnoreCase {
 		cmdArgs = append(cmdArgs, "--ignore-case")

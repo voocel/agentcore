@@ -4,9 +4,11 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"io/fs"
 	"os"
 	"path"
 	"path/filepath"
+	"slices"
 	"sort"
 	"strings"
 
@@ -21,7 +23,7 @@ func (w Workspace) Ls() agentcore.Tool {
 	return agentcore.Tool{
 		Name:        "ls",
 		Label:       "List Directory",
-		Description: "List directory contents as a tree. Use this for quick directory structure checks before reading files. Depth controls recursive listing (default 1, max 5). Use ignore to hide generated or irrelevant paths. Common generated directories (node_modules, .git, dist, build, etc.) are hidden by default.",
+		Description: "List directory contents as a tree. Use this for quick directory structure checks before reading files. Depth controls recursive listing (default 1, max 5). Use ignore to hide generated or irrelevant paths. Dependency and VCS directories (node_modules, .git, etc.) are hidden, and the contents of common generated ones (dist, build, cache, etc.) are not listed unless you list them.",
 		Schema: schema.Object(
 			schema.Property("path", schema.String("Directory path, relative or absolute (default: working directory)")),
 			schema.Property("depth", schema.Int("Recursion depth (default: 1, max: 5)")),
@@ -48,27 +50,12 @@ type ignoreMatcher struct {
 
 const lsDefaultLimit = 500
 
-// lsDefaultIgnorePatterns are hidden, as are skipDirs.
-var lsDefaultIgnorePatterns = []string{
-	"dist/",
-	"build/",
-	"target/",
-	"vendor/",
-	"bin/",
-	"obj/",
-	".idea/",
-	".vscode/",
-	".cache/",
-	"cache/",
-	"tmp/",
-	"temp/",
-	".coverage",
-	"coverage/",
-	"logs/",
-	"env/",
-	"venv/",
-	".zig-cache/",
-	"zig-out/",
+// lsCollapsed are directories that most often hold what a build or a tool
+// made: a listing names them without their contents. A project's own may
+// share a name, so they are not hidden, as skipDirs are.
+var lsCollapsed = []string{
+	"dist", "build", "target", "vendor", "bin", "obj", ".idea", ".vscode", ".cache", "cache",
+	"tmp", "temp", "coverage", "logs", "env", "venv", ".zig-cache", "zig-out",
 }
 
 func (t *lsTool) execute(ctx context.Context, args json.RawMessage) (string, error) {
@@ -78,33 +65,17 @@ func (t *lsTool) execute(ctx context.Context, args json.RawMessage) (string, err
 	}
 
 	dir := ResolvePath(t.w.dir(ctx), a.Path)
-
-	depth := a.Depth
-	if depth <= 0 {
-		depth = 1
-	}
-	if depth > 5 {
-		depth = 5
-	}
-
-	maxEntries := lsDefaultLimit
-
-	matcher := newIgnoreMatcher(append(append([]string{}, lsDefaultIgnorePatterns...), a.Ignore...))
-	var sb strings.Builder
-	count := 0
-	truncated := false
-
-	if err := renderTree(ctx, dir, dir, 0, depth, maxEntries, matcher, &count, &truncated, "", &sb); err != nil {
+	l := &lister{root: dir, depth: min(max(a.Depth, 1), 5), ignore: newIgnoreMatcher(a.Ignore)}
+	if err := l.render(ctx, dir, 0, ""); err != nil {
 		return "", fmt.Errorf("ls %s: %w", dir, err)
 	}
-
-	if count == 0 {
+	if l.count == 0 {
 		return "(empty directory)", nil
 	}
 
-	result := strings.TrimRight(dir, string(filepath.Separator)) + "/\n" + strings.TrimRight(sb.String(), "\n")
-	if truncated {
-		result += fmt.Sprintf("\n\n[Listing truncated at %d entries. List a subdirectory, a smaller depth, or ignore more.]", maxEntries)
+	result := strings.TrimRight(dir, string(filepath.Separator)) + "/\n" + strings.TrimRight(l.sb.String(), "\n")
+	if l.truncated {
+		result += fmt.Sprintf("\n\n[Listing truncated at %d entries. List a subdirectory, a smaller depth, or ignore more.]", lsDefaultLimit)
 	}
 
 	tr := truncateHead(result, defaultMaxLines, defaultMaxBytes)
@@ -144,74 +115,82 @@ func (m ignoreMatcher) Match(rel string) bool {
 	return false
 }
 
-func renderTree(ctx context.Context, root, dir string, current, maxDepth, maxEntries int, matcher ignoreMatcher, count *int, truncated *bool, prefix string, sb *strings.Builder) error {
-	if current >= maxDepth || *truncated {
-		return nil
-	}
+// lister writes the tree of root, to depth levels and lsDefaultLimit
+// entries.
+type lister struct {
+	root      string
+	depth     int
+	ignore    ignoreMatcher // what the call asked to hide
+	count     int
+	truncated bool
+	sb        strings.Builder
+}
+
+func (l *lister) render(ctx context.Context, dir string, level int, prefix string) error {
 	if ctx.Err() != nil {
 		return ctx.Err()
 	}
-
 	dirEntries, err := os.ReadDir(dir)
 	if err != nil {
 		return err
 	}
-
 	sort.Slice(dirEntries, func(i, j int) bool {
 		return strings.ToLower(dirEntries[i].Name()) < strings.ToLower(dirEntries[j].Name())
 	})
 
-	// Collect visible entries first to determine last-child connector.
-	type visibleEntry struct {
-		entry os.DirEntry
-		path  string
-	}
-	var visible []visibleEntry
+	var visible []os.DirEntry
 	for _, e := range dirEntries {
-		name := e.Name()
 		// Files of skipDirs' names too, such as the .git file of a worktree.
-		if IsSkipDir(name) {
+		if IsSkipDir(e.Name()) {
 			continue
 		}
-		childPath := filepath.Join(dir, name)
-		rel, _ := filepath.Rel(root, childPath)
-		if matcher.Match(filepath.ToSlash(rel)) {
-			continue
+		rel, _ := filepath.Rel(l.root, filepath.Join(dir, e.Name()))
+		if !l.ignore.Match(filepath.ToSlash(rel)) {
+			visible = append(visible, e)
 		}
-		visible = append(visible, visibleEntry{entry: e, path: childPath})
 	}
 
-	for i, ve := range visible {
-		if *count >= maxEntries {
-			*truncated = true
+	for i, e := range visible {
+		if l.count >= lsDefaultLimit {
+			l.truncated = true
 			return nil
 		}
-
-		info, err := ve.entry.Info()
+		info, err := e.Info()
 		if err != nil {
 			continue
 		}
+		l.count++
 
-		*count++
-		name := ve.entry.Name()
-		isDir := ve.entry.IsDir()
-		isLast := i == len(visible)-1
-
-		connector := "├── "
-		childPrefix := prefix + "│   "
-		if isLast {
-			connector = "└── "
-			childPrefix = prefix + "    "
+		connector, childPrefix := "├── ", prefix+"│   "
+		if i == len(visible)-1 {
+			connector, childPrefix = "└── ", prefix+"    "
 		}
-
-		if isDir {
-			sb.WriteString(prefix + connector + name + "/\n")
-			if err := renderTree(ctx, root, ve.path, current+1, maxDepth, maxEntries, matcher, count, truncated, childPrefix, sb); err != nil {
-				return err
+		name := e.Name()
+		switch {
+		case !e.IsDir():
+			l.sb.WriteString(prefix + connector + name + "  " + formatSize(int(info.Size())) + "\n")
+		case slices.Contains(lsCollapsed, name):
+			l.sb.WriteString(prefix + connector + name + "/  (contents not listed)\n")
+		default:
+			l.sb.WriteString(prefix + connector + name + "/\n")
+			if level+1 == l.depth {
+				continue
 			}
-		} else {
-			sb.WriteString(prefix + connector + name + "  " + formatSize(int(info.Size())) + "\n")
+			if err := l.render(ctx, filepath.Join(dir, name), level+1, childPrefix); err != nil {
+				if ctx.Err() != nil {
+					return err
+				}
+				l.sb.WriteString(childPrefix + "(cannot list: " + errText(err) + ")\n")
+			}
 		}
 	}
 	return nil
+}
+
+// errText is err without the path a filesystem error repeats.
+func errText(err error) string {
+	if pe, ok := err.(*fs.PathError); ok {
+		return pe.Err.Error()
+	}
+	return err.Error()
 }

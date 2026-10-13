@@ -3,6 +3,7 @@
 package tools
 
 import (
+	"fmt"
 	"os/exec"
 	"syscall"
 )
@@ -16,4 +17,13 @@ func configureProcGroup(cmd *exec.Cmd) {
 	cmd.Cancel = func() error {
 		return syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL)
 	}
+}
+
+func resolveShell() (string, []string, error) {
+	for _, name := range []string{"bash", "sh"} {
+		if p, err := exec.LookPath(name); err == nil {
+			return p, []string{"-c"}, nil
+		}
+	}
+	return "", nil, fmt.Errorf("no shell found: tried bash and sh")
 }

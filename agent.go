@@ -141,6 +141,9 @@ func (a *Agent) Compact(ctx context.Context) error {
 	if cfg.Compactor == nil {
 		return ErrNoCompactor
 	}
+	if err := cfg.Validate(); err != nil {
+		return err
+	}
 	ctx, cancel := context.WithCancelCause(ctx)
 	defer cancel(nil)
 	_, err = newRun(ctx, cancel, cfg, history).compact()
@@ -155,9 +158,6 @@ func (a *Agent) start() (Config, []Message, error) {
 	defer a.mu.Unlock()
 	if a.running {
 		return Config{}, nil, ErrBusy
-	}
-	if err := a.cfg.Validate(); err != nil {
-		return Config{}, nil, err
 	}
 	a.running = true
 	cfg := a.cfg

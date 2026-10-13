@@ -36,6 +36,30 @@ func TestAgentPrompt(t *testing.T) {
 	}
 }
 
+// A Config a run cannot use ends the run with its error, as any failure
+// does, so subscribers learn of it; the prompts never enter the history.
+func TestAgentPromptWithABadConfig(t *testing.T) {
+	p := litellmtest.New(litellmtest.Text("never"))
+	a := NewAgent(Config{Model: testModel(t, p), Tools: []Tool{echoTool(), echoTool()}}, nil)
+	var end *RunEnd
+	a.Subscribe(func(ev Event) error {
+		if e, ok := ev.(RunEnd); ok {
+			end = &e
+		}
+		return nil
+	})
+	err := a.Prompt(context.Background(), UserText("go"))
+	if err == nil || end == nil || end.Err != err || end.Reason != EndError {
+		t.Fatalf("err %v, run end %+v", err, end)
+	}
+	if len(a.Messages()) != 0 || len(p.Requests()) != 0 {
+		t.Fatalf("history %v, requests %d", roles(a.Messages()), len(p.Requests()))
+	}
+	if err := a.Prompt(context.Background(), UserText("again")); err == nil || errors.Is(err, ErrBusy) {
+		t.Fatalf("the failed run left the agent busy: %v", err)
+	}
+}
+
 // While a run is under way, a prompt is refused, steering reaches its next
 // call, and a follow-up comes when it would stop; cancelling its context
 // ends it.

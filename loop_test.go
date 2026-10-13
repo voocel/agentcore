@@ -448,6 +448,17 @@ func TestRunCancelledLeavesQueues(t *testing.T) {
 	}
 }
 
+// A response the vendor ended with an error is retried as a temporary
+// failure is.
+func TestRunRetriesAVendorError(t *testing.T) {
+	p := litellmtest.New(litellmtest.Reply{Blocks: []litellm.Block{litellm.Text("par")}, FinishReason: litellm.FinishReasonError}, litellmtest.Text("whole"))
+	policy := retry.Policy{MaxAttempts: 2, InitialDelay: time.Millisecond, MaxDelay: time.Millisecond, Multiplier: 1}
+	history, err := Run(context.Background(), Config{Model: testModel(t, p), Retry: policy}, nil, UserText("go"))
+	if err != nil || len(history) != 2 || history[1].Text() != "whole" {
+		t.Fatalf("err = %v, history %#v", err, history)
+	}
+}
+
 // A server asking for a longer wait than MaxRetryAfter ends retrying.
 func TestRunRetryAfterBeyondPolicy(t *testing.T) {
 	limited := litellm.NewError("test", litellm.ErrorTypeRateLimit, "slow down", nil)

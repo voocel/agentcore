@@ -362,16 +362,6 @@ func command(ctx context.Context, shell string, argv []string, dir string) *exec
 	return cmd
 }
 
-func resolveShell() (string, []string, error) {
-	if p, err := exec.LookPath("bash"); err == nil {
-		return p, []string{"-c"}, nil
-	}
-	if p, err := exec.LookPath("sh"); err == nil {
-		return p, []string{"-c"}, nil
-	}
-	return "", nil, fmt.Errorf("no shell found: tried bash and sh")
-}
-
 // truncate shortens s to n runes, marking the cut with "...".
 func truncate(s string, n int) string {
 	runes := []rune(s)

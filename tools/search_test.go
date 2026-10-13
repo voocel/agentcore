@@ -2,6 +2,7 @@ package tools
 
 import (
 	"os"
+	"os/exec"
 	"path/filepath"
 	"runtime"
 	"strings"
@@ -38,6 +39,23 @@ func TestGrepOptions(t *testing.T) {
 	got, err := run(t, Workspace{Dir: dir}.Grep(), map[string]any{"pattern": "hello", "ignore_case": true, "glob": "*.go", "context_lines": 1})
 	if err != nil || !strings.Contains(got, "main.go:2:// Hello") || !strings.Contains(got, "main.go-1-package main") || strings.Contains(got, ".git") {
 		t.Fatalf("grep = %q, %v", got, err)
+	}
+}
+
+// The limit holds for a single file searched with context, whose lines rg
+// would otherwise print without its name.
+func TestGrepLimitsOneFileWithContext(t *testing.T) {
+	if _, err := exec.LookPath("rg"); err != nil {
+		t.Skip("rg is not installed")
+	}
+	dir := t.TempDir()
+	path := filepath.Join(dir, "big.txt")
+	if err := os.WriteFile(path, []byte(strings.Repeat("hit\nmiss\n", 300)), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	got, err := run(t, Workspace{Dir: dir}.Grep(), map[string]any{"pattern": "hit", "path": path, "context_lines": 1, "limit": 5})
+	if n := strings.Count(got, ":hit"); err != nil || n != 5 {
+		t.Fatalf("%d matches in %q, %v", n, got, err)
 	}
 }
 

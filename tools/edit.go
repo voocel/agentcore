@@ -11,16 +11,17 @@ import (
 	"strconv"
 	"strings"
 	"unicode"
+	"unicode/utf8"
 
 	"github.com/voocel/agentcore"
 	"github.com/voocel/agentcore/schema"
 )
 
-// Edit returns the edit tool: it replaces exact strings in a file,
-// normalizing line endings and matching fuzzily. Its result is a line naming
-// the file over the diff of the edit; its Check returns the diff as the
-// call's preview. With Files, its Check and Run refuse a file the model has
-// not read, or that changed since.
+// Edit returns the edit tool: it replaces exact strings in a file, taking
+// CRLF for LF and matching fuzzily, and changes no byte outside them. Its
+// result is a line naming the file over the diff of the edit; its Check
+// returns the diff as the call's preview. With Files, its Check and Run
+// refuse a file the model has not read, or that changed since.
 func (w Workspace) Edit() agentcore.Tool {
 	t := &editTool{w: w, fs: w.fs()}
 	return agentcore.Tool{
@@ -66,10 +67,11 @@ type editArgs struct {
 
 // editResult is an edit worked out, before it is written.
 type editResult struct {
-	path       string
-	bom        string
-	ending     string // original line ending
-	oldContent string // normalized-to-LF content before edit
+	path   string
+	bom    string
+	edited string // the file's content after the edit, without the BOM
+	// The content before and after, CRLF as LF, for the diff.
+	oldContent string
 	newContent string
 }
 
@@ -132,18 +134,21 @@ func (t *editTool) parseAndMatch(ctx context.Context, args json.RawMessage) (*ed
 	}
 
 	bom, raw := stripBOM(string(data))
-	originalEnding := detectLineEnding(raw)
-	content := normalizeToLF(raw)
-	oldText := normalizeToLF(a.OldString)
-	newText := normalizeToLF(a.NewString)
+	content, crlf := lfView(raw)
+	oldText := strings.ReplaceAll(a.OldString, "\r\n", "\n")
+	newText := strings.ReplaceAll(a.NewString, "\r\n", "\n")
 
 	matches, reindent := findMatches(content, oldText)
 	switch {
 	case len(matches) == 0:
-		if hints := formatEditCandidates(content, oldText); hints != "" {
-			return nil, fmt.Errorf("could not find the exact text in %s. The old text must match exactly including all whitespace and newlines.\n\nPossible old_string candidates (copy one exactly):\n%s", a.FilePath, hints)
+		msg := fmt.Sprintf("could not find the exact text in %s. The old text must match exactly including all whitespace and newlines", a.FilePath)
+		if !utf8.ValidString(content) {
+			msg += ". The file is not UTF-8: text read shows as \uFFFD cannot be replaced"
 		}
-		return nil, fmt.Errorf("could not find the exact text in %s. The old text must match exactly including all whitespace and newlines", a.FilePath)
+		if hints := formatEditCandidates(content, oldText); hints != "" {
+			msg += ".\n\nPossible old_string candidates (copy one exactly):\n" + hints
+		}
+		return nil, errors.New(msg)
 	case len(matches) > 1 && !a.ReplaceAll:
 		return nil, fmt.Errorf("found %d occurrences of the text in %s. Use replace_all=true to replace all, or provide more context to make the match unique", len(matches), a.FilePath)
 	}
@@ -155,20 +160,25 @@ func (t *editTool) parseAndMatch(ctx context.Context, args json.RawMessage) (*ed
 		if reindent {
 			replacement = reindentReplacement(newText, oldText, content[m.start:m.end])
 		}
-		b.WriteString(content[end:m.start])
+		start := rawOffset(crlf, m.start)
+		if ending := lineEnding(raw, start); ending != "\n" {
+			replacement = strings.ReplaceAll(replacement, "\n", ending)
+		}
+		b.WriteString(raw[end:start])
 		b.WriteString(replacement)
-		end = m.end
+		end = rawOffset(crlf, m.end)
 	}
-	b.WriteString(content[end:])
-	newContent := b.String()
-	if newContent == content {
+	b.WriteString(raw[end:])
+	edited := b.String()
+	if edited == raw {
 		return nil, fmt.Errorf("old_string and new_string are identical in %s. Provide a new_string that is different from the matched text", a.FilePath)
 	}
 
+	newContent, _ := lfView(edited)
 	return &editResult{
 		path:       a.FilePath,
 		bom:        bom,
-		ending:     originalEnding,
+		edited:     edited,
 		oldContent: content,
 		newContent: newContent,
 	}, nil
@@ -196,39 +206,55 @@ func (t *editTool) execute(ctx context.Context, args json.RawMessage) (agentcore
 	if err := ctx.Err(); err != nil {
 		return agentcore.Result{}, err
 	}
-	finalContent := r.bom + restoreLineEndings(r.newContent, r.ending)
-	if err := t.fs.WriteFile(ctx, r.path, []byte(finalContent), 0o644); err != nil {
+	if err := t.fs.WriteFile(ctx, r.path, []byte(r.bom+r.edited), 0o644); err != nil {
 		return agentcore.Result{}, fmt.Errorf("write %s: %w", r.path, err)
 	}
 	t.w.Files.recordWrite(ctx, t.fs, r.path, false)
 	return agentcore.TextResult(fmt.Sprintf("Edited %s.\n%s", r.path, generateDiff(r.oldContent, r.newContent))), nil
 }
 
-// --- Line ending utilities ---
+// --- Line endings ---
 
-func detectLineEnding(content string) string {
-	crlfIdx := strings.Index(content, "\r\n")
-	lfIdx := strings.Index(content, "\n")
-	if lfIdx == -1 || crlfIdx == -1 {
+// lfView returns s with each CRLF as LF, as the matchers see it, and the
+// offsets in it of those LFs.
+func lfView(s string) (view string, crlf []int) {
+	if !strings.Contains(s, "\r\n") {
+		return s, nil
+	}
+	var b strings.Builder
+	b.Grow(len(s))
+	for {
+		i := strings.Index(s, "\r\n")
+		if i < 0 {
+			b.WriteString(s)
+			return b.String(), crlf
+		}
+		b.WriteString(s[:i])
+		crlf = append(crlf, b.Len())
+		b.WriteByte('\n')
+		s = s[i+2:]
+	}
+}
+
+// rawOffset maps offset p of the view lfView returned to its string.
+func rawOffset(crlf []int, p int) int {
+	n, _ := slices.BinarySearch(crlf, p)
+	return p + n
+}
+
+// lineEnding returns the line ending at s[at:]: that of the line it is on,
+// or of the line before for a last line without one.
+func lineEnding(s string, at int) string {
+	i := strings.IndexByte(s[at:], '\n')
+	if i >= 0 {
+		i += at
+	} else if i = strings.LastIndexByte(s[:at], '\n'); i < 0 {
 		return "\n"
 	}
-	if crlfIdx < lfIdx {
+	if i > 0 && s[i-1] == '\r' {
 		return "\r\n"
 	}
 	return "\n"
-}
-
-func normalizeToLF(text string) string {
-	text = strings.ReplaceAll(text, "\r\n", "\n")
-	text = strings.ReplaceAll(text, "\r", "\n")
-	return text
-}
-
-func restoreLineEndings(text, ending string) string {
-	if ending == "\r\n" {
-		return strings.ReplaceAll(text, "\n", "\r\n")
-	}
-	return text
 }
 
 // --- BOM ---
@@ -270,6 +296,11 @@ type span struct{ start, end int }
 func findMatches(content, oldText string) (matches []span, reindent bool) {
 	if m := exactMatches(content, oldText); len(m) > 0 {
 		return m, false
+	}
+	// The model sees bytes that are not UTF-8 as U+FFFD, which the matchers
+	// below take for them, and would write U+FFFD back in their place.
+	if !utf8.ValidString(content) {
+		return nil, false
 	}
 	if m := fuzzyMatches(content, oldText); len(m) > 0 {
 		return m, false
@@ -476,6 +507,7 @@ const (
 	candidatePreviewLines      = 8
 	candidateSimilarityScale   = 100
 	minimumCandidateSimilarity = candidateSimilarityScale / 2
+	candidateBlocks            = 50 // blocks scored in full
 )
 
 func formatEditCandidates(content, oldText string) string {
@@ -530,7 +562,7 @@ func suggestEditCandidates(content, oldText string) []editCandidate {
 }
 
 func splitCandidateLines(text string) []string {
-	lines := strings.Split(normalizeToLF(text), "\n")
+	lines := strings.Split(text, "\n")
 	if len(lines) > 0 && lines[len(lines)-1] == "" {
 		lines = lines[:len(lines)-1]
 	}
@@ -554,23 +586,33 @@ func suggestSingleLineCandidates(contentLines []string, target string) []editCan
 	return topEditCandidates(out)
 }
 
+// suggestBlockCandidates scores only the blocks that start and end most like
+// the text: scoring every block of a large file takes seconds.
 func suggestBlockCandidates(contentLines, targetLines []string) []editCandidate {
 	windowSize := len(targetLines)
 	if windowSize > len(contentLines) {
 		return nil
 	}
 
-	var out []editCandidate
+	type window struct{ start, score int }
+	windows := make([]window, 0, len(contentLines)-windowSize+1)
 	for i := 0; i+windowSize <= len(contentLines); i++ {
-		window := contentLines[i : i+windowSize]
-		score := scoreCandidateBlock(window, targetLines)
+		score := scoreCandidateLine(contentLines[i], targetLines[0]) + scoreCandidateLine(contentLines[i+windowSize-1], targetLines[windowSize-1])
+		windows = append(windows, window{i, score})
+	}
+	slices.SortStableFunc(windows, func(a, b window) int { return cmp.Compare(b.score, a.score) })
+
+	var out []editCandidate
+	for _, w := range windows[:min(len(windows), candidateBlocks)] {
+		block := contentLines[w.start : w.start+windowSize]
+		score := scoreCandidateBlock(block, targetLines)
 		if score <= 0 {
 			continue
 		}
 		out = append(out, editCandidate{
-			startLine: i + 1,
-			endLine:   i + windowSize,
-			block:     strings.Join(window, "\n"),
+			startLine: w.start + 1,
+			endLine:   w.start + windowSize,
+			block:     strings.Join(block, "\n"),
 			score:     score,
 		})
 	}

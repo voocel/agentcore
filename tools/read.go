@@ -9,6 +9,7 @@ import (
 	"image"
 	"image/jpeg"
 	"image/png"
+	"io"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -134,6 +135,10 @@ func (t *readTool) parseArgs(ctx context.Context, args json.RawMessage) (resolve
 		}
 		return resolvedRead{}, fmt.Errorf("read %s: %w", p, err)
 	}
+	// A pipe or a device may never end, or never start.
+	if !info.IsDir && !info.Mode.IsRegular() {
+		return resolvedRead{}, fmt.Errorf("not a regular file: %s", p)
+	}
 
 	offset := a.Offset
 	if offset <= 0 {
@@ -186,9 +191,10 @@ func (t *readTool) readImage(ctx context.Context, path, mime string) ([]litellm.
 	}
 
 	note := fmt.Sprintf("Read image file [%s] (%s)", mime, formatSize(len(data)))
-
-	// Auto-resize large images to reduce token usage
-	resized, resMIME, resNote := resizeImage(data, mime)
+	resized, resMIME, resNote, err := resizeImage(data, mime)
+	if err != nil {
+		return nil, fmt.Errorf("read %s: %w", path, err)
+	}
 	if resNote != "" {
 		data = resized
 		mime = resMIME
@@ -201,40 +207,53 @@ func (t *readTool) readImage(ctx context.Context, path, mime string) ([]litellm.
 	}, nil
 }
 
-const imageMaxDim = 2000
+const (
+	imageMaxDim = 2000
+	// imageMaxBytes keeps an image within what providers take, 5MB in
+	// base64 for the strictest.
+	imageMaxBytes = 3 << 20
+	// imageMaxPixels bounds the memory decoding takes, four bytes a pixel.
+	imageMaxPixels = 50_000_000
+)
 
-// resizeImage downscales an image if either dimension exceeds imageMaxDim.
-// Returns original data unchanged if no resize is needed or on error.
-func resizeImage(data []byte, mime string) ([]byte, string, string) {
+// resizeImage downscales an image to fit imageMaxDim, and re-encodes one
+// larger than imageMaxBytes; note describes what it did, "" for nothing. An
+// image it cannot decode, or too large to, is an error: one a provider
+// refused would stay in the history, failing every request after it.
+func resizeImage(data []byte, mime string) (out []byte, outMIME, note string, err error) {
+	cfg, _, err := image.DecodeConfig(bytes.NewReader(data))
+	if err != nil {
+		return nil, "", "", fmt.Errorf("decode image: %w", err)
+	}
+	w, h := cfg.Width, cfg.Height
+	if w <= imageMaxDim && h <= imageMaxDim && len(data) <= imageMaxBytes {
+		return data, mime, "", nil
+	}
+	if w*h > imageMaxPixels {
+		return nil, "", "", fmt.Errorf("image of %dx%d is too large to read", w, h)
+	}
 	img, _, err := image.Decode(bytes.NewReader(data))
 	if err != nil {
-		return data, mime, ""
+		return nil, "", "", fmt.Errorf("decode image: %w", err)
 	}
 
-	bounds := img.Bounds()
-	w, h := bounds.Dx(), bounds.Dy()
-	if w <= imageMaxDim && h <= imageMaxDim {
-		return data, mime, ""
-	}
-
-	scale := float64(imageMaxDim) / float64(max(w, h))
-	newW := int(float64(w) * scale)
-	newH := int(float64(h) * scale)
-
+	scale := min(float64(imageMaxDim)/float64(max(w, h)), 1)
+	newW, newH := max(int(float64(w)*scale), 1), max(int(float64(h)*scale), 1)
 	dst := image.NewRGBA(image.Rect(0, 0, newW, newH))
-	draw.CatmullRom.Scale(dst, dst.Bounds(), img, bounds, draw.Over, nil)
+	draw.CatmullRom.Scale(dst, dst.Bounds(), img, img.Bounds(), draw.Over, nil)
 
-	var jpegBuf bytes.Buffer
+	var jpegBuf, pngBuf bytes.Buffer
 	if err := jpeg.Encode(&jpegBuf, dst, &jpeg.Options{Quality: 85}); err != nil {
-		return data, mime, ""
+		return nil, "", "", fmt.Errorf("encode image: %w", err)
 	}
-
-	var pngBuf bytes.Buffer
+	out, outMIME = jpegBuf.Bytes(), "image/jpeg"
 	if err := png.Encode(&pngBuf, dst); err == nil && pngBuf.Len() < jpegBuf.Len() {
-		return pngBuf.Bytes(), "image/png", fmt.Sprintf("[Resized %dx%d → %dx%d]", w, h, newW, newH)
+		out, outMIME = pngBuf.Bytes(), "image/png"
 	}
-
-	return jpegBuf.Bytes(), "image/jpeg", fmt.Sprintf("[Resized %dx%d → %dx%d]", w, h, newW, newH)
+	if len(out) > imageMaxBytes {
+		return nil, "", "", fmt.Errorf("image of %dx%d is too large to read, even resized", w, h)
+	}
+	return out, outMIME, fmt.Sprintf("[Resized %dx%d → %dx%d]", w, h, newW, newH), nil
 }
 
 func (t *readTool) readDirectory(ctx context.Context, a resolvedRead) (string, error) {
@@ -287,8 +306,7 @@ func (t *readTool) readTextFile(ctx context.Context, a resolvedRead) (string, bo
 	}
 	defer f.Close()
 
-	scanner := bufio.NewScanner(f)
-	scanner.Buffer(make([]byte, 256*1024), 2*1024*1024)
+	r := bufio.NewReader(f)
 
 	var sb strings.Builder
 	written := 0
@@ -296,8 +314,16 @@ func (t *readTool) readTextFile(ctx context.Context, a resolvedRead) (string, bo
 	totalLines := 0
 	hasMore := false
 	truncatedByBytes := false
+	cut := false // a line shown in part
 
-	for scanner.Scan() {
+	for {
+		line, err := nextLine(r, 4*readMaxLineLen+1)
+		if err == io.EOF {
+			break
+		}
+		if err != nil {
+			return "", false, fmt.Errorf("read %s: %w", a.path, err)
+		}
 		if ctx.Err() != nil {
 			return "", false, ctx.Err()
 		}
@@ -310,9 +336,8 @@ func (t *readTool) readTextFile(ctx context.Context, a resolvedRead) (string, bo
 			continue
 		}
 
-		line := scanner.Text()
 		if tl, truncated := truncateLine(line, readMaxLineLen); truncated {
-			line = tl
+			line, cut = tl, true
 		}
 		// A line cut to readMaxLineLen fits defaultMaxBytes: the first one
 		// read always does.
@@ -325,9 +350,6 @@ func (t *readTool) readTextFile(ctx context.Context, a resolvedRead) (string, bo
 		sb.WriteString(rendered)
 		written += len(rendered)
 		readLines++
-	}
-	if err := scanner.Err(); err != nil {
-		return "", false, fmt.Errorf("scan %s: %w", a.path, err)
 	}
 
 	if totalLines == 0 {
@@ -348,7 +370,26 @@ func (t *readTool) readTextFile(ctx context.Context, a resolvedRead) (string, bo
 	} else if result != "" {
 		result += fmt.Sprintf("\n\n[End of file - total %d lines.]", totalLines)
 	}
-	return result, a.offset > 1 || hasMore, nil
+	return result, a.offset > 1 || hasMore || cut, nil
+}
+
+// nextLine returns the next line of r without its line ending, and of a
+// line longer than keep bytes the first keep: a line has no length limit.
+func nextLine(r *bufio.Reader, keep int) (string, error) {
+	var line []byte
+	for {
+		chunk, err := r.ReadSlice('\n')
+		if room := keep - len(line); room > 0 {
+			line = append(line, chunk[:min(len(chunk), room)]...)
+		}
+		switch {
+		case err == bufio.ErrBufferFull:
+			continue
+		case err == nil, err == io.EOF && len(line) > 0:
+			return strings.TrimSuffix(strings.TrimSuffix(string(line), "\n"), "\r"), nil
+		}
+		return "", err
+	}
 }
 
 func (t *readTool) notFoundWithSuggestions(ctx context.Context, target string) string {

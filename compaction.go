@@ -28,7 +28,8 @@ type Compactor interface {
 
 // Compaction is a rewrite of a history.
 type Compaction struct {
-	// Messages is the history that replaces it.
+	// Messages is the history that replaces it: the rewrite of its first
+	// Replaced messages, then the rest of them as they were.
 	Messages []Message
 	// Replaced is how many messages of the history the rewrite stands in for.
 	Replaced int
