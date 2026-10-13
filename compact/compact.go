@@ -33,7 +33,8 @@ const keptWordsTokens = 20_000
 // the history it replaces, so the provider serves that from the prompt
 // cache; when the request no longer fits, or the model answers without the
 // summary in <summary> tags, it asks again with a plain-text transcript. A
-// previous summary is folded into the new one.
+// previous summary is folded into the new one. A focus the user gave goes
+// with either request.
 type Summarizer struct {
 	// Notes, if set, returns text appended to the summary of the messages it
 	// replaces, the previous summary among them, such as the files they
@@ -43,7 +44,7 @@ type Summarizer struct {
 }
 
 // Compact implements agentcore.Compactor.
-func (s Summarizer) Compact(ctx context.Context, history []agentcore.Message, call func([]agentcore.Message) agentcore.Call) (*agentcore.Compaction, error) {
+func (s Summarizer) Compact(ctx context.Context, history []agentcore.Message, call func([]agentcore.Message) agentcore.Call, focus string) (*agentcore.Compaction, error) {
 	cut := len(history)
 	for cut > 0 && history[cut-1].Role == litellm.RoleUser && history[cut-1].Kind != agentcore.KindSummary {
 		cut--
@@ -55,12 +56,12 @@ func (s Summarizer) Compact(ctx context.Context, history []agentcore.Message, ca
 
 	var used litellm.Usage
 	c := call(history[:cut])
-	summary, err := forkSummary(ctx, c, &used)
+	summary, err := forkSummary(ctx, c, focus, &used)
 	if err != nil {
 		return nil, err
 	}
 	if summary == "" {
-		if summary, err = standaloneSummary(ctx, c, older, previous, &used); err != nil {
+		if summary, err = standaloneSummary(ctx, c, older, previous, focus, &used); err != nil {
 			return nil, err
 		}
 	}

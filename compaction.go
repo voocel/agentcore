@@ -21,9 +21,10 @@ type Compactor interface {
 	// a history, as BuildCall does with the run's Config: a compactor that
 	// summarizes with the conversation's model can extend the call for the
 	// part of the history it replaces, which earlier calls sent, and read it
-	// from the prompt cache. A nil Compaction means there is nothing to
-	// compact.
-	Compact(ctx context.Context, history []Message, call func([]Message) Call) (*Compaction, error)
+	// from the prompt cache. focus, if set, is what the user asked the
+	// rewrite to attend to (see Agent.Compact); the loop's compactions have
+	// none. A nil Compaction means there is nothing to compact.
+	Compact(ctx context.Context, history []Message, call func([]Message) Call, focus string) (*Compaction, error)
 }
 
 // Compaction is a rewrite of a history.

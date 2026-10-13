@@ -337,7 +337,7 @@ func (r *run) respond() (Message, map[string]string, error) {
 	if r.cfg.Compactor != nil && r.cfg.CompactAt > 0 && Estimate(r.cfg, r.history) > r.cfg.CompactAt {
 		// A compaction failing as Emit failed, or as the run was cancelled,
 		// ends the run at steer.
-		_, err := r.compact()
+		_, err := r.compact("")
 		compacted = err == nil
 		if err := r.steer(); err != nil {
 			return Message{}, nil, err
@@ -354,7 +354,7 @@ func (r *run) respond() (Message, map[string]string, error) {
 			if eerr := r.emit(Retry{Attempt: attempt + 1, Err: err}); eerr != nil {
 				return Message{}, nil, eerr
 			}
-			changed, cerr := r.compact()
+			changed, cerr := r.compact("")
 			if cerr != nil {
 				return Message{}, nil, cerr
 			}
@@ -445,11 +445,11 @@ func (r *run) call() (msg Message, started bool, err error) {
 
 // compact has the Compactor rewrite the history and, once Emit took the
 // rewrite, puts it in place. It reports whether the history changed.
-func (r *run) compact() (bool, error) {
+func (r *run) compact(focus string) (bool, error) {
 	if err := r.emit(CompactionStart{}); err != nil {
 		return false, err
 	}
-	c, err := r.compaction()
+	c, err := r.compaction(focus)
 	if err != nil {
 		err = fmt.Errorf("agentcore: compact: %w", err)
 		if eerr := r.emit(CompactionEnd{Err: err}); eerr != nil {
@@ -472,9 +472,9 @@ func (r *run) compact() (bool, error) {
 
 // compaction has the Compactor rewrite the history, making its calls again
 // as Retry allows when one fails for a while.
-func (r *run) compaction() (*Compaction, error) {
+func (r *run) compaction(focus string) (*Compaction, error) {
 	for attempt := 1; ; attempt++ {
-		c, err := r.cfg.Compactor.Compact(r.ctx, r.history, func(h []Message) Call { return BuildCall(r.cfg, h) })
+		c, err := r.cfg.Compactor.Compact(r.ctx, r.history, func(h []Message) Call { return BuildCall(r.cfg, h) }, focus)
 		if err == nil {
 			return c, nil
 		}

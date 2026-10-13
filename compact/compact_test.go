@@ -73,7 +73,7 @@ func TestCompactReplacesOldHistoryWithSummary(t *testing.T) {
 	reply.Usage = litellm.Usage{InputTokens: 900, OutputTokens: 40}
 	p := litellmtest.New(reply)
 	msgs := history()
-	c, err := Summarizer{Notes: tools.FileOps}.Compact(context.Background(), msgs, callFor(t, p))
+	c, err := Summarizer{Notes: tools.FileOps}.Compact(context.Background(), msgs, callFor(t, p), "")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -110,7 +110,7 @@ func TestCompactKeepsTheUsersLatestWords(t *testing.T) {
 		agentcore.UserText("also keep the API stable"),
 		assistant(litellm.Text("ok")),
 	}
-	c, err := Summarizer{}.Compact(context.Background(), msgs, callFor(t, litellmtest.New(litellmtest.Text("<summary>s</summary>"))))
+	c, err := Summarizer{}.Compact(context.Background(), msgs, callFor(t, litellmtest.New(litellmtest.Text("<summary>s</summary>"))), "")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -128,7 +128,7 @@ func TestCompactKeepsTheUsersLatestWords(t *testing.T) {
 	// Compacted again with nothing new, the words kept are not summarized
 	// again.
 	p := litellmtest.New()
-	again, err := Summarizer{}.Compact(context.Background(), append(c.Messages, agentcore.UserText("next")), callFor(t, p))
+	again, err := Summarizer{}.Compact(context.Background(), append(c.Messages, agentcore.UserText("next")), callFor(t, p), "")
 	if err != nil || again != nil || len(p.Requests()) != 0 {
 		t.Fatalf("compacted nothing new: %v, %v", again, err)
 	}
@@ -144,7 +144,7 @@ func TestCompactForksTheConversation(t *testing.T) {
 	p := litellmtest.New(litellmtest.Text("<summary>checkpoint body</summary>"))
 	msgs := history()
 	call := callFor(t, p)
-	if _, err := (Summarizer{}).Compact(context.Background(), msgs, call); err != nil {
+	if _, err := (Summarizer{}).Compact(context.Background(), msgs, call, ""); err != nil {
 		t.Fatal(err)
 	}
 	sent := p.Requests()
@@ -181,7 +181,7 @@ func TestCompactFallsBackToTheTranscript(t *testing.T) {
 	} {
 		p := litellmtest.New(fork, litellmtest.Text("checkpoint body"))
 		msgs := history()
-		c, err := Summarizer{}.Compact(context.Background(), msgs, callFor(t, p))
+		c, err := Summarizer{}.Compact(context.Background(), msgs, callFor(t, p), "")
 		if err != nil {
 			t.Fatalf("%s: %v", name, err)
 		}
@@ -200,13 +200,13 @@ func TestCompactFallsBackToTheTranscript(t *testing.T) {
 	cut := litellmtest.Text("## Goal\nhalf a summ")
 	cut.FinishReason = litellm.FinishReasonLength
 	p := litellmtest.New(litellmtest.Text("untagged"), cut)
-	if _, err := (Summarizer{}).Compact(context.Background(), history(), callFor(t, p)); err == nil || !strings.Contains(err.Error(), "cut off") {
+	if _, err := (Summarizer{}).Compact(context.Background(), history(), callFor(t, p), ""); err == nil || !strings.Contains(err.Error(), "cut off") {
 		t.Fatalf("a cut summary: %v", err)
 	}
 
 	boom := errors.New("provider down")
 	p = litellmtest.New(litellmtest.Fail(boom))
-	if _, err := (Summarizer{}).Compact(context.Background(), history(), callFor(t, p)); !errors.Is(err, boom) {
+	if _, err := (Summarizer{}).Compact(context.Background(), history(), callFor(t, p), ""); !errors.Is(err, boom) {
 		t.Fatalf("fork error = %v", err)
 	}
 }
@@ -216,7 +216,7 @@ func TestCompactFoldsInThePreviousSummary(t *testing.T) {
 	p := litellmtest.New(litellmtest.Text("no tags"), litellmtest.Text("fresh"))
 	const old = "UNIQUE-PRIOR-SUMMARY-TEXT"
 	msgs := append([]agentcore.Message{agentcore.SummaryMessage(old)}, history()...)
-	if _, err := (Summarizer{}).Compact(context.Background(), msgs, callFor(t, p)); err != nil {
+	if _, err := (Summarizer{}).Compact(context.Background(), msgs, callFor(t, p), ""); err != nil {
 		t.Fatal(err)
 	}
 	prompt := agentcore.Message{Blocks: p.Requests()[1].Messages[1].Blocks}.Text()
@@ -227,7 +227,7 @@ func TestCompactFoldsInThePreviousSummary(t *testing.T) {
 	// Nothing new to cut: the prior summary is not reworded.
 	p = litellmtest.New()
 	msgs = []agentcore.Message{agentcore.SummaryMessage("prior"), agentcore.UserText(strings.Repeat("b ", 8000))}
-	c, err := Summarizer{}.Compact(context.Background(), msgs, callFor(t, p))
+	c, err := Summarizer{}.Compact(context.Background(), msgs, callFor(t, p), "")
 	if err != nil || c != nil || len(p.Requests()) != 0 {
 		t.Fatalf("compacted only a summary: %+v, %v", c, err)
 	}
@@ -253,7 +253,7 @@ func TestCompactReplaysNothing(t *testing.T) {
 		agentcore.ToolResult("r1", agentcore.TextResult("package a")),
 	}
 	call := callFor(t, p)
-	c, err := Summarizer{}.Compact(context.Background(), msgs, call)
+	c, err := Summarizer{}.Compact(context.Background(), msgs, call, "")
 	if err != nil || c == nil || len(c.Messages) != 2 || c.Messages[0].Role != litellm.RoleUser || c.Messages[0].Kind != "" || c.Replaced != len(msgs) {
 		t.Fatalf("compaction %+v, %v", c, err)
 	}
@@ -265,5 +265,21 @@ func TestCompactReplaysNothing(t *testing.T) {
 	}
 	if !strings.Contains(c.Messages[1].Text(), "Continue from where it leaves off") {
 		t.Fatalf("the summary does not carry the work on: %q", c.Messages[1].Text())
+	}
+}
+
+// The focus the user gave goes with the fork's request and, when that fails,
+// with the transcript's.
+func TestCompactAttendsToTheFocus(t *testing.T) {
+	const focus = "the retry design we settled on"
+	p := litellmtest.New(litellmtest.Text("untagged"), litellmtest.Text("checkpoint body"))
+	if _, err := (Summarizer{}).Compact(context.Background(), history(), callFor(t, p), focus); err != nil {
+		t.Fatal(err)
+	}
+	for i, req := range p.Requests() {
+		last := req.Messages[len(req.Messages)-1]
+		if text := (agentcore.Message{Blocks: last.Blocks}).Text(); !strings.HasSuffix(text, "pay particular attention to: "+focus) {
+			t.Errorf("request %d ends %q", i, text[max(len(text)-120, 0):])
+		}
 	}
 }

@@ -212,7 +212,7 @@ func TestFileOps(t *testing.T) {
 // compactWith compacts any history to its compaction.
 type compactWith struct{ c *agentcore.Compaction }
 
-func (w compactWith) Compact(context.Context, []agentcore.Message, func([]agentcore.Message) agentcore.Call) (*agentcore.Compaction, error) {
+func (w compactWith) Compact(context.Context, []agentcore.Message, func([]agentcore.Message) agentcore.Call, string) (*agentcore.Compaction, error) {
 	return w.c, nil
 }
 
@@ -232,11 +232,11 @@ func TestForgottenReadsAllowEditsOnly(t *testing.T) {
 	}
 	// Compacting nothing keeps the reads; a compaction forgets them.
 	compactor := w.Files.Forgetting(compactWith{})
-	compactor.Compact(context.Background(), nil, nil)
+	compactor.Compact(context.Background(), nil, nil, "")
 	if stamp, _ := w.Files.Get(path); stamp.Partial {
 		t.Fatal("forgot the reads without a compaction")
 	}
-	w.Files.Forgetting(compactWith{&agentcore.Compaction{}}).Compact(context.Background(), nil, nil)
+	w.Files.Forgetting(compactWith{&agentcore.Compaction{}}).Compact(context.Background(), nil, nil, "")
 	if err := call(t, write, writeArgs{FilePath: path, Content: "two\n"}); err == nil {
 		t.Fatal("overwrote a file whose read was forgotten")
 	}

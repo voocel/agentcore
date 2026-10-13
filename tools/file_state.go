@@ -83,8 +83,8 @@ type forgetting struct {
 	files *FileReadState
 }
 
-func (f forgetting) Compact(ctx context.Context, history []agentcore.Message, call func([]agentcore.Message) agentcore.Call) (*agentcore.Compaction, error) {
-	c, err := f.Compactor.Compact(ctx, history, call)
+func (f forgetting) Compact(ctx context.Context, history []agentcore.Message, call func([]agentcore.Message) agentcore.Call, focus string) (*agentcore.Compaction, error) {
+	c, err := f.Compactor.Compact(ctx, history, call, focus)
 	if c != nil {
 		f.files.Forget()
 	}

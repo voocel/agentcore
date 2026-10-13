@@ -170,7 +170,7 @@ func TestAgentCompact(t *testing.T) {
 		}
 		return nil
 	})
-	if err := a.Compact(context.Background()); err != nil {
+	if err := a.Compact(context.Background(), ""); err != nil {
 		t.Fatal(err)
 	}
 	if got := a.Messages(); len(got) != 2 || got[0].Kind != KindSummary || len(ends) != 1 || a.SetMessages(got) != nil {
@@ -199,7 +199,7 @@ func TestAgentClearQueues(t *testing.T) {
 
 func TestAgentCompactWithoutCompactor(t *testing.T) {
 	a := NewAgent(Config{}, bigHistory())
-	if err := a.Compact(context.Background()); !errors.Is(err, ErrNoCompactor) {
+	if err := a.Compact(context.Background(), ""); !errors.Is(err, ErrNoCompactor) {
 		t.Fatalf("err = %v", err)
 	}
 	if a.SetMessages(nil) != nil {

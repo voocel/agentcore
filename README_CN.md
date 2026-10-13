@@ -104,7 +104,7 @@ cancel()                                                     // 结束运行
 
 只追加 `MessageEnd` 的存储恢复出来的是压缩前的历史：`Compaction.Messages` 是完整的新历史，`Replaced` 是它替代了旧历史中的多少条。`NewAgent` 会用订阅者、`Steer` 和 `FollowUp` 替换 `Config.Emit`、`Steering` 和 `FollowUp`。
 
-取消 ctx 即结束运行。运行进行中时 `Prompt` 返回 `ErrBusy`。不带提示词时，它就现有历史作答（如运行失败之后），历史以响应结尾时返回 `ErrNothingToContinue`。`Compact` 按需压缩，`Messages` 和 `SetMessages` 读取和替换历史。每个订阅者都会收到 `RunEnd`，即使前面有订阅者失败。
+取消 ctx 即结束运行。运行进行中时 `Prompt` 返回 `ErrBusy`。不带提示词时，它就现有历史作答（如运行失败之后），历史以响应结尾时返回 `ErrNothingToContinue`。`Compact` 按需压缩，可带上用户指定的重点，`Messages` 和 `SetMessages` 读取和替换历史。每个订阅者都会收到 `RunEnd`，即使前面有订阅者失败。
 
 ## 事件
 

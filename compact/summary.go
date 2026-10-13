@@ -79,14 +79,22 @@ Update the existing structured summary with new information. RULES:
 
 ` + checkpointFormat
 
+// focusNote asks the summary to attend to what the user named, if anything.
+func focusNote(focus string) string {
+	if focus == "" {
+		return ""
+	}
+	return "\n\nThe user asked that the checkpoint pay particular attention to: " + focus
+}
+
 // forkSummary extends the conversation's call for the history to replace
 // with forkInstruction, so the provider serves that history from the prompt
 // cache, adding to used what the call used. It returns "" when the request
 // no longer fits or the model answered without a tagged summary, leaving the
 // transcript path to take over.
-func forkSummary(ctx context.Context, call agentcore.Call, used *litellm.Usage) (string, error) {
+func forkSummary(ctx context.Context, call agentcore.Call, focus string, used *litellm.Usage) (string, error) {
 	req := call.Request
-	req.Messages = append(slices.Clip(req.Messages), litellm.UserText(forkInstruction))
+	req.Messages = append(slices.Clip(req.Messages), litellm.UserText(forkInstruction+focusNote(focus)))
 	resp, err := call.Client.Chat(ctx, req)
 	if litellm.ErrorTypeOf(err) == litellm.ErrorTypeContextOverflow {
 		return "", nil
@@ -105,11 +113,12 @@ func forkSummary(ctx context.Context, call agentcore.Call, used *litellm.Usage) 
 // thinking, folding in the previous summary, and adds to used what its calls
 // used. When the transcript itself overflows, the oldest user turns are
 // dropped until it fits.
-func standaloneSummary(ctx context.Context, call agentcore.Call, history []agentcore.Message, previous string, used *litellm.Usage) (string, error) {
+func standaloneSummary(ctx context.Context, call agentcore.Call, history []agentcore.Message, previous, focus string, used *litellm.Usage) (string, error) {
 	instruction := summaryPrompt
 	if previous != "" {
 		instruction = "<previous-summary>\n" + previous + "\n</previous-summary>\n\n" + updateSummaryPrompt
 	}
+	instruction += focusNote(focus)
 	req := call.Request
 	req.Tools, req.ToolChoice, req.ResponseFormat, req.Thinking = nil, nil, nil, nil
 	history = stripImageBlocks(history)

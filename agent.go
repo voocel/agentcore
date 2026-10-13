@@ -129,10 +129,11 @@ func (a *Agent) ClearQueues() (steering, followUp []Message) {
 }
 
 // Compact has the Config's Compactor rewrite the history now, as a run
-// does when the history outgrows its CompactAt. Subscribers receive its
+// does when the history outgrows its CompactAt, attending to focus if set,
+// such as what the user wants carried on. Subscribers receive its
 // CompactionStart and CompactionEnd. It fails with ErrBusy while a run is
 // under way, and with ErrNoCompactor when the Config has none.
-func (a *Agent) Compact(ctx context.Context) error {
+func (a *Agent) Compact(ctx context.Context, focus string) error {
 	cfg, history, err := a.start()
 	if err != nil {
 		return err
@@ -146,7 +147,7 @@ func (a *Agent) Compact(ctx context.Context) error {
 	}
 	ctx, cancel := context.WithCancelCause(ctx)
 	defer cancel(nil)
-	_, err = newRun(ctx, cancel, cfg, history).compact()
+	_, err = newRun(ctx, cancel, cfg, history).compact(focus)
 	return err
 }
 

@@ -24,7 +24,7 @@ type summarizer struct {
 	during func()
 }
 
-func (s *summarizer) Compact(_ context.Context, history []Message, call func([]Message) Call) (*Compaction, error) {
+func (s *summarizer) Compact(_ context.Context, history []Message, call func([]Message) Call, _ string) (*Compaction, error) {
 	s.calls = append(s.calls, call(history))
 	if s.during != nil {
 		s.during()

@@ -104,7 +104,7 @@ cancel()                                                     // ends the run
 
 A store that appends `MessageEnd` alone restores the history from before its compactions: `Compaction.Messages` is the whole new history, and `Replaced` how many messages of the old one it stands in for. `NewAgent` replaces `Config.Emit`, `Steering` and `FollowUp` with the subscribers, `Steer` and `FollowUp`.
 
-A run ends when its context is cancelled. `Prompt` fails with `ErrBusy` while a run is under way. Without prompts, it answers the history as it stands, such as after a failed run, and fails with `ErrNothingToContinue` when it ends with a response. `Compact` compacts it on demand, `Messages` and `SetMessages` read and replace it. Every subscriber receives the `RunEnd`, even after one failed.
+A run ends when its context is cancelled. `Prompt` fails with `ErrBusy` while a run is under way. Without prompts, it answers the history as it stands, such as after a failed run, and fails with `ErrNothingToContinue` when it ends with a response. `Compact` compacts it on demand, attending to a focus the user gives, `Messages` and `SetMessages` read and replace it. Every subscriber receives the `RunEnd`, even after one failed.
 
 ## Events
 
