@@ -90,6 +90,23 @@ func TestBashWorkDir(t *testing.T) {
 	}
 }
 
+func TestBashSandbox(t *testing.T) {
+	t.Parallel()
+	if props := (Workspace{}).Bash().Schema["properties"].(map[string]any); props["unsandboxed"] != nil {
+		t.Fatal("unsandboxed offered without a sandbox")
+	}
+	sandbox := func(_ context.Context, argv []string) []string {
+		return append([]string{"env", "SANDBOXED=yes"}, argv...)
+	}
+	tool := Workspace{Dir: ".", Sandbox: sandbox}.Bash()
+	if got, err := run(t, tool, map[string]any{"command": "echo in $SANDBOXED"}); err != nil || got != "in yes" {
+		t.Fatalf("sandboxed: %q, %v", got, err)
+	}
+	if got, err := run(t, tool, map[string]any{"command": "echo in $SANDBOXED", "unsandboxed": true}); err != nil || got != "in" {
+		t.Fatalf("unsandboxed: %q, %v", got, err)
+	}
+}
+
 // The background mode is offered with Tasks only, and its commands run as
 // tasks, with no timeout unless asked.
 func TestBashBackground(t *testing.T) {

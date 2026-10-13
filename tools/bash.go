@@ -25,7 +25,8 @@ const bashTimeout = 2 * time.Minute
 // most 2000 lines or 50KB, with a line for each of a non-zero exit code, a
 // timeout and a cut. A command that fails is not a failed call: its output
 // is what the model needs. With Tasks, the model may run a command in the
-// background, as a task.
+// background, as a task. With Sandbox, commands run inside it unless a call
+// sets unsandboxed.
 func (w Workspace) Bash() agentcore.Tool {
 	t := &bashTool{w: w}
 	props := []schema.Prop{
@@ -41,6 +42,11 @@ func (w Workspace) Bash() agentcore.Tool {
 	if w.Tasks != nil {
 		props = append(props, schema.Property("run_in_background", schema.Bool("Run the command in the background as a task. Returns at once; a notification follows when it ends.")))
 		description += " Set run_in_background for long-running commands, such as servers or watchers."
+	}
+	if w.Sandbox != nil {
+		props = append(props, schema.Property("unsandboxed", schema.Bool("Run the command outside the sandbox. Set it only to retry a command the sandbox blocked; the user is asked to approve it.")))
+		description += " Commands run in a sandbox, which keeps them from writing some files, such as outside the workspace, and may keep them off the network. " +
+			"When one fails because of that, such as with \"Operation not permitted\", \"Read-only file system\" or a network error, retry it with unsandboxed."
 	}
 	return agentcore.Tool{
 		Name:        "bash",
@@ -61,6 +67,7 @@ type bashArgs struct {
 	WorkDir         string `json:"workdir"`
 	Description     string `json:"description"`
 	RunInBackground bool   `json:"run_in_background"`
+	Unsandboxed     bool   `json:"unsandboxed"`
 }
 
 func (t *bashTool) execute(ctx context.Context, args json.RawMessage) (string, error) {
@@ -77,6 +84,10 @@ func (t *bashTool) execute(ctx context.Context, args json.RawMessage) (string, e
 		return "", err
 	}
 	argv := append(shellArgs, a.Command)
+	if t.w.Sandbox != nil && !a.Unsandboxed {
+		wrapped := t.w.Sandbox(ctx, append([]string{shell}, argv...))
+		shell, argv = wrapped[0], wrapped[1:]
+	}
 	timeout := time.Duration(a.Timeout) * time.Second
 	if a.RunInBackground {
 		if t.w.Tasks == nil {

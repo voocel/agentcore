@@ -27,6 +27,11 @@ type Workspace struct {
 	// Tasks runs the commands bash runs in the background; nil offers no
 	// background mode.
 	Tasks *task.Runtime
+	// Sandbox, if set, returns the program and arguments that run argv, a
+	// shell command bash runs, inside a sandbox. bash then offers the model
+	// "unsandboxed" to run a command the sandbox blocked outside it, which
+	// whoever approves calls should ask about.
+	Sandbox func(ctx context.Context, argv []string) []string
 }
 
 // Tools returns read, write, edit, bash, glob, grep and ls.
