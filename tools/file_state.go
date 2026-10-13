@@ -59,6 +59,38 @@ func (s *FileReadState) Set(path string, stamp FileReadStamp) {
 	s.m[path] = stamp
 }
 
+// Forget makes every read a partial one, as when the history no longer
+// holds what the reads returned, after a compaction or a rewind: the model
+// may still edit a file, quoting the text it changes, but reads it again
+// before it overwrites it.
+func (s *FileReadState) Forget() {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for path, stamp := range s.m {
+		stamp.Partial = true
+		s.m[path] = stamp
+	}
+}
+
+// Forgetting returns c, which also forgets the reads (see Forget) whenever it
+// compacts a history, before the history is replaced.
+func (s *FileReadState) Forgetting(c agentcore.Compactor) agentcore.Compactor {
+	return forgetting{c, s}
+}
+
+type forgetting struct {
+	agentcore.Compactor
+	files *FileReadState
+}
+
+func (f forgetting) Compact(ctx context.Context, history []agentcore.Message, call func([]agentcore.Message) agentcore.Call) (*agentcore.Compaction, error) {
+	c, err := f.Compactor.Compact(ctx, history, call)
+	if c != nil {
+		f.files.Forget()
+	}
+	return c, err
+}
+
 // recordWrite refreshes the stamp of path after the LLM wrote it: all of it
 // when whole, otherwise (an edit) only the text it quoted, so whether it has
 // seen the whole file carries over. A file that cannot be stated keeps its
@@ -89,12 +121,18 @@ func stampMatches(stamp FileReadStamp, info FileInfo) bool {
 }
 
 // FileOps lists, as tagged sections, the files the read, write and edit
-// calls in history touched: those only read, and those modified. It is empty
-// when there were none. A compaction appends it to its summary, so that the
-// files the replaced messages worked on survive it.
+// calls in history touched, and those the lists of a summary in it name:
+// those only read, and those modified. It is empty when there were none. A
+// compaction appends it to its summary, so that the files the replaced
+// messages worked on survive it, and every compaction after it.
 func FileOps(history []agentcore.Message) string {
 	read, modified := map[string]bool{}, map[string]bool{}
 	for _, m := range history {
+		if m.Kind == agentcore.KindSummary {
+			summary := agentcore.SummaryText(m)
+			listed(read, summary, "read-files")
+			listed(modified, summary, "modified-files")
+		}
 		for _, call := range m.ToolCalls() {
 			var args struct {
 				FilePath string `json:"file_path"`
@@ -118,6 +156,25 @@ func FileOps(history []agentcore.Message) string {
 		out += "\n\n<modified-files>\n" + strings.Join(files, "\n") + "\n</modified-files>"
 	}
 	return out
+}
+
+// listed adds to set the files the <tag> sections of text list.
+func listed(set map[string]bool, text, tag string) {
+	open, end := "<"+tag+">\n", "\n</"+tag+">"
+	for {
+		_, rest, ok := strings.Cut(text, open)
+		if !ok {
+			return
+		}
+		files, after, ok := strings.Cut(rest, end)
+		if !ok {
+			return
+		}
+		for _, f := range strings.Split(files, "\n") {
+			set[f] = true
+		}
+		text = after
+	}
 }
 
 // sorted lists the keys of set that are not in except.

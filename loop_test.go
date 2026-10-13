@@ -459,6 +459,47 @@ func TestRunRetriesAVendorError(t *testing.T) {
 	}
 }
 
+// One that keeps failing fails the run with the vendor's reason.
+func TestRunNamesTheVendorsError(t *testing.T) {
+	p := litellmtest.New(litellmtest.Reply{Blocks: []litellm.Block{litellm.Text("par")}, FinishReason: litellm.FinishReasonError})
+	client, err := litellm.New(rawFinish{p, "insufficient_system_resource"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	history, err := Run(context.Background(), Config{Model: Model{Client: client, Request: litellm.Request{Model: "m"}}}, nil, UserText("go"))
+	if err == nil || !strings.Contains(err.Error(), "the model ended its response with insufficient_system_resource") {
+		t.Fatalf("err = %v", err)
+	}
+	if len(history) != 2 || history[1].Stop != StopError || history[1].Text() != "par" {
+		t.Fatalf("history %#v", history)
+	}
+}
+
+// rawFinish gives its streams' finish raw as the vendor's reason.
+type rawFinish struct {
+	*litellmtest.Provider
+	raw string
+}
+
+func (p rawFinish) Stream(ctx context.Context, req *litellm.Request) (litellm.Stream, error) {
+	s, err := p.Provider.Stream(ctx, req)
+	return rawStream{s, p.raw}, err
+}
+
+type rawStream struct {
+	litellm.Stream
+	raw string
+}
+
+func (s rawStream) Next() (litellm.Event, error) {
+	ev, err := s.Stream.Next()
+	if done, ok := ev.(litellm.DoneEvent); ok {
+		done.FinishReasonRaw = s.raw
+		ev = done
+	}
+	return ev, err
+}
+
 // A server asking for a longer wait than MaxRetryAfter ends retrying.
 func TestRunRetryAfterBeyondPolicy(t *testing.T) {
 	limited := litellm.NewError("test", litellm.ErrorTypeRateLimit, "slow down", nil)

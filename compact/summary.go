@@ -121,6 +121,11 @@ func standaloneSummary(ctx context.Context, call agentcore.Call, history []agent
 		resp, err := call.Client.Chat(ctx, req)
 		if err == nil {
 			used.Add(resp.Usage)
+			// A summary cut off at the output limit would stand in for the
+			// history as if whole.
+			if resp.FinishReason == litellm.FinishReasonLength {
+				return "", errors.New("summarize: the summary was cut off at the output token limit")
+			}
 			if summary := extractStoredSummary(resp.Text()); summary != "" {
 				return summary, nil
 			}
@@ -246,7 +251,13 @@ func formatArgsKeyValue(raw string) string {
 	return strings.Join(pairs, ", ")
 }
 
+// transcriptResultBytes bounds a tool result in a transcript: enough for an
+// error message or the gist of an output, which is what a summary takes.
+const transcriptResultBytes = 2000
+
 // serializeConversation renders history as readable text for summarization.
+// Reasoning is left out: providers return a digest of it, if anything, and
+// it can outgrow the rest; what was said and done records what happened.
 func serializeConversation(msgs []agentcore.Message) string {
 	var parts []string
 	for _, m := range msgs {
@@ -256,9 +267,6 @@ func serializeConversation(msgs []agentcore.Message) string {
 				parts = append(parts, "[User]: "+text)
 			}
 		case litellm.RoleAssistant:
-			if thinking := m.Reasoning(); thinking != "" {
-				parts = append(parts, "[Assistant thinking]: "+thinking)
-			}
 			if text := m.Text(); text != "" {
 				parts = append(parts, "[Assistant]: "+text)
 			}
@@ -270,7 +278,7 @@ func serializeConversation(msgs []agentcore.Message) string {
 				parts = append(parts, "[Assistant tool calls]: "+strings.Join(rendered, "; "))
 			}
 		case litellm.RoleTool:
-			if content := truncateForSummary(m.Text(), 497); content != "" {
+			if content := truncateForSummary(m.Text(), transcriptResultBytes); content != "" {
 				parts = append(parts, "[Tool result]: "+content)
 			}
 		}

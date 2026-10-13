@@ -53,8 +53,21 @@ func callFor(t *testing.T, p litellm.Provider) func([]agentcore.Message) agentco
 	return func(h []agentcore.Message) agentcore.Call { return agentcore.BuildCall(cfg, h) }
 }
 
-// The history is replaced by its summary, but for the prompt at its end the
-// model has yet to answer; the summary call's usage is reported.
+// summaryOf returns the text of the summary c put in place.
+func summaryOf(t *testing.T, c *agentcore.Compaction) string {
+	t.Helper()
+	for _, m := range c.Messages {
+		if m.Kind == agentcore.KindSummary {
+			return agentcore.SummaryText(m)
+		}
+	}
+	t.Fatalf("no summary among %d messages", len(c.Messages))
+	return ""
+}
+
+// The history is replaced by the user's words and its summary, but for the
+// prompt at its end the model has yet to answer; the summary call's usage is
+// reported.
 func TestCompactReplacesOldHistoryWithSummary(t *testing.T) {
 	reply := litellmtest.Text("<analysis>a</analysis><summary>checkpoint body</summary>")
 	reply.Usage = litellm.Usage{InputTokens: 900, OutputTokens: 40}
@@ -64,20 +77,60 @@ func TestCompactReplacesOldHistoryWithSummary(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if c == nil || len(c.Messages) != 2 || c.Replaced != 4 || c.Messages[0].Kind != agentcore.KindSummary {
-		t.Fatalf("compaction = %+v", c)
+	if c == nil || len(c.Messages) != 3 || c.Replaced != 4 || c.Messages[0].Text() != msgs[0].Text() || c.Messages[1].Kind != agentcore.KindSummary {
+		t.Fatalf("compaction of %d messages, %d replaced", len(c.Messages), c.Replaced)
 	}
 	if c.Usage == nil || c.Usage.InputTokens != 900 || c.Usage.OutputTokens != 40 {
 		t.Fatalf("usage = %+v", c.Usage)
 	}
-	text := agentcore.SummaryText(c.Messages[0])
+	text := summaryOf(t, c)
 	if !strings.HasPrefix(text, "checkpoint body") ||
 		!strings.Contains(text, "<read-files>\nold.go\n</read-files>") ||
 		!strings.Contains(text, "<modified-files>\nnew.go\n</modified-files>") {
 		t.Fatalf("summary = %q", text)
 	}
-	if !strings.HasPrefix(c.Messages[1].Text(), "keep ") {
+	if !strings.HasPrefix(c.Messages[2].Text(), "keep ") {
 		t.Fatal("the recent message was not kept")
+	}
+}
+
+// What the user said is kept word for word, the latest first, up to a
+// budget: the one overflowing it is cut in the middle, and the messages the
+// application added are left to the summary.
+func TestCompactKeepsTheUsersLatestWords(t *testing.T) {
+	added := agentcore.UserText("<system-reminder>context</system-reminder>")
+	added.Kind = "context:env"
+	long := "fix the parser " + strings.Repeat("log line\n", 20_000) + " and add a test"
+	msgs := []agentcore.Message{
+		agentcore.UserText("first, an old ask"),
+		assistant(litellm.Text("done")),
+		added,
+		agentcore.UserText(long),
+		assistant(litellm.Text("on it")),
+		agentcore.UserText("also keep the API stable"),
+		assistant(litellm.Text("ok")),
+	}
+	c, err := Summarizer{}.Compact(context.Background(), msgs, callFor(t, litellmtest.New(litellmtest.Text("<summary>s</summary>"))))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(c.Messages) != 3 || c.Messages[2].Kind != agentcore.KindSummary || c.Messages[1].Text() != "also keep the API stable" {
+		t.Fatalf("kept %d messages", len(c.Messages))
+	}
+	cut := c.Messages[0].Text()
+	if !strings.HasPrefix(cut, "fix the parser ") || !strings.HasSuffix(cut, " and add a test") || !strings.Contains(cut, "characters cut ...]") || len(cut) >= len(long) {
+		t.Fatalf("the long ask was not cut in the middle: %d of %d bytes", len(cut), len(long))
+	}
+	if kept := agentcore.EstimateMessage(c.Messages[0]) + agentcore.EstimateMessage(c.Messages[1]); kept > keptWordsTokens+20 {
+		t.Fatalf("kept %d tokens of the user's words", kept)
+	}
+
+	// Compacted again with nothing new, the words kept are not summarized
+	// again.
+	p := litellmtest.New()
+	again, err := Summarizer{}.Compact(context.Background(), append(c.Messages, agentcore.UserText("next")), callFor(t, p))
+	if err != nil || again != nil || len(p.Requests()) != 0 {
+		t.Fatalf("compacted nothing new: %v, %v", again, err)
 	}
 }
 
@@ -138,15 +191,22 @@ func TestCompactFallsBackToTheTranscript(t *testing.T) {
 			!strings.Contains(agentcore.Message{Blocks: transcript.Messages[1].Blocks}.Text(), "<conversation>") {
 			t.Fatalf("%s: calls %d, transcript request %#v", name, len(sent), transcript)
 		}
-		if !strings.HasPrefix(agentcore.SummaryText(c.Messages[0]), "checkpoint body") {
-			t.Fatalf("%s: summary %q", name, agentcore.SummaryText(c.Messages[0]))
+		if summary := summaryOf(t, c); !strings.HasPrefix(summary, "checkpoint body") {
+			t.Fatalf("%s: summary %q", name, summary)
 		}
 	}
 
+	// A summary cut off at the output limit is no checkpoint.
+	cut := litellmtest.Text("## Goal\nhalf a summ")
+	cut.FinishReason = litellm.FinishReasonLength
+	p := litellmtest.New(litellmtest.Text("untagged"), cut)
+	if _, err := (Summarizer{}).Compact(context.Background(), history(), callFor(t, p)); err == nil || !strings.Contains(err.Error(), "cut off") {
+		t.Fatalf("a cut summary: %v", err)
+	}
+
 	boom := errors.New("provider down")
-	p := litellmtest.New(litellmtest.Fail(boom))
-	msgs := history()
-	if _, err := (Summarizer{}).Compact(context.Background(), msgs, callFor(t, p)); !errors.Is(err, boom) {
+	p = litellmtest.New(litellmtest.Fail(boom))
+	if _, err := (Summarizer{}).Compact(context.Background(), history(), callFor(t, p)); !errors.Is(err, boom) {
 		t.Fatalf("fork error = %v", err)
 	}
 }
@@ -179,9 +239,9 @@ func TestTruncateForSummaryKeepsRunesWhole(t *testing.T) {
 	}
 }
 
-// Mid-task, nothing of the history is replayed: no response, with the
-// reasoning bound to what came before it, and no tool load, so the deferred
-// tools it loaded are found again.
+// Mid-task, no response is replayed, with the reasoning bound to what came
+// before it, nor a tool load, so the deferred tools it loaded are found
+// again: only the user's words and the summary stand.
 func TestCompactReplaysNothing(t *testing.T) {
 	p := litellmtest.New(litellmtest.Text("<summary>checkpoint body</summary>"))
 	search := litellm.ToolUseBlock{ID: "s1", Name: "tool_search", Arguments: `{"query":"select:deploy"}`}
@@ -194,7 +254,7 @@ func TestCompactReplaysNothing(t *testing.T) {
 	}
 	call := callFor(t, p)
 	c, err := Summarizer{}.Compact(context.Background(), msgs, call)
-	if err != nil || c == nil || len(c.Messages) != 1 || c.Replaced != len(msgs) {
+	if err != nil || c == nil || len(c.Messages) != 2 || c.Messages[0].Role != litellm.RoleUser || c.Messages[0].Kind != "" || c.Replaced != len(msgs) {
 		t.Fatalf("compaction %+v, %v", c, err)
 	}
 	req := call(c.Messages).Request
@@ -203,7 +263,7 @@ func TestCompactReplaysNothing(t *testing.T) {
 			t.Fatal("a tool load survived the compaction")
 		}
 	}
-	if !strings.Contains(c.Messages[0].Text(), "Continue from where it leaves off") {
-		t.Fatalf("the summary does not carry the work on: %q", c.Messages[0].Text())
+	if !strings.Contains(c.Messages[1].Text(), "Continue from where it leaves off") {
+		t.Fatalf("the summary does not carry the work on: %q", c.Messages[1].Text())
 	}
 }

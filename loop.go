@@ -345,11 +345,6 @@ func (r *run) respond() (Message, map[string]string, error) {
 	}
 	for attempt := 1; ; attempt++ {
 		msg, started, err := r.call()
-		if err == nil && msg.Stop == StopError {
-			// Mostly one that passes, as an overloaded server or a tool call
-			// the model malformed.
-			err = &litellm.Error{Type: litellm.ErrorTypeProvider, Provider: msg.Provider, Message: "the model ended its response with an error", Temporary: true}
-		}
 		if err == nil {
 			bad := invalidArgs(&msg)
 			return msg, bad, r.record(msg)
@@ -418,9 +413,10 @@ func (r *run) retry(attempt int, err error) (bool, error) {
 	}
 }
 
-// call makes one streamed model call for the history. On failure it returns
-// what streamed before, as a response; started reports that its
-// MessageStart was emitted.
+// call makes one streamed model call for the history. On failure, the
+// vendor ending the response with an error included, it returns what
+// streamed before, as a response; started reports that its MessageStart
+// was emitted.
 func (r *run) call() (msg Message, started bool, err error) {
 	msg = Message{Role: litellm.RoleAssistant}
 	c := BuildCall(r.cfg, r.history)
@@ -439,6 +435,11 @@ func (r *run) call() (msg Message, started bool, err error) {
 	msg.Stop = stopReason(resp.FinishReason)
 	msg.Usage = usage(resp.Usage, r.cfg.Model.Pricing)
 	msg.Provider, msg.Model = resp.Provider, resp.Model
+	if err == nil && msg.Stop == StopError {
+		// Mostly one that passes, as an overloaded server or a tool call
+		// the model malformed. The vendor's reason tells which.
+		err = &litellm.Error{Type: litellm.ErrorTypeProvider, Provider: resp.Provider, Message: "the model ended its response with " + resp.FinishReasonRaw, Temporary: true}
+	}
 	return msg, true, err
 }
 

@@ -197,4 +197,56 @@ func TestFileOps(t *testing.T) {
 	if got := FileOps(nil); got != "" {
 		t.Fatalf("FileOps(nil) = %q", got)
 	}
+
+	// The lists of an earlier compaction's summary carry on: a file read
+	// then is modified now.
+	later := []agentcore.Message{
+		agentcore.SummaryMessage("body" + want),
+		{Role: litellm.RoleAssistant, Blocks: []litellm.Block{use("7", "edit", `{"file_path":"a.go"}`), use("8", "read", `{"file_path":"d.go"}`)}},
+	}
+	if got, want := FileOps(later), "\n\n<read-files>\nd.go\n</read-files>\n\n<modified-files>\na.go\nb.go\nc.go\n</modified-files>"; got != want {
+		t.Fatalf("FileOps after a compaction = %q", got)
+	}
+}
+
+// compactWith compacts any history to its compaction.
+type compactWith struct{ c *agentcore.Compaction }
+
+func (w compactWith) Compact(context.Context, []agentcore.Message, func([]agentcore.Message) agentcore.Call) (*agentcore.Compaction, error) {
+	return w.c, nil
+}
+
+// After a compaction or a rewind the model no longer holds what it read, so
+// it reads a file again before it overwrites it; an edit, which quotes what
+// it changes, needs no new read.
+func TestForgottenReadsAllowEditsOnly(t *testing.T) {
+	dir := t.TempDir()
+	w := Workspace{Dir: dir, Files: NewFileReadState()}
+	read, write, edit := w.Read(), w.Write(), w.Edit()
+	path := filepath.Join(dir, "a.txt")
+	if err := os.WriteFile(path, []byte("one\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := call(t, read, readArgs{FilePath: path}); err != nil {
+		t.Fatal(err)
+	}
+	// Compacting nothing keeps the reads; a compaction forgets them.
+	compactor := w.Files.Forgetting(compactWith{})
+	compactor.Compact(context.Background(), nil, nil)
+	if stamp, _ := w.Files.Get(path); stamp.Partial {
+		t.Fatal("forgot the reads without a compaction")
+	}
+	w.Files.Forgetting(compactWith{&agentcore.Compaction{}}).Compact(context.Background(), nil, nil)
+	if err := call(t, write, writeArgs{FilePath: path, Content: "two\n"}); err == nil {
+		t.Fatal("overwrote a file whose read was forgotten")
+	}
+	if err := call(t, edit, editArgs{FilePath: path, OldString: "one", NewString: "uno"}); err != nil {
+		t.Fatalf("edit after a compaction: %v", err)
+	}
+	if err := call(t, read, readArgs{FilePath: path}); err != nil {
+		t.Fatal(err)
+	}
+	if err := call(t, write, writeArgs{FilePath: path, Content: "two\n"}); err != nil {
+		t.Fatalf("write after reading again: %v", err)
+	}
 }

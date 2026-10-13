@@ -106,8 +106,8 @@ func usageAnchor(history []Message) int {
 	return -1
 }
 
-// estimateMessage approximates the tokens of m's content.
-func estimateMessage(m Message) int {
+// EstimateMessage approximates the tokens of m's content.
+func EstimateMessage(m Message) int {
 	tokens := 0
 	for _, b := range m.Blocks {
 		tokens += estimateBlock(b)
@@ -118,7 +118,7 @@ func estimateMessage(m Message) int {
 func estimateMessages(msgs []Message) int {
 	total := 0
 	for _, m := range msgs {
-		total += estimateMessage(m)
+		total += EstimateMessage(m)
 	}
 	return total
 }
