@@ -5,6 +5,7 @@ import (
 	"reflect"
 	"testing"
 	"time"
+	"unicode/utf8"
 
 	"github.com/voocel/litellm"
 	"github.com/voocel/litellm/catalog"
@@ -113,6 +114,19 @@ func TestBuildCallMarksTheCallBefore(t *testing.T) {
 	}
 	if !reflect.DeepEqual(marked, []int{2, 5}) {
 		t.Fatalf("breakpoints after messages %v, want [2 5]", marked)
+	}
+}
+
+// A command's output cut inside a character still makes a valid request.
+func TestToolResultValidUTF8(t *testing.T) {
+	cut := "关卡"[:4] // the second character cut after its first byte
+	res := Result{Content: []litellm.Block{litellm.Text(cut)}}
+	block, _ := ToolResult("1", res).ToolResult()
+	if got := block.Content[0].(litellm.TextBlock).Text; got != "关"+string(utf8.RuneError) {
+		t.Errorf("text %q, want the broken character replaced", got)
+	}
+	if res.Content[0].(litellm.TextBlock).Text != cut {
+		t.Error("the tool's own result was changed")
 	}
 }
 
