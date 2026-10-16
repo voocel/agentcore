@@ -2,6 +2,7 @@ package tools
 
 import (
 	"bytes"
+	"cmp"
 	"context"
 	"encoding/json"
 	"errors"
@@ -17,8 +18,17 @@ import (
 	"github.com/voocel/agentcore/task"
 )
 
-// bashTimeout is how long a command runs in the foreground by default.
-const bashTimeout = 2 * time.Minute
+// bashTimeout is how long a command runs in the foreground by default, and
+// bashMaxTimeout the longest it may ask for unless the Workspace says: a
+// model can ask for an hour on a script that prints nothing, and wait it
+// out. Longer belongs in the background.
+const (
+	bashTimeout    = 2 * time.Minute
+	bashMaxTimeout = 10 * time.Minute
+)
+
+// bashLimit is the longest foreground timeout a model may set.
+func (w Workspace) bashLimit() time.Duration { return cmp.Or(w.BashMaxTimeout, bashMaxTimeout) }
 
 // Bash returns the bash tool, which runs shell commands. It reports each
 // line of their output as a string progress, and returns the tail of it, at
@@ -31,7 +41,7 @@ func (w Workspace) Bash() agentcore.Tool {
 	t := &bashTool{w: w}
 	props := []schema.Prop{
 		schema.Property("command", schema.String("Shell command to execute. Quote paths with spaces.")).Required(),
-		schema.Property("timeout", schema.Int(fmt.Sprintf("Timeout in seconds (default: %d; none in the background)", int(bashTimeout.Seconds())))),
+		schema.Property("timeout", schema.Int(fmt.Sprintf("Timeout in seconds (default: %d, at most %d; none in the background)", int(bashTimeout.Seconds()), int(w.bashLimit().Seconds())))),
 		schema.Property("workdir", schema.String("Optional working directory for this command. Use this instead of 'cd && ...'.")),
 		schema.Property("description", schema.String("Short 5-10 word description of what the command does")),
 	}
@@ -98,7 +108,7 @@ func (t *bashTool) execute(ctx context.Context, args json.RawMessage) (string, e
 	if timeout <= 0 {
 		timeout = bashTimeout
 	}
-	return foreground(ctx, shell, argv, dir, timeout)
+	return foreground(ctx, shell, argv, dir, min(timeout, t.w.bashLimit()))
 }
 
 func (t *bashTool) resolveWorkDir(ctx context.Context, a bashArgs) (string, error) {
