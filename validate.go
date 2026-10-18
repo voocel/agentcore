@@ -165,13 +165,23 @@ func mismatchHint(value any, types []string) string {
 		return ""
 	}
 	trimmed := strings.TrimSpace(text)
-	if slices.Contains(types, "array") && strings.HasPrefix(trimmed, "[") {
-		return `Looks like a JSON-encoded array — pass the value directly (e.g. ["a","b"]), not wrapped in quotes.`
+	var kind, example string
+	switch {
+	case slices.Contains(types, "array") && strings.HasPrefix(trimmed, "["):
+		kind, example = "array", `["a","b"]`
+	case slices.Contains(types, "object") && strings.HasPrefix(trimmed, "{"):
+		kind, example = "object", `{"k":"v"}`
+	default:
+		return ""
 	}
-	if slices.Contains(types, "object") && strings.HasPrefix(trimmed, "{") {
-		return `Looks like a JSON-encoded object — pass the value directly (e.g. {"k":"v"}), not wrapped in quotes.`
+	// Some vendors turn a value they cannot parse as JSON into a string: the
+	// model then needs to hear where its JSON breaks, not to unquote it.
+	var syntax *json.SyntaxError
+	if err := json.Unmarshal([]byte(trimmed), new(any)); errors.As(err, &syntax) {
+		return fmt.Sprintf("It starts like a JSON %s but is not valid JSON (%v at byte %d of %d), so it arrived as a string — fix the %s there and pass it directly.",
+			kind, err, syntax.Offset, len(trimmed), kind)
 	}
-	return ""
+	return fmt.Sprintf("Looks like a JSON-encoded %s — pass the value directly (e.g. %s), not wrapped in quotes.", kind, example)
 }
 
 func jsonTypeName(value any) string {

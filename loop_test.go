@@ -823,6 +823,19 @@ func TestValidateArgsListsEveryIssue(t *testing.T) {
 	}
 }
 
+// A value the vendor could not parse as JSON arrives as a string: the hint
+// says where the JSON breaks instead of asking to unquote it.
+func TestValidateArgsPointsAtBrokenJSON(t *testing.T) {
+	schema := map[string]any{"type": "object", "properties": map[string]any{"chapter": map[string]any{"type": "object"}}}
+	err := validateArgs("t", schema, json.RawMessage(`{"chapter":"{\"blocks\":[]}}"}`))
+	want := "InputValidationError: t failed due to the following issue:\n" +
+		"The parameter `chapter` type is expected as `object` but provided as `string`. It starts like a JSON object but is not valid JSON " +
+		"(invalid character '}' after top-level value at byte 14 of 14), so it arrived as a string — fix the object there and pass it directly."
+	if err == nil || err.Error() != want {
+		t.Fatalf("err = %v", err)
+	}
+}
+
 // A run cancelled with a cause ends with it, as the application stopped it.
 func TestRunAbortCause(t *testing.T) {
 	stop := errors.New("stop here")
