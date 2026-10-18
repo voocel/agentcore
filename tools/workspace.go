@@ -32,6 +32,9 @@ type Workspace struct {
 	// "unsandboxed" to run a command the sandbox blocked outside it, which
 	// whoever approves calls should ask about.
 	Sandbox func(ctx context.Context, argv []string) []string
+	// BashMaxTimeout bounds the timeout a model may set on a command bash
+	// runs in the foreground; zero is ten minutes.
+	BashMaxTimeout time.Duration
 }
 
 // Tools returns read, write, edit, bash, glob, grep and ls.

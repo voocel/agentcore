@@ -2,8 +2,10 @@ package agentcore
 
 import (
 	"encoding/json"
+	"slices"
 	"strings"
 	"time"
+	"unicode/utf8"
 
 	"github.com/voocel/litellm"
 	"github.com/voocel/litellm/catalog"
@@ -130,8 +132,29 @@ func User(blocks ...litellm.Block) Message {
 func ToolResult(id string, result Result) Message {
 	return Message{
 		Role:   litellm.RoleTool,
-		Blocks: []litellm.Block{litellm.ToolResultBlock{ToolUseID: id, Content: result.Content, IsError: result.IsError}},
+		Blocks: []litellm.Block{litellm.ToolResultBlock{ToolUseID: id, Content: validUTF8(result.Content), IsError: result.IsError}},
 	}
+}
+
+// validUTF8 returns blocks with their text made valid UTF-8, as requests must
+// be: a tool passes on what a command printed, which may end inside a
+// character, as `head -c` does. The blocks given stay as they were.
+func validUTF8(blocks []litellm.Block) []litellm.Block {
+	invalid := func(b litellm.Block) bool {
+		t, ok := b.(litellm.TextBlock)
+		return ok && !utf8.ValidString(t.Text)
+	}
+	if !slices.ContainsFunc(blocks, invalid) {
+		return blocks
+	}
+	out := slices.Clone(blocks)
+	for i, b := range out {
+		if t, ok := b.(litellm.TextBlock); ok {
+			t.Text = strings.ToValidUTF8(t.Text, string(utf8.RuneError))
+			out[i] = t
+		}
+	}
+	return out
 }
 
 // Text returns the text of m's text blocks, or of the tool result it holds.

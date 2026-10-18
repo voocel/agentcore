@@ -2,6 +2,7 @@ package tools
 
 import (
 	"context"
+	"encoding/json"
 	"io"
 	"os"
 	"path"
@@ -33,6 +34,20 @@ func TestBashResult(t *testing.T) {
 	got, err = bash(t, ".", map[string]any{"command": "echo started; sleep 2", "timeout": 1})
 	if err != nil || got != "started\n\n[timed out after 1s]" {
 		t.Fatalf("timeout: %q, %v", got, err)
+	}
+}
+
+// A model asking for a longer timeout than the workspace allows gets the
+// limit, which the schema states.
+func TestBashMaxTimeout(t *testing.T) {
+	t.Parallel()
+	tool := Workspace{Dir: ".", BashMaxTimeout: time.Second}.Bash()
+	if schema, _ := json.Marshal(tool.Schema); !strings.Contains(string(schema), "at most 1;") {
+		t.Errorf("schema %s", schema)
+	}
+	got, err := run(t, tool, map[string]any{"command": "echo started; sleep 2", "timeout": 3600})
+	if err != nil || got != "started\n\n[timed out after 1s]" {
+		t.Fatalf("result %q, %v", got, err)
 	}
 }
 
